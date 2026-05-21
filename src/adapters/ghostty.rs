@@ -1,4 +1,4 @@
-use super::{TerminalAdapter, applescript_quote, run_checked, shell_line};
+use super::{TerminalAdapter, applescript_quote, run_checked};
 use crate::process;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -10,36 +10,29 @@ pub struct Ghostty;
 
 impl TerminalAdapter for Ghostty {
     fn open_tab(&self, directory: &Path, command: &str) -> Result<()> {
-        let was_running = self.is_running();
-        if !was_running {
+        if !self.is_running() {
             self.launch()?;
             thread::sleep(Duration::from_millis(700));
         }
 
-        let line = shell_line(directory, command);
-        let new_tab = if was_running {
-            "keystroke \"t\" using command down\ndelay 0.2"
-        } else {
-            ""
-        };
+        let dir_str = directory
+            .to_str()
+            .context("Ghostty restore requires a UTF-8 directory path")?;
+        let initial_input = format!("{command}\n");
         let script = format!(
-            r#"tell application "Ghostty" to activate
-delay 0.2
-tell application "System Events"
-  tell process "Ghostty"
-    {new_tab}
-    keystroke {}
-    key code 36
-  end tell
+            r#"tell application "Ghostty"
+  set cfg to new surface configuration
+  set initial working directory of cfg to {dir}
+  set initial input of cfg to {input}
+  new tab in front window with configuration cfg
 end tell"#,
-            applescript_quote(&line),
+            dir = applescript_quote(dir_str),
+            input = applescript_quote(&initial_input),
         );
 
-        let mut command = Command::new("osascript");
-        command.args(["-e", &script]);
-        run_checked(command, "opening Ghostty tab").with_context(|| {
-            "Ghostty tab restore uses System Events; grant Accessibility permission if macOS blocks it"
-        })
+        let mut osa = Command::new("osascript");
+        osa.args(["-e", &script]);
+        run_checked(osa, "opening Ghostty tab")
     }
 
     fn is_running(&self) -> bool {

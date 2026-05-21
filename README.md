@@ -16,7 +16,7 @@ Supported terminal values:
 
 | Value | Restore behavior |
 | --- | --- |
-| `ghostty` | Opens tabs in Ghostty with AppleScript keystrokes. Requires macOS Accessibility permission for System Events. |
+| `ghostty` | Opens tabs in Ghostty via its native AppleScript scripting dictionary (`new tab with configuration`). No keystroke automation, so no Accessibility permission is needed. |
 | `iterm2` | Opens tabs in the current iTerm2 window. |
 | `terminal` | Uses Terminal.app `do script`. |
 | `kitty` | Uses `kitty @ launch --type=tab`. |
