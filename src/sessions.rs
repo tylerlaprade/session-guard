@@ -212,9 +212,21 @@ pub fn register(path: &Path, record: SessionRecord) -> Result<()> {
 
 pub fn repair_if_corrupt(path: &Path) -> Result<Option<PathBuf>> {
     ensure_store(path)?;
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+
     if contents.trim().is_empty() || serde_json::from_str::<Vec<SessionRecord>>(&contents).is_ok() {
+        let _ = file.unlock();
         return Ok(None);
     }
 
@@ -226,6 +238,7 @@ pub fn repair_if_corrupt(path: &Path) -> Result<Option<PathBuf>> {
         )
     })?;
     fs::write(path, b"[]\n").with_context(|| format!("failed to recreate {}", path.display()))?;
+    let _ = file.unlock();
     Ok(Some(backup))
 }
 

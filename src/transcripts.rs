@@ -37,13 +37,15 @@ fn discover_jsonl(root: &Path, tool: Tool, sessions: &mut Vec<SessionRecord>) ->
     }
 
     let mut files = Vec::new();
-    collect_jsonl_files(root, &mut files)?;
+    collect_jsonl_files(root, &mut files);
     for path in files {
-        if !is_recent(&path)? {
+        if !is_recent(&path).unwrap_or(false) {
             continue;
         }
 
-        let Some((session_id, directory, timestamp)) = read_metadata(&path, tool)? else {
+        let Some((session_id, directory, timestamp)) =
+            read_metadata(&path, tool).ok().flatten()
+        else {
             continue;
         };
         sessions.push(SessionRecord::from_transcript(
@@ -54,12 +56,14 @@ fn discover_jsonl(root: &Path, tool: Tool, sessions: &mut Vec<SessionRecord>) ->
     Ok(())
 }
 
-fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_jsonl_files(&path, files)?;
+            collect_jsonl_files(&path, files);
         } else if path
             .extension()
             .is_some_and(|extension| extension == "jsonl")
@@ -67,7 +71,6 @@ fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             files.push(path);
         }
     }
-    Ok(())
 }
 
 fn is_recent(path: &Path) -> Result<bool> {
