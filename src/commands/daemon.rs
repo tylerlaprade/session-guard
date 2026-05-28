@@ -146,6 +146,14 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+// The daemon's monitor cycle bumps `last_seen_at` for every alive session
+// roughly every 60 seconds. So at boot, the maximum `last_seen_at` in the file
+// marks the last moment the previous daemon ran — i.e., right before
+// crash/shutdown. Sessions clustered within this window of that maximum were
+// alive at crash; anything much older was already in the recoverable pile and
+// should not be auto-restored.
+const LIVENESS_CLUSTER_WINDOW_SECS: i64 = 120;
+
 pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let path = paths::sessions_file()?;
     let _ = sessions::repair_if_corrupt(&path)?;
@@ -161,6 +169,17 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
         }
 
         let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary);
+
+        let activity_cutoff = matches!(mode, RestoreMode::Startup)
+            .then(|| {
+                unique
+                    .iter()
+                    .map(|s| s.last_seen_at)
+                    .max()
+                    .map(|t_max| t_max - chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS))
+            })
+            .flatten();
+
         let mut kept = Vec::new();
 
         for mut session in unique {
@@ -176,6 +195,21 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             }
 
             session.mark_recoverable();
+
+            if let Some(cutoff) = activity_cutoff {
+                if session.last_seen_at < cutoff {
+                    summary.preserved_recoverable += 1;
+                    kept.push(session);
+                    continue;
+                }
+            }
+
+            if matches!(mode, RestoreMode::Startup) && !transcript_present(&session) {
+                summary.preserved_recoverable += 1;
+                kept.push(session);
+                continue;
+            }
+
             if !should_restore(mode, &session, boot_time) {
                 summary.preserved_recoverable += 1;
                 kept.push(session);
@@ -320,6 +354,13 @@ fn configured_terminal() -> Result<TerminalKind> {
     let contents =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     contents.parse()
+}
+
+fn transcript_present(session: &SessionRecord) -> bool {
+    match &session.transcript_path {
+        Some(path) => path.exists(),
+        None => true,
+    }
 }
 
 fn session_is_alive(session: &SessionRecord) -> bool {
