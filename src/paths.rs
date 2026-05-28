@@ -1,3 +1,4 @@
+use crate::Tool;
 use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
@@ -35,6 +36,21 @@ pub fn claude_settings() -> Result<PathBuf> {
 
 pub fn codex_config() -> Result<PathBuf> {
     Ok(home_dir()?.join(".codex").join("config.toml"))
+}
+
+/// The tool's own config/state root, honoring the same env overrides the tools
+/// themselves use. Sessions whose working directory lives inside this root are
+/// internal tool activity (e.g. codex memory maintenance under `~/.codex`),
+/// never user project sessions.
+pub fn tool_home(tool: Tool) -> Result<PathBuf> {
+    match tool {
+        Tool::Claude => Ok(env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or(home_dir()?.join(".claude"))),
+        Tool::Codex => Ok(env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or(home_dir()?.join(".codex"))),
+    }
 }
 
 pub fn launch_agent_plist() -> Result<PathBuf> {

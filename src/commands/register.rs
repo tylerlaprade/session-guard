@@ -4,7 +4,7 @@ use crate::sessions::{self, SessionRecord};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::io::{self, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -42,6 +42,15 @@ pub fn run(
     let directory = directory
         .or_else(|| hook_input.as_ref().and_then(|input| input.cwd.clone()))
         .context("missing directory; pass --directory or run from a hook that provides cwd")?;
+
+    // The tools fire their session hooks for internal activity too — e.g. codex
+    // memory maintenance running under ~/.codex. Those aren't user project
+    // sessions and would restore as junk tabs cd'd into a config dir, so never
+    // record them.
+    if is_internal_directory(&directory, &paths::tool_home(tool)?) {
+        return Ok(());
+    }
+
     let transcript_path = hook_input
         .as_ref()
         .and_then(|input| input.transcript_path.clone());
@@ -60,6 +69,10 @@ pub fn run(
         source,
     );
     sessions::register(&paths::sessions_file()?, record)
+}
+
+fn is_internal_directory(directory: &Path, tool_home: &Path) -> bool {
+    directory.starts_with(tool_home)
 }
 
 pub fn read_session_id_from_hook_stdin() -> Result<Option<String>> {
@@ -82,4 +95,33 @@ fn read_hook_input() -> Result<Option<HookInput>> {
     serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse hook stdin as JSON: {contents}"))
         .map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_directory_matches_tool_home_and_descendants() {
+        let home = Path::new("/Users/tyler/.codex");
+        assert!(is_internal_directory(Path::new("/Users/tyler/.codex"), home));
+        assert!(is_internal_directory(
+            Path::new("/Users/tyler/.codex/memories"),
+            home
+        ));
+    }
+
+    #[test]
+    fn project_directory_is_not_internal() {
+        let home = Path::new("/Users/tyler/.codex");
+        assert!(!is_internal_directory(
+            Path::new("/Users/tyler/Code/go2rust"),
+            home
+        ));
+        // A sibling that merely shares a prefix string must not match.
+        assert!(!is_internal_directory(
+            Path::new("/Users/tyler/.codex-backup"),
+            home
+        ));
+    }
 }
