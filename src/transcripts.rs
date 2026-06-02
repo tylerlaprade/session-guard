@@ -15,11 +15,37 @@ pub fn discover_recent_sessions() -> Result<Vec<SessionRecord>> {
     Ok(sessions)
 }
 
-fn discover_claude_sessions(sessions: &mut Vec<SessionRecord>) -> Result<()> {
-    let root = std::env::var_os("CLAUDE_CONFIG_DIR")
+pub fn claude_projects_dir() -> Result<PathBuf> {
+    Ok(std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or(paths::home_dir()?.join(".claude"))
-        .join("projects");
+        .join("projects"))
+}
+
+pub fn claude_transcript_path(session_id: &str) -> Result<Option<PathBuf>> {
+    let root = claude_projects_dir()?;
+    let file_name = format!("{session_id}.jsonl");
+    let Ok(entries) = fs::read_dir(root) else {
+        return Ok(None);
+    };
+
+    for entry in entries.flatten() {
+        let project_dir = entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+
+        let path = project_dir.join(&file_name);
+        if path.is_file() {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
+}
+
+fn discover_claude_sessions(sessions: &mut Vec<SessionRecord>) -> Result<()> {
+    let root = claude_projects_dir()?;
     discover_jsonl(&root, Tool::Claude, sessions)
 }
 
@@ -43,8 +69,7 @@ fn discover_jsonl(root: &Path, tool: Tool, sessions: &mut Vec<SessionRecord>) ->
             continue;
         }
 
-        let Some((session_id, directory, timestamp)) =
-            read_metadata(&path, tool).ok().flatten()
+        let Some((session_id, directory, timestamp)) = read_metadata(&path, tool).ok().flatten()
         else {
             continue;
         };
@@ -79,7 +104,7 @@ fn is_recent(path: &Path) -> Result<bool> {
     Ok(modified >= Utc::now() - Duration::days(DEFAULT_RECOVERABLE_DAYS))
 }
 
-fn read_metadata(path: &Path, tool: Tool) -> Result<Option<(String, PathBuf, DateTime<Utc>)>> {
+pub fn read_metadata(path: &Path, tool: Tool) -> Result<Option<(String, PathBuf, DateTime<Utc>)>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut session_id = filename_session_id(path, tool);

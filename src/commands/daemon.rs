@@ -1,17 +1,16 @@
 use crate::adapters::{adapter_for, shell_quote};
 use crate::paths;
 use crate::process;
+use crate::scan;
 use crate::sessions::{self, SessionRecord, SessionState};
 use crate::transcripts;
 use crate::{TerminalKind, Tool};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
 use signal_hook::flag;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -92,6 +91,11 @@ pub fn run() -> Result<()> {
     write_pid_file()?;
     log_line("daemon started")?;
 
+    let added = reconcile_from_scan()?;
+    if added > 0 {
+        log_line(&format!("scan added {added} sessions"))?;
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let restore_requested = Arc::new(AtomicBool::new(false));
     flag::register(SIGTERM, Arc::clone(&shutdown))?;
@@ -118,6 +122,11 @@ pub fn run() -> Result<()> {
 
         seconds_until_monitor -= 1;
         if seconds_until_monitor == 0 {
+            let added = reconcile_from_scan()?;
+            if added > 0 {
+                log_line(&format!("scan added {added} sessions"))?;
+            }
+
             let summary = monitor_once()?;
             if summary.marked_recoverable > 0 {
                 log_line(&format!(
@@ -146,19 +155,49 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+pub fn reconcile_from_scan() -> Result<usize> {
+    let path = paths::sessions_file()?;
+    let _ = sessions::repair_if_corrupt(&path)?;
+    let scanned = process::list_processes()
+        .and_then(|processes| scan::discover_sessions(&processes))
+        .unwrap_or_default();
+
+    sessions::with_sessions_mut(&path, |sessions| {
+        let mut added = 0;
+        for scanned_session in scanned {
+            if let Some(existing) = sessions
+                .iter_mut()
+                .find(|session| session.session_id == scanned_session.session_id)
+            {
+                existing.pid = scanned_session.pid;
+                existing.mark_active();
+            } else {
+                sessions.push(scanned_session);
+                added += 1;
+            }
+        }
+        Ok(added)
+    })
+}
+
 // The daemon's monitor cycle bumps `last_seen_at` for every alive session
-// roughly every 60 seconds. So at boot, the maximum `last_seen_at` in the file
-// marks the last moment the previous daemon ran — i.e., right before
-// crash/shutdown. Sessions clustered within this window of that maximum were
-// alive at crash; anything much older was already in the recoverable pile and
-// should not be auto-restored.
+// roughly every 60 seconds. So when the daemon restarts, the maximum
+// `last_seen_at` in the file marks the last moment the previous daemon ran —
+// i.e., right before it (and usually the sessions running alongside it) went
+// away. Sessions whose `last_seen_at` falls within this window of that maximum
+// were alive when the daemon stopped and are restored; anything much older was
+// already sitting in the recoverable pile and is left alone.
+//
+// This deliberately keys off the daemon's own last heartbeat rather than the
+// kernel boot time. A logout or GUI-session crash kills every terminal — and
+// the daemon with them — without rebooting the kernel, so a boot-time check
+// would never fire for those sessions even though they should come back.
 const LIVENESS_CLUSTER_WINDOW_SECS: i64 = 120;
 
 pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let path = paths::sessions_file()?;
     let _ = sessions::repair_if_corrupt(&path)?;
     let fallback_sessions = transcripts::discover_recent_sessions().unwrap_or_default();
-    let boot_time = system_boot_time();
     let mut adapter = None;
 
     sessions::with_sessions_mut(&path, |sessions| {
@@ -170,15 +209,14 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
 
         let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary);
 
-        let activity_cutoff = matches!(mode, RestoreMode::Startup)
-            .then(|| {
-                unique
-                    .iter()
-                    .map(|s| s.last_seen_at)
-                    .max()
-                    .map(|t_max| t_max - chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS))
-            })
-            .flatten();
+        let activity_cutoff =
+            matches!(mode, RestoreMode::Startup)
+                .then(|| {
+                    unique.iter().map(|s| s.last_seen_at).max().map(|t_max| {
+                        t_max - chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS)
+                    })
+                })
+                .flatten();
 
         let mut kept = Vec::new();
 
@@ -196,21 +234,15 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
 
             session.mark_recoverable();
 
-            if let Some(cutoff) = activity_cutoff {
-                if session.last_seen_at < cutoff {
-                    summary.preserved_recoverable += 1;
-                    kept.push(session);
-                    continue;
-                }
-            }
-
-            if matches!(mode, RestoreMode::Startup) && !transcript_present(&session) {
+            if let Some(cutoff) = activity_cutoff
+                && session.last_seen_at < cutoff
+            {
                 summary.preserved_recoverable += 1;
                 kept.push(session);
                 continue;
             }
 
-            if !should_restore(mode, &session, boot_time) {
+            if matches!(mode, RestoreMode::Startup) && !transcript_present(&session) {
                 summary.preserved_recoverable += 1;
                 kept.push(session);
                 continue;
@@ -377,19 +409,6 @@ fn session_shell_is_alive(session: &SessionRecord) -> bool {
         .unwrap_or(false)
 }
 
-fn should_restore(
-    mode: RestoreMode,
-    session: &SessionRecord,
-    boot_time: Option<DateTime<Utc>>,
-) -> bool {
-    match mode {
-        RestoreMode::Manual => true,
-        RestoreMode::Startup => boot_time
-            .map(|boot_time| session.last_seen_at < boot_time || session.registered_at < boot_time)
-            .unwrap_or(true),
-    }
-}
-
 fn deduplicate_sessions(
     sessions: Vec<SessionRecord>,
     summary: &mut RestoreSummary,
@@ -436,24 +455,4 @@ fn resume_command(session: &SessionRecord) -> String {
         Tool::Claude => format!("claude --resume {session_id}"),
         Tool::Codex => format!("codex resume {session_id}"),
     }
-}
-
-fn system_boot_time() -> Option<DateTime<Utc>> {
-    let output = Command::new("sysctl")
-        .args(["-n", "kern.boottime"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let sec_index = text.find("sec = ")? + "sec = ".len();
-    let seconds: i64 = text[sec_index..]
-        .chars()
-        .take_while(|char| char.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .ok()?;
-    DateTime::from_timestamp(seconds, 0)
 }

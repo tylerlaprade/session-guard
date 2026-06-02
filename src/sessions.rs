@@ -50,6 +50,7 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tool: Tool,
         session_id: String,

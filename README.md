@@ -54,8 +54,12 @@ forgotten. During normal monitoring:
 | dead | dead | Tool and shell exited | Remove during normal monitor |
 | unknown | unknown | PID data unavailable | Keep recoverable |
 
-At daemon startup, dead sessions from before the current boot are restored.
-This keeps login recovery separate from normal process-death cleanup. Manual
+At daemon startup, sessions that were alive in the final heartbeat before the
+previous daemon stopped — i.e., that died alongside it — are restored. This
+keys off the daemon's own last heartbeat rather than the kernel boot time, so a
+logout or GUI-session crash (which kills every terminal and the daemon without
+rebooting the kernel) triggers recovery the same as a reboot does. Sessions
+already sitting in the recoverable pile from earlier are left alone. Manual
 `session-guard restore` restores recoverable sessions immediately.
 
 If `active-sessions.json` is missing or had to be moved aside as corrupt,

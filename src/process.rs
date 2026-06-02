@@ -2,6 +2,13 @@ use crate::Tool;
 use anyhow::{Context, Result};
 use std::process::Command;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcInfo {
+    pub pid: i32,
+    pub ppid: i32,
+    pub command: String,
+}
+
 pub fn pid_is_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -48,6 +55,47 @@ pub fn process_command(pid: i32) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn list_processes() -> Result<Vec<ProcInfo>> {
+    let output = Command::new("ps")
+        .args(["-axww", "-o", "pid=,ppid=,command="])
+        .output()
+        .context("failed to list processes")?;
+
+    if !output.status.success() {
+        anyhow::bail!("ps could not list processes");
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut processes = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some(pid_end) = line.find(char::is_whitespace) else {
+            continue;
+        };
+        let pid = match line[..pid_end].parse::<i32>() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+
+        let rest = line[pid_end..].trim_start();
+        let Some(ppid_end) = rest.find(char::is_whitespace) else {
+            continue;
+        };
+        let ppid = match rest[..ppid_end].parse::<i32>() {
+            Ok(ppid) => ppid,
+            Err(_) => continue,
+        };
+
+        processes.push(ProcInfo {
+            pid,
+            ppid,
+            command: rest[ppid_end..].trim_start().to_string(),
+        });
+    }
+
+    Ok(processes)
 }
 
 pub fn command_exists(name: &str) -> bool {

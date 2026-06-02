@@ -71,7 +71,7 @@ pub fn run(
     sessions::register(&paths::sessions_file()?, record)
 }
 
-fn is_internal_directory(directory: &Path, tool_home: &Path) -> bool {
+pub(crate) fn is_internal_directory(directory: &Path, tool_home: &Path) -> bool {
     directory.starts_with(tool_home)
 }
 
@@ -104,7 +104,10 @@ mod tests {
     #[test]
     fn internal_directory_matches_tool_home_and_descendants() {
         let home = Path::new("/Users/tyler/.codex");
-        assert!(is_internal_directory(Path::new("/Users/tyler/.codex"), home));
+        assert!(is_internal_directory(
+            Path::new("/Users/tyler/.codex"),
+            home
+        ));
         assert!(is_internal_directory(
             Path::new("/Users/tyler/.codex/memories"),
             home

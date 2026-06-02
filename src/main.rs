@@ -3,6 +3,7 @@ mod commands;
 mod hooks;
 mod paths;
 mod process;
+mod scan;
 mod sessions;
 mod transcripts;
 

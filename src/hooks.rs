@@ -215,7 +215,7 @@ fn remove_json_hook_commands(root: &mut JsonValue, commands: &[&str]) -> bool {
             inner_hooks.retain(|hook| {
                 hook.get("command")
                     .and_then(JsonValue::as_str)
-                    .map(|command| !commands.iter().any(|needle| command == *needle))
+                    .map(|command| !commands.contains(&command))
                     .unwrap_or(true)
             });
             changed |= inner_hooks.len() != before;
@@ -234,12 +234,12 @@ fn remove_json_hook_commands(root: &mut JsonValue, commands: &[&str]) -> bool {
 
     let empty_events: Vec<String> = hooks
         .iter()
-        .filter_map(|(event, value)| {
+        .filter(|(_, value)| {
             value
                 .as_array()
                 .is_some_and(|event_hooks| event_hooks.is_empty())
-                .then(|| event.clone())
         })
+        .map(|(event, _)| event.clone())
         .collect();
     for event in empty_events {
         hooks.remove(&event);
@@ -373,7 +373,7 @@ fn remove_toml_hook_commands(root: &mut TomlValue, commands: &[&str]) -> Result<
             inner_hooks.retain(|hook| {
                 hook.get("command")
                     .and_then(TomlValue::as_str)
-                    .map(|command| !commands.iter().any(|needle| command == *needle))
+                    .map(|command| !commands.contains(&command))
                     .unwrap_or(true)
             });
             changed |= inner_hooks.len() != before;
@@ -392,12 +392,12 @@ fn remove_toml_hook_commands(root: &mut TomlValue, commands: &[&str]) -> Result<
 
     let empty_events: Vec<String> = hooks
         .iter()
-        .filter_map(|(event, value)| {
+        .filter(|(_, value)| {
             value
                 .as_array()
                 .is_some_and(|event_hooks| event_hooks.is_empty())
-                .then(|| event.clone())
         })
+        .map(|(event, _)| event.clone())
         .collect();
     for event in empty_events {
         hooks.remove(&event);
