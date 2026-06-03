@@ -19,12 +19,20 @@ impl TerminalAdapter for Ghostty {
             .to_str()
             .context("Ghostty restore requires a UTF-8 directory path")?;
         let initial_input = format!("{command}\n");
+        // Add a tab to the existing window, but start a fresh window when there
+        // is none. At login-time restore Ghostty is often running with no window
+        // yet, and `new tab in front window` fails with -1728 ("Can't get front
+        // window") in that state.
         let script = format!(
             r#"tell application "Ghostty"
   set cfg to new surface configuration
   set initial working directory of cfg to {dir}
   set initial input of cfg to {input}
-  new tab in front window with configuration cfg
+  if (count of windows) is 0 then
+    new window with configuration cfg
+  else
+    new tab in front window with configuration cfg
+  end if
 end tell"#,
             dir = applescript_quote(dir_str),
             input = applescript_quote(&initial_input),
