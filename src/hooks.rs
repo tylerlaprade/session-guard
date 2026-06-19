@@ -32,6 +32,13 @@ pub fn install_claude_hooks(path: &Path) -> Result<HookChange> {
         Some("startup|resume"),
         CLAUDE_REGISTER,
     )?;
+    // Claude fires SessionStart only at creation and never re-announces a live
+    // session, so a session that loses its registration mid-life stays lost: a
+    // stray SessionEnd (e.g. /clear, or switching away with /resume) deregisters
+    // it, and a SessionStart whose source the matcher skips (clear|compact) never
+    // re-adds it. Re-registering on Stop (every turn) self-heals this the same
+    // way the Codex Stop hook does, so a still-open session remains restorable.
+    changed |= ensure_json_hook(&mut root, "Stop", None, CLAUDE_REGISTER)?;
     changed |= ensure_json_hook(&mut root, "SessionEnd", None, CLAUDE_DEREGISTER)?;
 
     if changed {
@@ -437,6 +444,9 @@ mod tests {
         let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
+        let stop = root["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert!(json_event_has_command(stop, CLAUDE_REGISTER));
     }
 
     #[test]
