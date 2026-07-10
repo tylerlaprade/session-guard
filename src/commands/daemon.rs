@@ -20,6 +20,7 @@ use std::time::Duration;
 pub struct RestoreSummary {
     pub restored_claude: usize,
     pub restored_codex: usize,
+    pub restored_grok: usize,
     pub pruned_missing_dirs: usize,
     pub pruned_duplicates: usize,
     pub preserved_recoverable: usize,
@@ -30,15 +31,16 @@ pub struct RestoreSummary {
 
 impl RestoreSummary {
     pub fn restored_total(&self) -> usize {
-        self.restored_claude + self.restored_codex
+        self.restored_claude + self.restored_codex + self.restored_grok
     }
 
     pub fn message(&self) -> String {
         let mut message = format!(
-            "Restored {} sessions ({} Claude Code, {} Codex). Pruned {} (directory gone).",
+            "Restored {} sessions ({} Claude Code, {} Codex, {} Grok). Pruned {} (directory gone).",
             self.restored_total(),
             self.restored_claude,
             self.restored_codex,
+            self.restored_grok,
             self.pruned_missing_dirs,
         );
         if self.pruned_duplicates > 0 {
@@ -262,6 +264,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 Ok(()) => match session.tool {
                     Tool::Claude => summary.restored_claude += 1,
                     Tool::Codex => summary.restored_codex += 1,
+                    Tool::Grok => summary.restored_grok += 1,
                 },
                 Err(error) => {
                     summary.failed += 1;
@@ -454,5 +457,6 @@ fn resume_command(session: &SessionRecord) -> String {
     match session.tool {
         Tool::Claude => format!("claude --resume {session_id}"),
         Tool::Codex => format!("codex resume {session_id}"),
+        Tool::Grok => format!("grok --resume {session_id}"),
     }
 }

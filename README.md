@@ -1,7 +1,7 @@
 # session-guard
 
-`session-guard` tracks active Claude Code and Codex CLI sessions and restores
-them after a macOS crash or reboot.
+`session-guard` tracks active Claude Code, Codex CLI, and Grok sessions and
+restores them after a macOS crash or reboot.
 
 Licensed under [GPL-3.0-only](LICENSE).
 
@@ -38,11 +38,13 @@ terminal is stored in `~/.config/session-guard/terminal`.
 
 ## Recovery Model
 
-Hook identity comes from the JSON payload Claude Code and Codex provide on
-stdin. The installed hook commands only use PID data as best-effort telemetry:
-they store the tool PID and the parent shell PID when the hook process can
-derive them. Codex installs a `SessionStart` hook plus a `Stop` heartbeat;
-it does not install a made-up `SessionEnd` hook.
+Hook identity comes from the JSON payload Claude Code, Codex, and Grok provide
+on stdin. The installed hook commands only use PID data as best-effort
+telemetry: they store the tool PID and the parent shell PID when the hook
+process can derive them. Codex installs a `SessionStart` hook plus a `Stop`
+heartbeat; it does not install a made-up `SessionEnd` hook. Grok hooks live in
+`~/.grok/hooks/` (global) and use a companion register script because Grok
+expands `$VAR` in inline hook commands and rejects unset vars such as `$PPID`.
 
 The daemon does not treat a dead tool PID as proof that a session should be
 forgotten. During normal monitoring:
@@ -68,8 +70,10 @@ restore can rebuild recent recoverable entries from transcript/session files:
 ```text
 ~/.claude/projects/**/*.jsonl
 ~/.codex/sessions/**/*.jsonl
+~/.grok/sessions/**/summary.json
 ```
 
 Codex non-interactive `codex exec` sessions are not currently tracked by hooks.
 Interactive Codex sessions are tracked and restored with
-`codex resume <session-id>`.
+`codex resume <session-id>`. Grok sessions are restored with
+`grok --resume <session-id>`.

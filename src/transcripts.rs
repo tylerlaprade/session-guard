@@ -12,6 +12,7 @@ pub fn discover_recent_sessions() -> Result<Vec<SessionRecord>> {
     let mut sessions = Vec::new();
     discover_claude_sessions(&mut sessions)?;
     discover_codex_sessions(&mut sessions)?;
+    discover_grok_sessions(&mut sessions)?;
     Ok(sessions)
 }
 
@@ -55,6 +56,86 @@ fn discover_codex_sessions(sessions: &mut Vec<SessionRecord>) -> Result<()> {
         .unwrap_or(paths::home_dir()?.join(".codex"))
         .join("sessions");
     discover_jsonl(&root, Tool::Codex, sessions)
+}
+
+fn discover_grok_sessions(sessions: &mut Vec<SessionRecord>) -> Result<()> {
+    let root = paths::tool_home(Tool::Grok)?.join("sessions");
+    if !root.is_dir() {
+        return Ok(());
+    }
+
+    let Ok(cwd_entries) = fs::read_dir(&root) else {
+        return Ok(());
+    };
+    for cwd_entry in cwd_entries.flatten() {
+        let cwd_dir = cwd_entry.path();
+        if !cwd_dir.is_dir() {
+            continue;
+        }
+
+        let Ok(session_entries) = fs::read_dir(&cwd_dir) else {
+            continue;
+        };
+        for session_entry in session_entries.flatten() {
+            let session_dir = session_entry.path();
+            if !session_dir.is_dir() {
+                continue;
+            }
+
+            let summary_path = session_dir.join("summary.json");
+            if !summary_path.is_file() || !is_recent(&summary_path).unwrap_or(false) {
+                continue;
+            }
+
+            let Some((session_id, directory, timestamp)) =
+                read_grok_summary(&summary_path).ok().flatten()
+            else {
+                continue;
+            };
+            sessions.push(SessionRecord::from_transcript(
+                Tool::Grok,
+                session_id,
+                directory,
+                summary_path,
+                timestamp,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn read_grok_summary(path: &Path) -> Result<Option<(String, PathBuf, DateTime<Utc>)>> {
+    let contents = fs::read_to_string(path)?;
+    let value: Value = serde_json::from_str(&contents)?;
+
+    let session_id = value
+        .pointer("/info/id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        });
+    let directory = value
+        .pointer("/info/cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let timestamp = value
+        .get("updated_at")
+        .or_else(|| value.get("created_at"))
+        .and_then(Value::as_str)
+        .and_then(parse_timestamp)
+        .or_else(|| file_modified_at(path).ok());
+
+    Ok(match (session_id, directory, timestamp) {
+        (Some(session_id), Some(directory), Some(timestamp)) => {
+            Some((session_id, directory, timestamp))
+        }
+        _ => None,
+    })
 }
 
 fn discover_jsonl(root: &Path, tool: Tool, sessions: &mut Vec<SessionRecord>) -> Result<()> {
@@ -153,6 +234,8 @@ fn filename_session_id(path: &Path, tool: Tool) -> Option<String> {
             .checked_sub(36)
             .and_then(|start| stem.get(start..))
             .map(ToOwned::to_owned),
+        // Grok sessions are directories; summary.json is handled separately.
+        Tool::Grok => None,
     }
 }
 
@@ -191,5 +274,33 @@ mod tests {
         let (id, cwd, _) = read_metadata(&path, Tool::Codex).unwrap().unwrap();
         assert_eq!(id, "019dd0a8-a320-78b3-a770-fffc78f09c5d");
         assert_eq!(cwd, PathBuf::from("/tmp/project"));
+    }
+
+    #[test]
+    fn parses_grok_summary_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("019f486e-061f-7343-b53e-f487a0f30e85");
+        fs::create_dir_all(&session_dir).unwrap();
+        let path = session_dir.join("summary.json");
+        fs::write(
+            &path,
+            r#"{
+              "info": {
+                "id": "019f486e-061f-7343-b53e-f487a0f30e85",
+                "cwd": "/tmp/project"
+              },
+              "created_at": "2026-07-09T19:49:58.259284Z",
+              "updated_at": "2026-07-10T00:02:58.951370Z"
+            }"#,
+        )
+        .unwrap();
+
+        let (id, cwd, timestamp) = read_grok_summary(&path).unwrap().unwrap();
+        assert_eq!(id, "019f486e-061f-7343-b53e-f487a0f30e85");
+        assert_eq!(cwd, PathBuf::from("/tmp/project"));
+        assert_eq!(
+            timestamp.to_rfc3339(),
+            "2026-07-10T00:02:58.951370+00:00"
+        );
     }
 }

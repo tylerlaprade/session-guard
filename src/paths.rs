@@ -38,6 +38,10 @@ pub fn codex_config() -> Result<PathBuf> {
     Ok(home_dir()?.join(".codex").join("config.toml"))
 }
 
+pub fn grok_hooks_dir() -> Result<PathBuf> {
+    Ok(tool_home(Tool::Grok)?.join("hooks"))
+}
+
 /// The tool's own config/state root, honoring the same env overrides the tools
 /// themselves use. Sessions whose working directory lives inside this root are
 /// internal tool activity (e.g. codex memory maintenance under `~/.codex`),
@@ -50,6 +54,9 @@ pub fn tool_home(tool: Tool) -> Result<PathBuf> {
         Tool::Codex => Ok(env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or(home_dir()?.join(".codex"))),
+        Tool::Grok => Ok(env::var_os("GROK_HOME")
+            .map(PathBuf::from)
+            .unwrap_or(home_dir()?.join(".grok"))),
     }
 }
 

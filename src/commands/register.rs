@@ -8,8 +8,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
+    // Claude/Codex use snake_case; Grok uses camelCase on the same fields.
+    #[serde(default, alias = "sessionId")]
     session_id: Option<String>,
     cwd: Option<PathBuf>,
+    #[serde(default, alias = "transcriptPath")]
     transcript_path: Option<PathBuf>,
     source: Option<String>,
     name: Option<String>,

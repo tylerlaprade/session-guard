@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use toml::Value as TomlValue;
 use toml::map::Map as TomlMap;
@@ -8,6 +9,21 @@ use toml::map::Map as TomlMap;
 const CLAUDE_REGISTER: &str = r#"tool_pid="$PPID"; shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool claude --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool claude --pid "$tool_pid"; fi"#;
 const CLAUDE_DEREGISTER: &str = "session-guard deregister";
 const CODEX_REGISTER: &str = r#"tool_pid="$PPID"; shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool codex --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool codex --pid "$tool_pid"; fi"#;
+// Grok expands $VAR / ${VAR} in hook `command` strings and fails the hook when
+// the var is unset. $PPID is a shell special, not an env var, so inline Claude-
+// style commands break. Keep the register logic in a companion script instead.
+const GROK_REGISTER_SCRIPT_NAME: &str = "session-guard-register.sh";
+const GROK_HOOKS_FILE_NAME: &str = "session-guard.json";
+const GROK_REGISTER_SCRIPT: &str = r#"#!/bin/sh
+tool_pid="$PPID"
+shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"
+if [ -n "$shell_pid" ]; then
+  exec session-guard register --tool grok --pid "$tool_pid" --shell-pid "$shell_pid"
+else
+  exec session-guard register --tool grok --pid "$tool_pid"
+fi
+"#;
+const GROK_DEREGISTER: &str = "session-guard deregister";
 const OLD_CLAUDE_REGISTER: &str = "session-guard register --tool claude --pid \"$PPID\"";
 const OLD_CODEX_REGISTER: &str = "session-guard register --tool codex --pid \"$PPID\"";
 const OLD_CLAUDE_REGISTER_ENV: &str = "session-guard register --tool claude --session-id \"$CLAUDE_SESSION_ID\" --pid \"$PPID\" --directory \"$PWD\"";
@@ -95,6 +111,93 @@ pub fn remove_codex_hooks(path: &Path) -> Result<HookChange> {
     }
 
     Ok(HookChange { changed })
+}
+
+pub fn install_grok_hooks(hooks_dir: &Path) -> Result<HookChange> {
+    fs::create_dir_all(hooks_dir)
+        .with_context(|| format!("failed to create {}", hooks_dir.display()))?;
+
+    let script_path = hooks_dir.join(GROK_REGISTER_SCRIPT_NAME);
+    let json_path = hooks_dir.join(GROK_HOOKS_FILE_NAME);
+    let mut changed = false;
+
+    changed |= write_if_changed(&script_path, GROK_REGISTER_SCRIPT)?;
+    if changed || !is_executable(&script_path) {
+        let mut perms = fs::metadata(&script_path)
+            .with_context(|| format!("failed to stat {}", script_path.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms)
+            .with_context(|| format!("failed to chmod {}", script_path.display()))?;
+        changed = true;
+    }
+
+    let desired = grok_hooks_json();
+    changed |= write_if_changed(&json_path, &desired)?;
+
+    Ok(HookChange { changed })
+}
+
+pub fn remove_grok_hooks(hooks_dir: &Path) -> Result<HookChange> {
+    let mut changed = false;
+    for name in [GROK_HOOKS_FILE_NAME, GROK_REGISTER_SCRIPT_NAME] {
+        let path = hooks_dir.join(name);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            changed = true;
+        }
+    }
+    Ok(HookChange { changed })
+}
+
+fn grok_hooks_json() -> String {
+    // SessionStart has no matcher: Grok rejects matchers on lifecycle events.
+    // Stop re-registers each turn so a session that lost its registration stays
+    // restorable, matching Claude/Codex.
+    let root = json!({
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": GROK_REGISTER_SCRIPT_NAME
+                }]
+            }],
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": GROK_REGISTER_SCRIPT_NAME
+                }]
+            }],
+            "SessionEnd": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": GROK_DEREGISTER
+                }]
+            }]
+        }
+    });
+    let mut contents = serde_json::to_string_pretty(&root).expect("static grok hooks json");
+    contents.push('\n');
+    contents
+}
+
+fn write_if_changed(path: &Path, contents: &str) -> Result<bool> {
+    if path.exists() {
+        let existing = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if existing == contents {
+            return Ok(false);
+        }
+    }
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(true)
+}
+
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 fn read_json_config(path: &Path) -> Result<JsonValue> {
@@ -521,5 +624,46 @@ command = '{}'
         assert_eq!(start.len(), 1);
         assert!(toml_event_has_command(start, CODEX_REGISTER));
         assert!(!toml_event_has_command(start, OLD_CODEX_REGISTER_ENV));
+    }
+
+    #[test]
+    fn grok_hook_install_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_dir = dir.path().join("hooks");
+
+        assert!(install_grok_hooks(&hooks_dir).unwrap().changed);
+        assert!(!install_grok_hooks(&hooks_dir).unwrap().changed);
+
+        let json_path = hooks_dir.join(GROK_HOOKS_FILE_NAME);
+        let script_path = hooks_dir.join(GROK_REGISTER_SCRIPT_NAME);
+        assert!(json_path.is_file());
+        assert!(script_path.is_file());
+        assert!(is_executable(&script_path));
+
+        let root = read_json_config(&json_path).unwrap();
+        let start = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(start.len(), 1);
+        assert!(json_event_has_command(start, GROK_REGISTER_SCRIPT_NAME));
+        let stop = root["hooks"]["Stop"].as_array().unwrap();
+        assert!(json_event_has_command(stop, GROK_REGISTER_SCRIPT_NAME));
+        let end = root["hooks"]["SessionEnd"].as_array().unwrap();
+        assert!(json_event_has_command(end, GROK_DEREGISTER));
+
+        // Register script must not embed bare $VAR in the JSON command field —
+        // Grok expands those and fails when unset (e.g. $PPID).
+        let json_text = fs::read_to_string(json_path).unwrap();
+        assert!(!json_text.contains("$PPID"));
+        assert!(!json_text.contains("${"));
+    }
+
+    #[test]
+    fn grok_hook_remove_deletes_owned_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_dir = dir.path().join("hooks");
+        assert!(install_grok_hooks(&hooks_dir).unwrap().changed);
+        assert!(remove_grok_hooks(&hooks_dir).unwrap().changed);
+        assert!(!hooks_dir.join(GROK_HOOKS_FILE_NAME).exists());
+        assert!(!hooks_dir.join(GROK_REGISTER_SCRIPT_NAME).exists());
+        assert!(!remove_grok_hooks(&hooks_dir).unwrap().changed);
     }
 }

@@ -17,6 +17,7 @@ use std::path::PathBuf;
 pub enum Tool {
     Claude,
     Codex,
+    Grok,
 }
 
 impl Tool {
@@ -24,6 +25,7 @@ impl Tool {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
         }
     }
 }
@@ -81,7 +83,9 @@ impl std::fmt::Display for TerminalKind {
 
 #[derive(Parser)]
 #[command(name = "session-guard")]
-#[command(about = "Restore Claude Code and Codex CLI sessions after a macOS crash or reboot")]
+#[command(
+        about = "Restore Claude Code, Codex CLI, and Grok sessions after a macOS crash or reboot"
+    )]
 struct Cli {
     #[command(subcommand)]
     command: Command,

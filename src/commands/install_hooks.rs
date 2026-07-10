@@ -6,6 +6,7 @@ use anyhow::Result;
 pub fn run() -> Result<()> {
     let claude_installed = process::command_exists("claude");
     let codex_installed = process::command_exists("codex");
+    let grok_installed = process::command_exists("grok");
 
     let claude_hooks = if claude_installed {
         Some(hooks::install_claude_hooks(&paths::claude_settings()?)?)
@@ -17,6 +18,11 @@ pub fn run() -> Result<()> {
     } else {
         None
     };
+    let grok_hooks = if grok_installed {
+        Some(hooks::install_grok_hooks(&paths::grok_hooks_dir()?)?)
+    } else {
+        None
+    };
 
     println!(
         "Claude Code hooks: {}",
@@ -25,6 +31,10 @@ pub fn run() -> Result<()> {
     println!(
         "Codex hooks: {}",
         hook_summary(codex_installed, codex_hooks.as_ref())
+    );
+    println!(
+        "Grok hooks: {}",
+        hook_summary(grok_installed, grok_hooks.as_ref())
     );
     Ok(())
 }

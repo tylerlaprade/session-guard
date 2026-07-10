@@ -7,6 +7,7 @@ use std::process::Command;
 pub fn run(purge: bool) -> Result<()> {
     let claude = hooks::remove_claude_hooks(&paths::claude_settings()?)?;
     let codex = hooks::remove_codex_hooks(&paths::codex_config()?)?;
+    let grok = hooks::remove_grok_hooks(&paths::grok_hooks_dir()?)?;
 
     let plist = paths::launch_agent_plist()?;
     if plist.exists() {
@@ -34,6 +35,14 @@ pub fn run(purge: bool) -> Result<()> {
     println!(
         "Codex hooks: {}",
         if codex.changed {
+            "removed"
+        } else {
+            "not present"
+        }
+    );
+    println!(
+        "Grok hooks: {}",
+        if grok.changed {
             "removed"
         } else {
             "not present"

@@ -2,13 +2,13 @@
 name = "session-guard"
 version = "0.1.0"
 edition = "2024"
-description = "Track active Claude Code and Codex CLI sessions and restore them after a macOS crash or reboot."
+description = "Track active Claude Code, Codex CLI, and Grok sessions and restore them after a macOS crash or reboot."
 license = "GPL-3.0-only"
 repository = "https://github.com/tylerlaprade/session-guard"
 homepage = "https://github.com/tylerlaprade/session-guard"
 readme = "README.md"
 authors = ["Tyler Laprade <tyler@tylerlaprade.com>"]
-keywords = ["claude", "codex", "session", "macos", "restore"]
+keywords = ["claude", "codex", "grok", "session", "macos", "restore"]
 categories = ["command-line-utilities"]
 
 [dependencies]
