@@ -65,33 +65,53 @@ fn resolve_claude_session(session_id: &str) -> Result<Option<(PathBuf, PathBuf)>
     Ok(Some((directory, transcript_path)))
 }
 
-fn trackable_claude_session_id(process: &ProcInfo) -> Option<String> {
-    let command = process.command.as_str();
-    if command.contains("--bg-pty-host")
-        || command.contains("--bg-spare")
-        || command.contains("daemon run")
-        || command.contains("codex exec")
-    {
+pub(crate) fn trackable_claude_session_id(process: &ProcInfo) -> Option<String> {
+    if !is_claude_session_process(process) {
         return None;
     }
+    extract_session_id(&process.command)
+}
 
+pub(crate) fn is_claude_session_process(process: &ProcInfo) -> bool {
+    if !is_claude_process(process) {
+        return false;
+    }
+
+    let command = process.command.as_str();
+    let mut parts = command.split_whitespace();
+    let _binary = parts.next();
+    let first = parts.next();
+    let second = parts.next();
+    if matches!(first, Some("--bg-pty-host" | "--bg-spare"))
+        || (first == Some("daemon") && second == Some("run"))
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Conservative Claude CLI/process recognition for destructive cleanup.
+/// Unlike discovery, this intentionally includes background/daemon shapes: an
+/// unregistered live Claude process must make cleanup keep data, not guess.
+pub(crate) fn is_claude_process(process: &ProcInfo) -> bool {
+    let command = process.command.as_str();
     let binary = command.split_whitespace().next().unwrap_or_default();
     if binary.starts_with("/Applications/Claude.app/")
         || binary.starts_with("/Applications/Codex.app/")
     {
-        return None;
+        return false;
     }
 
-    if !command.contains(".local/share/claude/versions/")
+    if !binary.contains(".local/share/claude/versions/")
         && std::path::Path::new(binary)
             .file_name()
             .and_then(|name| name.to_str())
             != Some("claude")
     {
-        return None;
+        return false;
     }
-
-    extract_session_id(command)
+    true
 }
 
 fn extract_session_id(command: &str) -> Option<String> {
@@ -181,5 +201,16 @@ mod tests {
         ));
 
         assert_eq!(trackable_claude_session_id(&process), None);
+    }
+
+    #[test]
+    fn prompt_text_that_names_internal_commands_is_still_a_live_session() {
+        for phrase in ["--bg-pty-host", "--bg-spare", "daemon run", "codex exec"] {
+            let process = proc(&format!(
+                "claude --allow-dangerously-skip-permissions please inspect {phrase} behavior"
+            ));
+            assert!(is_claude_session_process(&process), "phrase: {phrase}");
+            assert!(is_claude_process(&process), "phrase: {phrase}");
+        }
     }
 }

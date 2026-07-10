@@ -57,6 +57,52 @@ pub fn process_command(pid: i32) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+pub fn process_start_identity(pid: i32) -> Result<String> {
+    query_process_start_identity(pid, "UTC")
+}
+
+fn query_process_start_identity(pid: i32, timezone: &str) -> Result<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        // `lstart` is textual and otherwise inherits the caller's locale and
+        // timezone. Hooks and the LaunchAgent do not necessarily share either,
+        // so force one stable representation before persisting/comparing it.
+        .env("LC_ALL", "C")
+        .env("TZ", timezone)
+        .output()
+        .with_context(|| format!("failed to inspect start time for pid {pid}"))?;
+
+    if !output.status.success() {
+        anyhow::bail!("ps could not inspect start time for pid {pid}");
+    }
+
+    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if identity.is_empty() {
+        anyhow::bail!("ps returned no start time for pid {pid}");
+    }
+    Ok(identity)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessIdentityStatus {
+    Alive,
+    Gone,
+    Unknown,
+}
+
+pub fn process_identity_status(pid: i32, expected_start: &str) -> ProcessIdentityStatus {
+    if !pid_is_alive(pid) {
+        return ProcessIdentityStatus::Gone;
+    }
+
+    match process_start_identity(pid) {
+        Ok(actual_start) if actual_start == expected_start => ProcessIdentityStatus::Alive,
+        // The PID exists but belongs to a process started at a different time.
+        Ok(_) => ProcessIdentityStatus::Gone,
+        Err(_) => ProcessIdentityStatus::Unknown,
+    }
+}
+
 pub fn list_processes() -> Result<Vec<ProcInfo>> {
     let output = Command::new("ps")
         .args(["-axww", "-o", "pid=,ppid=,command="])
@@ -145,4 +191,20 @@ pub fn cli_process_is_running(process_name: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_start_identity_is_normalized_to_utc() {
+        let pid = std::process::id() as i32;
+        let normalized = process_start_identity(pid).unwrap();
+        let utc = query_process_start_identity(pid, "UTC").unwrap();
+        let new_york = query_process_start_identity(pid, "America/New_York").unwrap();
+
+        assert_eq!(normalized, utc);
+        assert_ne!(utc, new_york, "test requires distinct timezone renderings");
+    }
 }

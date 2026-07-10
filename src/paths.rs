@@ -30,6 +30,20 @@ pub fn daemon_pid() -> Result<PathBuf> {
     Ok(config_dir()?.join("daemon.pid"))
 }
 
+pub fn cargo_targets_dir() -> Result<PathBuf> {
+    Ok(home_dir()?
+        .join("Library")
+        .join("Caches")
+        .join("session-guard")
+        .join("cargo-targets"))
+}
+
+pub fn claude_scratch_dir() -> PathBuf {
+    PathBuf::from(format!("/private/tmp/claude-{}", unsafe {
+        libc::geteuid()
+    }))
+}
+
 pub fn claude_settings() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join("settings.json"))
 }

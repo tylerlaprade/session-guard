@@ -1,3 +1,4 @@
+use crate::cargo_targets::{self, CacheRemoval};
 use crate::hooks;
 use crate::paths;
 use anyhow::{Context, Result};
@@ -5,6 +6,11 @@ use std::fs;
 use std::process::Command;
 
 pub fn run(purge: bool) -> Result<()> {
+    // Preflight before touching hooks, the LaunchAgent, or recovery config.
+    // The returned plan holds the exclusive cache lifecycle lease through
+    // removal, so another tab cannot start using a target mid-uninstall.
+    let cargo_cache_plan = cargo_targets::prepare_cache_removal()?;
+
     let claude = hooks::remove_claude_hooks(&paths::claude_settings()?)?;
     let codex = hooks::remove_codex_hooks(&paths::codex_config()?)?;
     let grok = hooks::remove_grok_hooks(&paths::grok_hooks_dir()?)?;
@@ -22,6 +28,8 @@ pub fn run(purge: bool) -> Result<()> {
                 .with_context(|| format!("failed to remove {}", config_dir.display()))?;
         }
     }
+
+    let cargo_cache = cargo_cache_plan.remove()?;
 
     println!("session-guard uninstalled");
     println!(
@@ -49,6 +57,13 @@ pub fn run(purge: bool) -> Result<()> {
         }
     );
     println!("LaunchAgent: removed");
+    println!(
+        "Session-owned Cargo targets: {}",
+        match cargo_cache {
+            CacheRemoval::Removed => "removed",
+            CacheRemoval::NotPresent => "not present",
+        }
+    );
     if purge {
         println!("Config directory: removed");
     }

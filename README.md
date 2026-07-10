@@ -29,6 +29,7 @@ Supported terminal values:
 session-guard status
 session-guard restore
 session-guard daemon
+session-guard cargo-target -- cargo test -p my-crate
 session-guard uninstall
 session-guard uninstall --purge
 ```
@@ -77,3 +78,27 @@ Codex non-interactive `codex exec` sessions are not currently tracked by hooks.
 Interactive Codex sessions are tracked and restored with
 `codex resume <session-id>`. Grok sessions are restored with
 `grok --resume <session-id>`.
+
+## Temporary Cargo targets
+
+Use the repository's normal shared Cargo target for routine builds. When a
+build genuinely needs an isolated target, run it through session-guard:
+
+```sh
+session-guard cargo-target -- cargo test -p my-crate
+```
+
+The wrapper derives the Claude, Codex, or Grok session/thread ID and verifies
+the owning tool process by both PID and process start time. It then sets
+`CARGO_TARGET_DIR` to a per-session directory under
+`~/Library/Caches/session-guard/cargo-targets/`. It fails without running the
+command if it cannot prove that ownership.
+
+The daemon reuses the target for that session while its exact owning process
+is alive. Once that PID and process-start identity are gone, it removes only
+the target bearing session-guard's matching ownership marker; recoverable
+session records and transcripts are unaffected. It also removes
+verified Cargo build-target directories inside Claude scratchpads whose exact
+session UUID is absent from the registry and whose transcript has been
+inactive for more than 24 hours. Scratch source, patches, task output, and all
+transcripts remain untouched.

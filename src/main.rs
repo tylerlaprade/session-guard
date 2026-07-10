@@ -1,4 +1,5 @@
 mod adapters;
+mod cargo_targets;
 mod commands;
 mod hooks;
 mod paths;
@@ -10,6 +11,7 @@ mod transcripts;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -84,8 +86,8 @@ impl std::fmt::Display for TerminalKind {
 #[derive(Parser)]
 #[command(name = "session-guard")]
 #[command(
-        about = "Restore Claude Code, Codex CLI, and Grok sessions after a macOS crash or reboot"
-    )]
+    about = "Restore Claude Code, Codex CLI, and Grok sessions after a macOS crash or reboot"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -94,6 +96,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Daemon,
+    /// Run a command with a temporary Cargo target owned by this agent session.
+    CargoTarget {
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
+    },
     Install {
         #[arg(long, value_enum)]
         terminal: TerminalKind,
@@ -133,6 +140,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Daemon => commands::daemon::run(),
+        Command::CargoTarget { command } => cargo_targets::run(command),
         Command::Install { terminal } => commands::install::run(terminal),
         Command::InstallHooks => commands::install_hooks::run(),
         Command::Uninstall { purge } => commands::uninstall::run(purge),

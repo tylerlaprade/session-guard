@@ -1,4 +1,5 @@
 use crate::adapters::{adapter_for, shell_quote};
+use crate::cargo_targets;
 use crate::paths;
 use crate::process;
 use crate::scan;
@@ -15,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
+
+const CARGO_TARGET_CLEANUP_MONITOR_CYCLES: u16 = 60;
 
 #[derive(Debug, Default)]
 pub struct RestoreSummary {
@@ -97,6 +100,7 @@ pub fn run() -> Result<()> {
     if added > 0 {
         log_line(&format!("scan added {added} sessions"))?;
     }
+    run_cargo_target_cleanup()?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let restore_requested = Arc::new(AtomicBool::new(false));
@@ -111,6 +115,7 @@ pub fn run() -> Result<()> {
     }
 
     let mut seconds_until_monitor = 60;
+    let mut monitor_cycles_until_cleanup = CARGO_TARGET_CLEANUP_MONITOR_CYCLES;
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
 
@@ -148,12 +153,42 @@ pub fn run() -> Result<()> {
                     summary.pruned_expired
                 ))?;
             }
+
+            monitor_cycles_until_cleanup -= 1;
+            if monitor_cycles_until_cleanup == 0 {
+                run_cargo_target_cleanup()?;
+                monitor_cycles_until_cleanup = CARGO_TARGET_CLEANUP_MONITOR_CYCLES;
+            }
             seconds_until_monitor = 60;
         }
     }
 
     log_line("daemon stopped")?;
     remove_pid_file_if_current()?;
+    Ok(())
+}
+
+fn run_cargo_target_cleanup() -> Result<()> {
+    match cargo_targets::cleanup_once() {
+        Ok(summary) => {
+            if summary.owned_targets > 0 {
+                log_line(&format!(
+                    "cleanup removed {} abandoned session-owned Cargo targets",
+                    summary.owned_targets
+                ))?;
+            }
+            if summary.claude_scratch_targets > 0 {
+                log_line(&format!(
+                    "cleanup removed {} inactive Claude scratch Cargo targets",
+                    summary.claude_scratch_targets
+                ))?;
+            }
+            for error in summary.errors {
+                log_line(&error)?;
+            }
+        }
+        Err(error) => log_line(&format!("Cargo target cleanup failed: {error:#}"))?,
+    }
     Ok(())
 }
 
