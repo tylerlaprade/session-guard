@@ -26,7 +26,6 @@ pub struct RestoreSummary {
     pub restored_grok: usize,
     pub pruned_missing_dirs: usize,
     pub pruned_duplicates: usize,
-    pub preserved_recoverable: usize,
     pub fallback_sessions: usize,
     pub failed: usize,
     pub errors: Vec<String>,
@@ -52,12 +51,6 @@ impl RestoreSummary {
                 self.pruned_duplicates
             ));
         }
-        if self.preserved_recoverable > 0 {
-            message.push_str(&format!(
-                " Preserved {} recoverable sessions.",
-                self.preserved_recoverable
-            ));
-        }
         if self.fallback_sessions > 0 {
             message.push_str(&format!(
                 " Added {} transcript fallback sessions.",
@@ -74,7 +67,6 @@ impl RestoreSummary {
 #[derive(Debug, Default)]
 pub struct MonitorSummary {
     pub marked_recoverable: usize,
-    pub removed_closed: usize,
     pub pruned_expired: usize,
 }
 
@@ -96,12 +88,9 @@ pub fn run() -> Result<()> {
     write_pid_file()?;
     log_line("daemon started")?;
 
-    let added = reconcile_from_scan()?;
-    if added > 0 {
-        log_line(&format!("scan added {added} sessions"))?;
-    }
-    run_cargo_target_cleanup()?;
-
+    // Restore *before* scan. Scan calls mark_active() on still-running tools
+    // (including headless Claude workers), which rewrites last_seen_at to
+    // "now" and would push crash-window sessions outside any startup window.
     let shutdown = Arc::new(AtomicBool::new(false));
     let restore_requested = Arc::new(AtomicBool::new(false));
     flag::register(SIGTERM, Arc::clone(&shutdown))?;
@@ -113,6 +102,12 @@ pub fn run() -> Result<()> {
     for error in &summary.errors {
         log_line(error)?;
     }
+
+    let added = reconcile_from_scan()?;
+    if added > 0 {
+        log_line(&format!("scan added {added} sessions"))?;
+    }
+    run_cargo_target_cleanup()?;
 
     let mut seconds_until_monitor = 60;
     let mut monitor_cycles_until_cleanup = CARGO_TARGET_CLEANUP_MONITOR_CYCLES;
@@ -139,12 +134,6 @@ pub fn run() -> Result<()> {
                 log_line(&format!(
                     "monitor marked {} sessions recoverable",
                     summary.marked_recoverable
-                ))?;
-            }
-            if summary.removed_closed > 0 {
-                log_line(&format!(
-                    "monitor removed {} sessions whose tool and shell exited",
-                    summary.removed_closed
                 ))?;
             }
             if summary.pruned_expired > 0 {
@@ -217,37 +206,43 @@ pub fn reconcile_from_scan() -> Result<usize> {
     })
 }
 
-// The daemon's monitor cycle bumps `last_seen_at` for every alive session
-// roughly every 60 seconds. So when the daemon restarts, the maximum
-// `last_seen_at` in the file marks the last moment the previous daemon ran —
-// i.e., right before it (and usually the sessions running alongside it) went
-// away. Sessions whose `last_seen_at` falls within this window of that maximum
-// were alive when the daemon stopped and are restored; anything much older was
-// already sitting in the recoverable pile and is left alone.
+// Dual PID death is ambiguous (intentional close vs jetsam/WindowServer), so
+// monitor never deletes on PID death alone — only deregister or 7-day expiry.
 //
-// This deliberately keys off the daemon's own last heartbeat rather than the
-// kernel boot time. A logout or GUI-session crash kills every terminal — and
-// the daemon with them — without rebooting the kernel, so a boot-time check
-// would never fire for those sessions even though they should come back.
+// Restore policy:
+// - Never open a new tab if the recorded shell is still alive (tab still open).
+// - Manual restore: every both-dead recoverable session.
+// - Startup restore: only the crash cluster — last_seen within 2 minutes of
+//   the newest last_seen already in the file. That reopens sessions that died
+//   with the previous daemon epoch, without reopening hours-old intentional
+//   closes when the daemon is merely restarted for an upgrade.
+// - Restore runs before process scan so survivors cannot rewrite heartbeats.
+// - After open_tab succeeds, keep the record (source="restored") with a
+//   cooldown so a second restore does not spam duplicate tabs.
+
 const LIVENESS_CLUSTER_WINDOW_SECS: i64 = 120;
+const RESTORE_COOLDOWN_SECS: i64 = 30 * 60;
+const RESTORED_SOURCE: &str = "restored";
 
 pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let path = paths::sessions_file()?;
     let _ = sessions::repair_if_corrupt(&path)?;
     let fallback_sessions = transcripts::discover_recent_sessions().unwrap_or_default();
-    let mut adapter = None;
+    let now = chrono::Utc::now();
 
-    sessions::with_sessions_mut(&path, |sessions| {
-        let mut summary = RestoreSummary::default();
-        if sessions.is_empty() && !fallback_sessions.is_empty() {
-            summary.fallback_sessions = fallback_sessions.len();
-            sessions.extend(fallback_sessions.clone());
-        }
+    // Phase 1: decide who to restore under the sessions lock (no AppleScript).
+    let (mut summary, alive_kept, to_open) =
+        sessions::with_sessions_mut(&path, |sessions| {
+            let mut summary = RestoreSummary::default();
+            if sessions.is_empty() && !fallback_sessions.is_empty() {
+                summary.fallback_sessions = fallback_sessions.len();
+                sessions.extend(fallback_sessions.clone());
+            }
 
-        let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary);
+            let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary);
 
-        let activity_cutoff =
-            matches!(mode, RestoreMode::Startup)
+            // Crash cluster uses on-disk last_seen only (before mark_active).
+            let activity_cutoff = matches!(mode, RestoreMode::Startup)
                 .then(|| {
                     unique.iter().map(|s| s.last_seen_at).max().map(|t_max| {
                         t_max - chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS)
@@ -255,69 +250,119 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 })
                 .flatten();
 
-        let mut kept = Vec::new();
+            let mut alive_kept = Vec::new();
+            let mut to_open = Vec::new();
 
-        for mut session in unique {
-            if session_is_alive(&session) {
-                session.mark_active();
-                kept.push(session);
-                continue;
+            for mut session in unique {
+                if session_is_alive(&session) {
+                    session.mark_active();
+                    alive_kept.push(session);
+                    continue;
+                }
+
+                if !session.directory.is_dir() {
+                    summary.pruned_missing_dirs += 1;
+                    continue;
+                }
+
+                session.mark_recoverable();
+
+                // Shell still up ⇒ Ghostty/terminal tab still exists. Opening
+                // another tab duplicates work that is already on screen.
+                if session_shell_is_alive(&session) {
+                    alive_kept.push(session);
+                    continue;
+                }
+
+                if recently_restored(&session, now) {
+                    alive_kept.push(session);
+                    continue;
+                }
+
+                if let Some(cutoff) = activity_cutoff
+                    && session.last_seen_at < cutoff
+                {
+                    // Older recoverable pile (earlier intentional closes, etc.)
+                    alive_kept.push(session);
+                    continue;
+                }
+
+                to_open.push(session);
             }
 
-            if !session.directory.is_dir() {
-                summary.pruned_missing_dirs += 1;
-                continue;
-            }
+            // Hold only non-opening sessions while tabs are opened outside the lock.
+            *sessions = alive_kept.clone();
+            Ok((summary, alive_kept, to_open))
+        })?;
 
-            session.mark_recoverable();
+    // Phase 2: open tabs without holding the exclusive sessions lock.
+    let mut adapter = None;
+    let mut opened = Vec::new();
+    for mut session in to_open {
+        if adapter.is_none() {
+            let kind = configured_terminal()?;
+            adapter = Some(adapter_for(kind));
+        }
 
-            if let Some(cutoff) = activity_cutoff
-                && session.last_seen_at < cutoff
-            {
-                summary.preserved_recoverable += 1;
-                kept.push(session);
-                continue;
-            }
-
-            if matches!(mode, RestoreMode::Startup) && !transcript_present(&session) {
-                summary.preserved_recoverable += 1;
-                kept.push(session);
-                continue;
-            }
-
-            if adapter.is_none() {
-                let kind = configured_terminal()?;
-                adapter = Some(adapter_for(kind));
-            }
-
-            let command = resume_command(&session);
-            match adapter
-                .as_ref()
-                .unwrap()
-                .open_tab(&session.directory, &command)
-            {
-                Ok(()) => match session.tool {
+        let command = resume_command(&session);
+        match adapter
+            .as_ref()
+            .unwrap()
+            .open_tab(&session.directory, &command)
+        {
+            Ok(()) => {
+                match session.tool {
                     Tool::Claude => summary.restored_claude += 1,
                     Tool::Codex => summary.restored_codex += 1,
                     Tool::Grok => summary.restored_grok += 1,
-                },
-                Err(error) => {
-                    summary.failed += 1;
-                    summary.errors.push(format!(
-                        "failed to restore {} in {}: {error:#}",
-                        session.session_id,
-                        session.directory.display()
-                    ));
-                    kept.push(session);
                 }
+                session.source = Some(RESTORED_SOURCE.to_string());
+                session.last_seen_at = now;
             }
-
-            thread::sleep(Duration::from_millis(350));
+            Err(error) => {
+                summary.failed += 1;
+                summary.errors.push(format!(
+                    "failed to restore {} in {}: {error:#}",
+                    session.session_id,
+                    session.directory.display()
+                ));
+            }
         }
+        opened.push(session);
+        thread::sleep(Duration::from_millis(350));
+    }
 
-        *sessions = kept;
-        Ok(summary)
-    })
+    // Phase 3: write restored/failed records back (merge with anything hooks added).
+    sessions::with_sessions_mut(&path, |sessions| {
+        let mut by_id: HashMap<String, SessionRecord> = HashMap::new();
+        for session in alive_kept
+            .into_iter()
+            .chain(opened.into_iter())
+            .chain(sessions.drain(..))
+        {
+            by_id
+                .entry(session.session_id.clone())
+                .and_modify(|existing| {
+                    if should_replace(existing, &session) {
+                        *existing = session.clone();
+                    }
+                })
+                .or_insert(session);
+        }
+        *sessions = by_id.into_values().collect();
+        Ok(())
+    })?;
+
+    Ok(summary)
+}
+
+fn recently_restored(session: &SessionRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if session.source.as_deref() != Some(RESTORED_SOURCE) {
+        return false;
+    }
+    now.signed_duration_since(session.last_seen_at)
+        .num_seconds()
+        < RESTORE_COOLDOWN_SECS
 }
 
 pub fn monitor_once() -> Result<MonitorSummary> {
@@ -330,28 +375,14 @@ pub fn monitor_once() -> Result<MonitorSummary> {
                 continue;
             }
 
-            if session.state == SessionState::Active
-                && session.shell_pid.is_some()
-                && !session_shell_is_alive(session)
-            {
-                continue;
-            }
-
+            // Tool (and possibly shell) are dead. Jetsam and WindowServer
+            // crashes kill both PIDs while this daemon often keeps running —
+            // never treat that as an intentional close.
             if session.state == SessionState::Active {
                 session.mark_recoverable();
                 summary.marked_recoverable += 1;
             }
         }
-
-        let before = sessions.len();
-        sessions.retain(|session| {
-            let closed = session.state == SessionState::Active
-                && session.shell_pid.is_some()
-                && !session_shell_is_alive(session)
-                && !session_is_alive(session);
-            !closed
-        });
-        summary.removed_closed = before - sessions.len();
 
         let before = sessions.len();
         sessions.retain(|session| !session.recoverable_expired());
@@ -426,18 +457,24 @@ fn configured_terminal() -> Result<TerminalKind> {
     contents.parse()
 }
 
-fn transcript_present(session: &SessionRecord) -> bool {
-    match &session.transcript_path {
-        Some(path) => path.exists(),
-        None => true,
-    }
-}
-
 fn session_is_alive(session: &SessionRecord) -> bool {
-    session
+    let tool_alive = session
         .pid
         .map(|pid| process::pid_is_alive(pid) && process::pid_is_tool(pid, session.tool))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !tool_alive {
+        return false;
+    }
+
+    // Hook-tracked sessions record a shell PID for the Ghostty/terminal tab.
+    // A forked/headless tool can outlive that tab (Claude remote workers under
+    // launchd). Requiring the shell prevents "still alive" from blocking
+    // restore of a tab the user no longer has.
+    if session.shell_pid.is_some() {
+        return session_shell_is_alive(session);
+    }
+
+    true
 }
 
 fn session_shell_is_alive(session: &SessionRecord) -> bool {
@@ -493,5 +530,73 @@ fn resume_command(session: &SessionRecord) -> String {
         Tool::Claude => format!("claude --resume {session_id}"),
         Tool::Codex => format!("codex resume {session_id}"),
         Tool::Grok => format!("grok --resume {session_id}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sessions::SessionRecord;
+    use chrono::{Duration, Utc};
+    use std::path::PathBuf;
+
+    fn sample(tool: Tool, id: &str) -> SessionRecord {
+        SessionRecord::new(
+            tool,
+            id.to_string(),
+            None,
+            None,
+            PathBuf::from("/tmp/proj"),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn resume_commands_match_each_tool() {
+        assert_eq!(
+            resume_command(&sample(Tool::Claude, "abc")),
+            "claude --resume 'abc'"
+        );
+        assert_eq!(
+            resume_command(&sample(Tool::Codex, "def")),
+            "codex resume 'def'"
+        );
+        assert_eq!(
+            resume_command(&sample(Tool::Grok, "ghi")),
+            "grok --resume 'ghi'"
+        );
+    }
+
+    #[test]
+    fn recently_restored_respects_source_and_cooldown() {
+        let now = Utc::now();
+        let mut session = sample(Tool::Claude, "abc");
+        assert!(!recently_restored(&session, now));
+
+        session.source = Some(RESTORED_SOURCE.to_string());
+        session.last_seen_at = now - Duration::seconds(10);
+        assert!(recently_restored(&session, now));
+
+        session.last_seen_at = now - Duration::seconds(RESTORE_COOLDOWN_SECS + 1);
+        assert!(!recently_restored(&session, now));
+    }
+
+    #[test]
+    fn restore_summary_message_lists_counts() {
+        let summary = RestoreSummary {
+            restored_claude: 2,
+            restored_codex: 1,
+            restored_grok: 1,
+            pruned_missing_dirs: 0,
+            pruned_duplicates: 1,
+            fallback_sessions: 0,
+            failed: 0,
+            errors: vec![],
+        };
+        let message = summary.message();
+        assert!(message.contains("Restored 4 sessions"));
+        assert!(message.contains("Pruned 1 duplicate"));
     }
 }

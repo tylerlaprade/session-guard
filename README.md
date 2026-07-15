@@ -48,22 +48,32 @@ heartbeat; it does not install a made-up `SessionEnd` hook. Grok hooks live in
 expands `$VAR` in inline hook commands and rejects unset vars such as `$PPID`.
 
 The daemon does not treat a dead tool PID as proof that a session should be
-forgotten. During normal monitoring:
+forgotten. Jetsam (memory pressure) and WindowServer crashes often kill the
+tool and shell while the daemon keeps running; that must not erase the
+registry entry. During normal monitoring:
 
 | Tool PID | Shell PID | Meaning | Action |
 | --- | --- | --- | --- |
-| alive | alive | Session is running | Keep active |
+| alive | alive | Session is running in its tab | Keep active |
+| alive | dead | Tool outlived the tab (e.g. headless worker) | Mark recoverable |
 | dead | alive | Tool died while the tab still exists | Mark recoverable |
-| dead | dead | Tool and shell exited | Remove during normal monitor |
+| dead | dead | Both gone (close, jetsam, or crash) | Mark recoverable |
 | unknown | unknown | PID data unavailable | Keep recoverable |
 
-At daemon startup, sessions that were alive in the final heartbeat before the
-previous daemon stopped — i.e., that died alongside it — are restored. This
-keys off the daemon's own last heartbeat rather than the kernel boot time, so a
-logout or GUI-session crash (which kills every terminal and the daemon without
-rebooting the kernel) triggers recovery the same as a reboot does. Sessions
-already sitting in the recoverable pile from earlier are left alone. Manual
-`session-guard restore` restores recoverable sessions immediately.
+Sessions leave the registry only via explicit deregister (Stop hooks) or after
+the 7-day recoverable expiry. If the shell PID is still alive, restore never
+opens a new tab (the existing terminal tab is enough).
+
+**Startup restore** reopens only the crash cluster: sessions whose
+`last_seen_at` falls within 2 minutes of the newest heartbeat already in the
+file (and whose tool *and* shell are dead). That brings back work that died
+with the previous daemon epoch without reopening hours-old intentional closes
+when the daemon is merely restarted for an upgrade. **Manual**
+`session-guard restore` reopens every both-dead recoverable session.
+
+Restore runs before process scan so surviving headless workers cannot rewrite
+heartbeats. After a successful tab open the record stays recoverable until
+hooks re-register it live; a 30-minute cooldown prevents duplicate tabs.
 
 If `active-sessions.json` is missing or had to be moved aside as corrupt,
 restore can rebuild recent recoverable entries from transcript/session files:

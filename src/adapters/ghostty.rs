@@ -40,7 +40,13 @@ end tell"#,
 
         let mut osa = Command::new("osascript");
         osa.args(["-e", &script]);
-        run_checked(osa, "opening Ghostty tab")
+        // Ghostty scripting can hang when the app is busy/recovering; do not
+        // block the daemon (or its sessions lock) forever.
+        super::run_checked_timeout(
+            &mut osa,
+            "opening Ghostty tab",
+            Duration::from_secs(15),
+        )
     }
 
     fn is_running(&self) -> bool {

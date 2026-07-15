@@ -6,7 +6,7 @@ mod terminal_app;
 mod wezterm;
 
 use crate::TerminalKind;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 pub trait TerminalAdapter {
@@ -47,9 +47,49 @@ pub fn shell_line(directory: &Path, command: &str) -> String {
 }
 
 pub fn run_checked(mut command: std::process::Command, description: &str) -> Result<()> {
-    let status = command.status()?;
-    if !status.success() {
-        anyhow::bail!("{description} failed with status {status}");
+    run_checked_timeout(
+        &mut command,
+        description,
+        std::time::Duration::from_secs(30),
+    )
+}
+
+/// Run a process with a hard timeout so a stuck AppleScript/osascript cannot
+/// wedge the restore path (and the sessions-file lock) indefinitely.
+pub fn run_checked_timeout(
+    command: &mut std::process::Command,
+    description: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn for {description}"))?;
+    let start = Instant::now();
+    loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("failed to wait for {description}"))?
+        {
+            Some(status) => {
+                if !status.success() {
+                    anyhow::bail!("{description} failed with status {status}");
+                }
+                return Ok(());
+            }
+            None => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "{description} timed out after {}s",
+                        timeout.as_secs()
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
-    Ok(())
 }

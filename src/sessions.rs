@@ -116,6 +116,10 @@ impl SessionRecord {
         self.dead_at = None;
         self.recoverable_until = None;
         self.last_seen_at = Utc::now();
+        // Clear restore-cooldown tag so a later crash can re-open this session.
+        if self.source.as_deref() == Some("restored") {
+            self.source = None;
+        }
     }
 
     pub fn recoverable_expired(&self) -> bool {
@@ -313,5 +317,25 @@ mod tests {
         assert_eq!(sessions[0].pid, Some(42));
         assert_eq!(sessions[0].state, SessionState::Active);
         assert!(sessions[0].transcript_path.is_none());
+    }
+
+    #[test]
+    fn mark_active_clears_restored_cooldown_source() {
+        let mut session = SessionRecord::new(
+            Tool::Claude,
+            "abc".to_string(),
+            Some(1),
+            Some(2),
+            PathBuf::from("/tmp/p"),
+            None,
+            None,
+            Some("restored".to_string()),
+        );
+        session.mark_recoverable();
+        assert_eq!(session.state, SessionState::Recoverable);
+        session.mark_active();
+        assert_eq!(session.state, SessionState::Active);
+        assert!(session.source.is_none());
+        assert!(session.dead_at.is_none());
     }
 }
