@@ -238,18 +238,18 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let processes = ProcessSnapshot::capture()?;
 
     // Phase 1: decide who to restore under the sessions lock (no AppleScript).
-    let (mut summary, alive_kept, to_open) =
-        sessions::with_sessions_mut(&path, |sessions| {
-            let mut summary = RestoreSummary::default();
-            if sessions.is_empty() && !fallback_sessions.is_empty() {
-                summary.fallback_sessions = fallback_sessions.len();
-                sessions.extend(fallback_sessions.clone());
-            }
+    let (mut summary, alive_kept, to_open) = sessions::with_sessions_mut(&path, |sessions| {
+        let mut summary = RestoreSummary::default();
+        if sessions.is_empty() && !fallback_sessions.is_empty() {
+            summary.fallback_sessions = fallback_sessions.len();
+            sessions.extend(fallback_sessions.clone());
+        }
 
-            let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary, &processes);
+        let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary, &processes);
 
-            // Crash cluster uses on-disk last_seen only (before mark_active).
-            let activity_cutoff = matches!(mode, RestoreMode::Startup)
+        // Crash cluster uses on-disk last_seen only (before mark_active).
+        let activity_cutoff =
+            matches!(mode, RestoreMode::Startup)
                 .then(|| {
                     unique.iter().map(|s| s.last_seen_at).max().map(|t_max| {
                         t_max - chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS)
@@ -257,60 +257,60 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 })
                 .flatten();
 
-            let mut alive_kept = Vec::new();
-            let mut to_open = Vec::new();
+        let mut alive_kept = Vec::new();
+        let mut to_open = Vec::new();
 
-            for mut session in unique {
-                let was_recoverable = session.state == SessionState::Recoverable;
-                if session_is_alive(&session, &processes) {
-                    session.mark_active();
-                    alive_kept.push(session);
-                    continue;
-                }
-
-                if !session.directory.is_dir() {
-                    summary.pruned_missing_dirs += 1;
-                    continue;
-                }
-
-                session.mark_recoverable();
-
-                // Already recoverable on disk ⇒ a previous epoch's monitor saw
-                // this session die — an observed close, not one that fell with
-                // the epoch. A daemon upgrade/restart must not resurrect it.
-                // Manual restore still offers it.
-                if matches!(mode, RestoreMode::Startup) && was_recoverable {
-                    alive_kept.push(session);
-                    continue;
-                }
-
-                // Shell still up ⇒ Ghostty/terminal tab still exists. Opening
-                // another tab duplicates work that is already on screen.
-                if session_shell_is_alive(&session, &processes) {
-                    alive_kept.push(session);
-                    continue;
-                }
-
-                if recently_restored(&session, now) {
-                    alive_kept.push(session);
-                    continue;
-                }
-
-                if let Some(cutoff) = activity_cutoff
-                    && session.last_seen_at < cutoff
-                {
-                    // Older recoverable pile (earlier intentional closes, etc.)
-                    alive_kept.push(session);
-                    continue;
-                }
-
-                to_open.push(session);
+        for mut session in unique {
+            let was_recoverable = session.state == SessionState::Recoverable;
+            if session_is_alive(&session, &processes) {
+                session.mark_active();
+                alive_kept.push(session);
+                continue;
             }
 
-            // Hold only non-opening sessions while tabs are opened outside the lock.
-            *sessions = alive_kept.clone();
-            Ok((summary, alive_kept, to_open))
-        })?;
+            if !session.directory.is_dir() {
+                summary.pruned_missing_dirs += 1;
+                continue;
+            }
+
+            session.mark_recoverable();
+
+            // Already recoverable on disk ⇒ a previous epoch's monitor saw
+            // this session die — an observed close, not one that fell with
+            // the epoch. A daemon upgrade/restart must not resurrect it.
+            // Manual restore still offers it.
+            if matches!(mode, RestoreMode::Startup) && was_recoverable {
+                alive_kept.push(session);
+                continue;
+            }
+
+            // Shell still up ⇒ Ghostty/terminal tab still exists. Opening
+            // another tab duplicates work that is already on screen.
+            if session_shell_is_alive(&session, &processes) {
+                alive_kept.push(session);
+                continue;
+            }
+
+            if recently_restored(&session, now) {
+                alive_kept.push(session);
+                continue;
+            }
+
+            if let Some(cutoff) = activity_cutoff
+                && session.last_seen_at < cutoff
+            {
+                // Older recoverable pile (earlier intentional closes, etc.)
+                alive_kept.push(session);
+                continue;
+            }
+
+            to_open.push(session);
+        }
+
+        // Hold only non-opening sessions while tabs are opened outside the lock.
+        *sessions = alive_kept.clone();
+        Ok((summary, alive_kept, to_open))
+    })?;
 
     // Phase 2: open tabs without holding the exclusive sessions lock.
     let mut adapter = None;

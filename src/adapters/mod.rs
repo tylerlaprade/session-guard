@@ -83,10 +83,7 @@ pub fn run_checked_timeout(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    anyhow::bail!(
-                        "{description} timed out after {}s",
-                        timeout.as_secs()
-                    );
+                    anyhow::bail!("{description} timed out after {}s", timeout.as_secs());
                 }
                 thread::sleep(Duration::from_millis(50));
             }

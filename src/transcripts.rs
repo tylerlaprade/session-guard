@@ -397,7 +397,10 @@ mod tests {
         fs::write(&no_meta, r#"{"type":"turn_context","payload":{}}"#).unwrap();
         assert!(!codex_rollout_is_cli(&no_meta, "a"));
 
-        assert!(!codex_rollout_is_cli(&dir.path().join("missing.jsonl"), "a"));
+        assert!(!codex_rollout_is_cli(
+            &dir.path().join("missing.jsonl"),
+            "a"
+        ));
     }
 
     #[test]
@@ -439,9 +442,6 @@ mod tests {
         let (id, cwd, timestamp) = read_grok_summary(&path).unwrap().unwrap();
         assert_eq!(id, "019f486e-061f-7343-b53e-f487a0f30e85");
         assert_eq!(cwd, PathBuf::from("/tmp/project"));
-        assert_eq!(
-            timestamp.to_rfc3339(),
-            "2026-07-10T00:02:58.951370+00:00"
-        );
+        assert_eq!(timestamp.to_rfc3339(), "2026-07-10T00:02:58.951370+00:00");
     }
 }

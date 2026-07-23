@@ -42,11 +42,7 @@ end tell"#,
         osa.args(["-e", &script]);
         // Ghostty scripting can hang when the app is busy/recovering; do not
         // block the daemon (or its sessions lock) forever.
-        super::run_checked_timeout(
-            &mut osa,
-            "opening Ghostty tab",
-            Duration::from_secs(15),
-        )
+        super::run_checked_timeout(&mut osa, "opening Ghostty tab", Duration::from_secs(15))
     }
 
     fn is_running(&self) -> bool {
