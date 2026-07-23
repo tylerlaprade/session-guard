@@ -109,6 +109,13 @@ fn read_grok_summary(path: &Path) -> Result<Option<(String, PathBuf, DateTime<Ut
     let contents = fs::read_to_string(path)?;
     let value: Value = serde_json::from_str(&contents)?;
 
+    // Grok subagent sessions are children of a primary session, never tabs of
+    // their own. (Live subagents never register either: Grok fires separate
+    // SubagentStart/SubagentStop events that session-guard does not hook.)
+    if value.get("session_kind").and_then(Value::as_str) == Some("subagent") {
+        return Ok(None);
+    }
+
     let session_id = value
         .pointer("/info/id")
         .and_then(Value::as_str)
@@ -150,6 +157,13 @@ fn discover_jsonl(root: &Path, tool: Tool, sessions: &mut Vec<SessionRecord>) ->
             continue;
         }
 
+        if tool == Tool::Codex
+            && !filename_session_id(&path, tool)
+                .is_some_and(|session_id| codex_rollout_is_cli(&path, &session_id))
+        {
+            continue;
+        }
+
         let Some((session_id, directory, timestamp)) = read_metadata(&path, tool).ok().flatten()
         else {
             continue;
@@ -160,6 +174,44 @@ fn discover_jsonl(root: &Path, tool: Tool, sessions: &mut Vec<SessionRecord>) ->
     }
 
     Ok(())
+}
+
+/// The Codex desktop app, its scheduled automations, `codex exec`, and
+/// subagents run through the same codex core as the terminal TUI, sharing
+/// `~/.codex` and firing the same hooks — but their threads live outside any
+/// terminal tab and restore as junk. The rollout's `session_meta` records the
+/// owning frontend. A rollout also embeds its ANCESTOR chain's metas — a
+/// subagent file ends with the root terminal's "cli" meta — so only metas for
+/// the session's own id count; re-opening the thread appends another own-id
+/// meta, and the latest of those decides. Only `source == "cli"` threads
+/// belong in a tab.
+pub fn codex_rollout_is_cli(path: &Path, session_id: &str) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+
+    let mut source = None;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        if !line.contains("\"session_meta\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta")
+            && value.pointer("/payload/id").and_then(Value::as_str) == Some(session_id)
+            && let Some(meta_source) = value.pointer("/payload/source")
+        {
+            source = Some(meta_source.clone());
+        }
+    }
+
+    // Subagent threads carry an object source ({"subagent": ...}); as_str
+    // rejects those along with "vscode"/"exec"/"mcp".
+    source.is_some_and(|source| source.as_str() == Some("cli"))
 }
 
 fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -256,6 +308,7 @@ fn file_modified_at(path: &Path) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::Write;
 
     #[test]
@@ -274,6 +327,94 @@ mod tests {
         let (id, cwd, _) = read_metadata(&path, Tool::Codex).unwrap().unwrap();
         assert_eq!(id, "019dd0a8-a320-78b3-a770-fffc78f09c5d");
         assert_eq!(cwd, PathBuf::from("/tmp/project"));
+    }
+
+    #[test]
+    fn codex_rollout_latest_own_session_meta_decides_frontend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+
+        // Desktop-only thread: never a tab.
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"a","cwd":"/tmp","source":"vscode"}}"#,
+        )
+        .unwrap();
+        assert!(!codex_rollout_is_cli(&path, "a"));
+
+        // Re-opened in a terminal afterwards: the appended own-id cli meta wins.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"id":"a","cwd":"/tmp","source":"cli"}}}}"#
+        )
+        .unwrap();
+        assert!(codex_rollout_is_cli(&path, "a"));
+
+        // Picked up by the desktop app afterwards: no longer a tab.
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"id":"a","cwd":"/tmp","source":"vscode"}}}}"#
+        )
+        .unwrap();
+        assert!(!codex_rollout_is_cli(&path, "a"));
+    }
+
+    #[test]
+    fn codex_rollout_ancestor_chain_meta_does_not_leak_cli() {
+        // A subagent rollout embeds its ancestor chain after its own meta,
+        // ending with the root terminal's "cli" meta. The root's meta must not
+        // make the subagent's file count as a terminal session.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagent.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"child","cwd":"/tmp","source":{"subagent":"review"}}}"#,
+                "\n",
+                r#"{"type":"session_meta","payload":{"id":"root","cwd":"/tmp","source":"cli"}}"#,
+            ),
+        )
+        .unwrap();
+
+        assert!(!codex_rollout_is_cli(&path, "child"));
+    }
+
+    #[test]
+    fn codex_rollout_subagent_and_missing_sources_are_not_cli() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let subagent = dir.path().join("subagent.jsonl");
+        fs::write(
+            &subagent,
+            r#"{"type":"session_meta","payload":{"id":"a","cwd":"/tmp","source":{"subagent":"review"}}}"#,
+        )
+        .unwrap();
+        assert!(!codex_rollout_is_cli(&subagent, "a"));
+
+        let no_meta = dir.path().join("no-meta.jsonl");
+        fs::write(&no_meta, r#"{"type":"turn_context","payload":{}}"#).unwrap();
+        assert!(!codex_rollout_is_cli(&no_meta, "a"));
+
+        assert!(!codex_rollout_is_cli(&dir.path().join("missing.jsonl"), "a"));
+    }
+
+    #[test]
+    fn grok_subagent_summary_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summary.json");
+        fs::write(
+            &path,
+            r#"{
+              "info": {"id": "abc", "cwd": "/tmp/project"},
+              "session_kind": "subagent",
+              "updated_at": "2026-07-10T00:02:58.951370Z"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(read_grok_summary(&path).unwrap().is_none());
     }
 
     #[test]

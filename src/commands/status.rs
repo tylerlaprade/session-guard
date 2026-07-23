@@ -21,6 +21,7 @@ pub fn run() -> Result<()> {
         println!("No tracked sessions.");
         return Ok(());
     }
+    let processes = process::ProcessSnapshot::capture()?;
 
     println!(
         "{:<12} {:<8} {:<11} {:<36} {:>7} {:<8} {:<8} {:>8}",
@@ -28,14 +29,8 @@ pub fn run() -> Result<()> {
     );
 
     for session in sessions {
-        let alive = session
-            .pid
-            .map(|pid| process::pid_is_alive(pid) && process::pid_is_tool(pid, session.tool))
-            .unwrap_or(false);
-        let shell_alive = session
-            .shell_pid
-            .map(process::pid_is_alive)
-            .unwrap_or(false);
+        let alive = daemon::session_tool_is_alive(&session, &processes);
+        let shell_alive = daemon::session_shell_is_alive(&session, &processes);
         let alive_text = if alive {
             format!("{GREEN}yes{RESET}")
         } else if session.pid.is_none() {

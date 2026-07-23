@@ -76,11 +76,77 @@ fn query_process_start_identity(pid: i32, timezone: &str) -> Result<String> {
         anyhow::bail!("ps could not inspect start time for pid {pid}");
     }
 
-    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let identity = normalize_identity(&String::from_utf8_lossy(&output.stdout));
     if identity.is_empty() {
         anyhow::bail!("ps returned no start time for pid {pid}");
     }
     Ok(identity)
+}
+
+// `lstart` pads single-digit days with a second space ("Wed Jul  2 ...").
+// Identities are compared across ps invocations whose column layouts differ
+// (per-pid vs the batched snapshot), so collapse runs of whitespace before
+// persisting or comparing.
+fn normalize_identity(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One `ps` pass over every process, replacing per-PID spawns wherever many
+/// sessions are checked at once. The registry's exclusive file lock is held
+/// across those checks; per-PID `ps` calls there stall hook-driven
+/// register/deregister commands, and codex kills its SessionEnd hook after
+/// one second.
+pub struct ProcessSnapshot {
+    /// pid -> (start identity, lowercased command name)
+    processes: std::collections::HashMap<i32, (String, String)>,
+}
+
+impl ProcessSnapshot {
+    pub fn capture() -> Result<Self> {
+        let output = Command::new("ps")
+            .args(["-axww", "-o", "pid=,lstart=,comm="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .output()
+            .context("failed to snapshot processes")?;
+
+        if !output.status.success() {
+            anyhow::bail!("ps could not snapshot processes");
+        }
+
+        let mut processes = std::collections::HashMap::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut parts = line.split_whitespace();
+            let Some(pid) = parts.next().and_then(|pid| pid.parse::<i32>().ok()) else {
+                continue;
+            };
+            // lstart is always five fields: "Wed Jul  2 09:03:01 2026".
+            let start: Vec<&str> = parts.by_ref().take(5).collect();
+            if start.len() < 5 {
+                continue;
+            }
+            let comm = parts.collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+            processes.insert(pid, (start.join(" "), comm));
+        }
+
+        Ok(Self { processes })
+    }
+
+    pub fn is_alive(&self, pid: i32) -> bool {
+        self.processes.contains_key(&pid)
+    }
+
+    pub fn is_tool(&self, pid: i32, tool: Tool) -> bool {
+        self.processes
+            .get(&pid)
+            .is_some_and(|(_, comm)| comm.contains(tool.as_str()))
+    }
+
+    pub fn identity_matches(&self, pid: i32, expected_start: &str) -> bool {
+        self.processes
+            .get(&pid)
+            .is_some_and(|(start, _)| start == expected_start)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,5 +272,17 @@ mod tests {
 
         assert_eq!(normalized, utc);
         assert_ne!(utc, new_york, "test requires distinct timezone renderings");
+    }
+
+    #[test]
+    fn snapshot_agrees_with_per_pid_identity() {
+        let pid = std::process::id() as i32;
+        let snapshot = ProcessSnapshot::capture().unwrap();
+        let identity = process_start_identity(pid).unwrap();
+
+        assert!(snapshot.is_alive(pid));
+        assert!(snapshot.identity_matches(pid, &identity));
+        assert!(!snapshot.identity_matches(pid, "Wed Jan 1 00:00:00 2020"));
+        assert!(!snapshot.is_alive(-1));
     }
 }

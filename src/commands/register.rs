@@ -1,6 +1,7 @@
 use crate::Tool;
 use crate::paths;
 use crate::sessions::{self, SessionRecord};
+use crate::transcripts;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::io::{self, IsTerminal, Read};
@@ -57,6 +58,22 @@ pub fn run(
     let transcript_path = hook_input
         .as_ref()
         .and_then(|input| input.transcript_path.clone());
+
+    // The Codex desktop app, its scheduled automations, `codex exec`, and
+    // subagents fire these hooks too, but their threads live outside any
+    // terminal tab and restore as junk. The hook payload does not say which
+    // frontend owns the thread; the rollout's session_meta for this session's
+    // own id does (see codex_rollout_is_cli). No readable rollout at all also
+    // disqualifies: `codex resume` needs one, so the session could never be
+    // restored anyway.
+    if tool == Tool::Codex
+        && !transcript_path
+            .as_deref()
+            .is_some_and(|path| transcripts::codex_rollout_is_cli(path, &session_id))
+    {
+        return Ok(());
+    }
+
     let source = hook_input.as_ref().and_then(|input| input.source.clone());
     let name = name.or_else(|| hook_input.and_then(|input| input.name));
 

@@ -32,6 +32,11 @@ pub fn run() -> Result<()> {
         "Codex hooks: {}",
         hook_summary(codex_installed, codex_hooks.as_ref())
     );
+    if codex_hooks.as_ref().is_some_and(|change| change.changed) {
+        println!(
+            "Codex asks once to trust new or changed hooks on the next interactive launch; they do not run until approved."
+        );
+    }
     println!(
         "Grok hooks: {}",
         hook_summary(grok_installed, grok_hooks.as_ref())

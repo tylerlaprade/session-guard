@@ -1,7 +1,7 @@
 use crate::adapters::{adapter_for, shell_quote};
 use crate::cargo_targets;
 use crate::paths;
-use crate::process;
+use crate::process::{self, ProcessSnapshot};
 use crate::scan;
 use crate::sessions::{self, SessionRecord, SessionState};
 use crate::transcripts;
@@ -196,6 +196,7 @@ pub fn reconcile_from_scan() -> Result<usize> {
                 .find(|session| session.session_id == scanned_session.session_id)
             {
                 existing.pid = scanned_session.pid;
+                existing.pid_started_at = scanned_session.pid_started_at.clone();
                 existing.mark_active();
             } else {
                 sessions.push(scanned_session);
@@ -212,10 +213,12 @@ pub fn reconcile_from_scan() -> Result<usize> {
 // Restore policy:
 // - Never open a new tab if the recorded shell is still alive (tab still open).
 // - Manual restore: every both-dead recoverable session.
-// - Startup restore: only the crash cluster — last_seen within 2 minutes of
-//   the newest last_seen already in the file. That reopens sessions that died
-//   with the previous daemon epoch, without reopening hours-old intentional
-//   closes when the daemon is merely restarted for an upgrade.
+// - Startup restore: only unobserved deaths in the crash cluster — sessions
+//   still marked active on disk (no epoch's monitor saw them die) whose
+//   last_seen falls within 2 minutes of the newest last_seen already in the
+//   file. That reopens sessions that died with the previous daemon epoch,
+//   without reopening intentional closes when the daemon is merely restarted
+//   for an upgrade.
 // - Restore runs before process scan so survivors cannot rewrite heartbeats.
 // - After open_tab succeeds, keep the record (source="restored") with a
 //   cooldown so a second restore does not spam duplicate tabs.
@@ -229,6 +232,10 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let _ = sessions::repair_if_corrupt(&path)?;
     let fallback_sessions = transcripts::discover_recent_sessions().unwrap_or_default();
     let now = chrono::Utc::now();
+    // One ps pass for every liveness check below: per-PID ps calls under the
+    // exclusive sessions lock stall hook-driven register/deregister (codex
+    // kills its SessionEnd hook after one second).
+    let processes = ProcessSnapshot::capture()?;
 
     // Phase 1: decide who to restore under the sessions lock (no AppleScript).
     let (mut summary, alive_kept, to_open) =
@@ -239,7 +246,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 sessions.extend(fallback_sessions.clone());
             }
 
-            let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary);
+            let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary, &processes);
 
             // Crash cluster uses on-disk last_seen only (before mark_active).
             let activity_cutoff = matches!(mode, RestoreMode::Startup)
@@ -254,7 +261,8 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             let mut to_open = Vec::new();
 
             for mut session in unique {
-                if session_is_alive(&session) {
+                let was_recoverable = session.state == SessionState::Recoverable;
+                if session_is_alive(&session, &processes) {
                     session.mark_active();
                     alive_kept.push(session);
                     continue;
@@ -267,9 +275,18 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
 
                 session.mark_recoverable();
 
+                // Already recoverable on disk ⇒ a previous epoch's monitor saw
+                // this session die — an observed close, not one that fell with
+                // the epoch. A daemon upgrade/restart must not resurrect it.
+                // Manual restore still offers it.
+                if matches!(mode, RestoreMode::Startup) && was_recoverable {
+                    alive_kept.push(session);
+                    continue;
+                }
+
                 // Shell still up ⇒ Ghostty/terminal tab still exists. Opening
                 // another tab duplicates work that is already on screen.
-                if session_shell_is_alive(&session) {
+                if session_shell_is_alive(&session, &processes) {
                     alive_kept.push(session);
                     continue;
                 }
@@ -343,7 +360,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             by_id
                 .entry(session.session_id.clone())
                 .and_modify(|existing| {
-                    if should_replace(existing, &session) {
+                    if should_replace(existing, &session, &processes) {
                         *existing = session.clone();
                     }
                 })
@@ -367,10 +384,15 @@ fn recently_restored(session: &SessionRecord, now: chrono::DateTime<chrono::Utc>
 
 pub fn monitor_once() -> Result<MonitorSummary> {
     let _ = sessions::repair_if_corrupt(&paths::sessions_file()?)?;
+    // Snapshot before taking the lock; a transiently failing ps skips the
+    // tick rather than killing the daemon or marking everything dead.
+    let Ok(processes) = ProcessSnapshot::capture() else {
+        return Ok(MonitorSummary::default());
+    };
     sessions::with_sessions_mut(&paths::sessions_file()?, |sessions| {
         let mut summary = MonitorSummary::default();
         for session in sessions.iter_mut() {
-            if session_is_alive(session) {
+            if session_is_alive(session, &processes) {
                 session.mark_active();
                 continue;
             }
@@ -457,12 +479,8 @@ fn configured_terminal() -> Result<TerminalKind> {
     contents.parse()
 }
 
-fn session_is_alive(session: &SessionRecord) -> bool {
-    let tool_alive = session
-        .pid
-        .map(|pid| process::pid_is_alive(pid) && process::pid_is_tool(pid, session.tool))
-        .unwrap_or(false);
-    if !tool_alive {
+fn session_is_alive(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
+    if !session_tool_is_alive(session, processes) {
         return false;
     }
 
@@ -471,22 +489,35 @@ fn session_is_alive(session: &SessionRecord) -> bool {
     // launchd). Requiring the shell prevents "still alive" from blocking
     // restore of a tab the user no longer has.
     if session.shell_pid.is_some() {
-        return session_shell_is_alive(session);
+        return session_shell_is_alive(session, processes);
     }
 
     true
 }
 
-fn session_shell_is_alive(session: &SessionRecord) -> bool {
-    session
-        .shell_pid
-        .map(process::pid_is_alive)
-        .unwrap_or(false)
+// When the record carries the process start time, liveness means "that exact
+// process": a recycled PID, or another same-named process on it, reads as
+// dead. Records that predate identity capture fall back to name matching.
+pub(crate) fn session_tool_is_alive(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
+    match (session.pid, session.pid_started_at.as_deref()) {
+        (Some(pid), Some(started_at)) => processes.identity_matches(pid, started_at),
+        (Some(pid), None) => processes.is_alive(pid) && processes.is_tool(pid, session.tool),
+        (None, _) => false,
+    }
+}
+
+pub(crate) fn session_shell_is_alive(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
+    match (session.shell_pid, session.shell_pid_started_at.as_deref()) {
+        (Some(pid), Some(started_at)) => processes.identity_matches(pid, started_at),
+        (Some(pid), None) => processes.is_alive(pid),
+        (None, _) => false,
+    }
 }
 
 fn deduplicate_sessions(
     sessions: Vec<SessionRecord>,
     summary: &mut RestoreSummary,
+    processes: &ProcessSnapshot,
 ) -> Vec<SessionRecord> {
     let mut ids = HashSet::new();
     let mut by_id: HashMap<String, SessionRecord> = HashMap::new();
@@ -500,7 +531,7 @@ fn deduplicate_sessions(
         by_id
             .entry(session.session_id.clone())
             .and_modify(|existing| {
-                if should_replace(existing, &session) {
+                if should_replace(existing, &session, processes) {
                     *existing = session.clone();
                 }
             })
@@ -510,9 +541,13 @@ fn deduplicate_sessions(
     by_id.into_values().collect()
 }
 
-fn should_replace(existing: &SessionRecord, candidate: &SessionRecord) -> bool {
-    let existing_alive = session_is_alive(existing);
-    let candidate_alive = session_is_alive(candidate);
+fn should_replace(
+    existing: &SessionRecord,
+    candidate: &SessionRecord,
+    processes: &ProcessSnapshot,
+) -> bool {
+    let existing_alive = session_is_alive(existing, processes);
+    let candidate_alive = session_is_alive(candidate, processes);
     if candidate_alive != existing_alive {
         return candidate_alive;
     }
@@ -567,6 +602,37 @@ mod tests {
             resume_command(&sample(Tool::Grok, "ghi")),
             "grok --resume 'ghi'"
         );
+    }
+
+    #[test]
+    fn tool_liveness_requires_matching_start_identity() {
+        let pid = std::process::id() as i32;
+        let processes = ProcessSnapshot::capture().unwrap();
+        let mut session = sample(Tool::Claude, "abc");
+        session.pid = Some(pid);
+
+        // Same PID number, different process start time: a recycled PID.
+        session.pid_started_at = Some("Wed Jan 1 00:00:00 2020".to_string());
+        assert!(!session_tool_is_alive(&session, &processes));
+        assert!(!session_is_alive(&session, &processes));
+
+        session.pid_started_at = process::process_start_identity(pid).ok();
+        assert!(session.pid_started_at.is_some());
+        assert!(session_tool_is_alive(&session, &processes));
+    }
+
+    #[test]
+    fn shell_liveness_requires_matching_start_identity() {
+        let pid = std::process::id() as i32;
+        let processes = ProcessSnapshot::capture().unwrap();
+        let mut session = sample(Tool::Claude, "abc");
+        session.shell_pid = Some(pid);
+
+        session.shell_pid_started_at = Some("Wed Jan 1 00:00:00 2020".to_string());
+        assert!(!session_shell_is_alive(&session, &processes));
+
+        session.shell_pid_started_at = process::process_start_identity(pid).ok();
+        assert!(session_shell_is_alive(&session, &processes));
     }
 
     #[test]

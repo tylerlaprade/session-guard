@@ -1,4 +1,5 @@
 use crate::Tool;
+use crate::process;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
@@ -32,6 +33,14 @@ pub struct SessionRecord {
     pub pid: Option<i32>,
     #[serde(default)]
     pub shell_pid: Option<i32>,
+    // `ps lstart` of each PID at registration. A bare PID is ambiguous: once
+    // recycled — or when one long-lived codex process hosts many threads — a
+    // dead session reads as alive forever. Pairing the PID with its start time
+    // pins it to the exact process the hook saw.
+    #[serde(default)]
+    pub pid_started_at: Option<String>,
+    #[serde(default)]
+    pub shell_pid_started_at: Option<String>,
     pub directory: PathBuf,
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
@@ -67,6 +76,9 @@ impl SessionRecord {
             tool,
             pid,
             shell_pid,
+            pid_started_at: pid.and_then(|pid| process::process_start_identity(pid).ok()),
+            shell_pid_started_at: shell_pid
+                .and_then(|pid| process::process_start_identity(pid).ok()),
             directory,
             transcript_path,
             session_name,
@@ -91,6 +103,8 @@ impl SessionRecord {
             tool,
             pid: None,
             shell_pid: None,
+            pid_started_at: None,
+            shell_pid_started_at: None,
             directory,
             transcript_path: Some(transcript_path),
             session_name: None,
