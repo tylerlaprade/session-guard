@@ -2,6 +2,7 @@ mod adapters;
 mod cargo_targets;
 mod commands;
 mod hooks;
+mod last_sessions;
 mod paths;
 mod process;
 mod scan;
@@ -113,6 +114,13 @@ enum Command {
     },
     Status,
     #[command(hide = true)]
+    LastSession {
+        #[arg(long, value_enum)]
+        tool: Tool,
+        #[arg(long)]
+        shell_pid: i32,
+    },
+    #[command(hide = true)]
     Register {
         #[arg(long, value_enum)]
         tool: Tool,
@@ -145,6 +153,7 @@ fn main() -> Result<()> {
         Command::InstallHooks => commands::install_hooks::run(),
         Command::Uninstall { purge } => commands::uninstall::run(purge),
         Command::Status => commands::status::run(),
+        Command::LastSession { tool, shell_pid } => commands::last_session::run(tool, shell_pid),
         Command::Register {
             tool,
             session_id,

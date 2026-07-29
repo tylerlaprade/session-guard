@@ -2,6 +2,7 @@ pub mod daemon;
 pub mod deregister;
 pub mod install;
 pub mod install_hooks;
+pub mod last_session;
 pub mod register;
 pub mod restore;
 pub mod status;

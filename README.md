@@ -34,15 +34,20 @@ session-guard uninstall
 session-guard uninstall --purge
 ```
 
-State is stored in `~/.config/session-guard/active-sessions.json`. The selected
-terminal is stored in `~/.config/session-guard/terminal`.
+Active state is stored in `~/.config/session-guard/active-sessions.json`.
+Cleanly ended sessions are stored by tool and parent shell in
+`~/.config/session-guard/last-sessions.json` so tab-local tools can resume the
+right session. The selected terminal is stored in
+`~/.config/session-guard/terminal`.
 
 ## Recovery Model
 
 Hook identity comes from the JSON payload Claude Code, Codex, and Grok provide
 on stdin. The installed hook commands store the tool PID, the parent shell
 PID, and each PID's process start time (`ps lstart`) when the hook process can
-derive them. Codex installs a `SessionStart` hook, a `Stop` heartbeat, and —
+derive them. A launcher that inserts an intermediate process can pass
+`SESSION_GUARD_SHELL_PID` to preserve the owning terminal shell. Codex installs
+a `SessionStart` hook, a `Stop` heartbeat, and —
 on Codex 0.145+ — a `SessionEnd` hook, which Codex fires only on graceful
 shutdown. Grok hooks live in `~/.grok/hooks/` (global) and use a companion
 register script because Grok expands `$VAR` in inline hook commands and

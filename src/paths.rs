@@ -18,6 +18,10 @@ pub fn sessions_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("active-sessions.json"))
 }
 
+pub fn last_sessions_file() -> Result<PathBuf> {
+    Ok(config_dir()?.join("last-sessions.json"))
+}
+
 pub fn terminal_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("terminal"))
 }

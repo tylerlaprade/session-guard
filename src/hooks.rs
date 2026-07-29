@@ -13,9 +13,9 @@ use toml::map::Map as TomlMap;
 // `claude` launched inside a VS Code integrated terminal is still "cli".
 // (Headless remote workers never register via hooks anyway; the process scan
 // tracks them.)
-const CLAUDE_REGISTER: &str = r#"[ "$CLAUDE_CODE_ENTRYPOINT" = cli ] || exit 0; tool_pid="$PPID"; shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool claude --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool claude --pid "$tool_pid"; fi"#;
+const CLAUDE_REGISTER: &str = r#"[ "$CLAUDE_CODE_ENTRYPOINT" = cli ] || exit 0; tool_pid="$PPID"; shell_pid="${SESSION_GUARD_SHELL_PID:-}"; [ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool claude --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool claude --pid "$tool_pid"; fi"#;
 const CLAUDE_DEREGISTER: &str = "session-guard deregister";
-const CODEX_REGISTER: &str = r#"tool_pid="$PPID"; shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool codex --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool codex --pid "$tool_pid"; fi"#;
+const CODEX_REGISTER: &str = r#"tool_pid="$PPID"; shell_pid="${SESSION_GUARD_SHELL_PID:-}"; [ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool codex --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool codex --pid "$tool_pid"; fi"#;
 const CODEX_DEREGISTER: &str = "session-guard deregister";
 // Grok expands $VAR / ${VAR} in hook `command` strings and fails the hook when
 // the var is unset. $PPID is a shell special, not an env var, so inline Claude-
@@ -32,7 +32,8 @@ tool_pid="$PPID"
 case " $(ps -o command= -p "$tool_pid") " in
   *" -p "*|*" --single "*|*" --single="*|*" --prompt-file "*|*" --prompt-file="*) exit 0 ;;
 esac
-shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"
+shell_pid="${SESSION_GUARD_SHELL_PID:-}"
+[ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"
 if [ -n "$shell_pid" ]; then
   exec session-guard register --tool grok --pid "$tool_pid" --shell-pid "$shell_pid"
 else
@@ -45,7 +46,9 @@ const OLD_CLAUDE_REGISTER: &str = "session-guard register --tool claude --pid \"
 // installs would leave both hooks and the ungated one would re-admit desktop
 // and SDK sessions.
 const OLD_CLAUDE_REGISTER_UNGATED: &str = r#"tool_pid="$PPID"; shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool claude --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool claude --pid "$tool_pid"; fi"#;
+const OLD_CLAUDE_REGISTER_PARENT: &str = r#"[ "$CLAUDE_CODE_ENTRYPOINT" = cli ] || exit 0; tool_pid="$PPID"; shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool claude --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool claude --pid "$tool_pid"; fi"#;
 const OLD_CODEX_REGISTER: &str = "session-guard register --tool codex --pid \"$PPID\"";
+const OLD_CODEX_REGISTER_PARENT: &str = r#"tool_pid="$PPID"; shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool codex --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool codex --pid "$tool_pid"; fi"#;
 const OLD_CLAUDE_REGISTER_ENV: &str = "session-guard register --tool claude --session-id \"$CLAUDE_SESSION_ID\" --pid \"$PPID\" --directory \"$PWD\"";
 const OLD_CLAUDE_DEREGISTER_ENV: &str =
     "session-guard deregister --session-id \"$CLAUDE_SESSION_ID\"";
@@ -253,9 +256,11 @@ fn old_hook_commands() -> &'static [&'static str] {
     &[
         OLD_CLAUDE_REGISTER,
         OLD_CLAUDE_REGISTER_UNGATED,
+        OLD_CLAUDE_REGISTER_PARENT,
         OLD_CLAUDE_REGISTER_ENV,
         OLD_CLAUDE_DEREGISTER_ENV,
         OLD_CODEX_REGISTER,
+        OLD_CODEX_REGISTER_PARENT,
         OLD_CODEX_REGISTER_ENV,
         OLD_CODEX_DEREGISTER_ENV,
     ]
@@ -268,9 +273,11 @@ fn all_hook_commands() -> &'static [&'static str] {
         CODEX_REGISTER,
         OLD_CLAUDE_REGISTER,
         OLD_CLAUDE_REGISTER_UNGATED,
+        OLD_CLAUDE_REGISTER_PARENT,
         OLD_CLAUDE_REGISTER_ENV,
         OLD_CLAUDE_DEREGISTER_ENV,
         OLD_CODEX_REGISTER,
+        OLD_CODEX_REGISTER_PARENT,
         OLD_CODEX_REGISTER_ENV,
         OLD_CODEX_DEREGISTER_ENV,
     ]
@@ -609,6 +616,36 @@ mod tests {
     }
 
     #[test]
+    fn claude_install_replaces_parent_only_register_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            json!({
+                "hooks": {
+                    "SessionStart": [{
+                        "matcher": "startup|resume",
+                        "hooks": [{
+                            "type": "command",
+                            "command": OLD_CLAUDE_REGISTER_PARENT
+                        }]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(install_claude_hooks(&path).unwrap().changed);
+
+        let root = read_json_config(&path).unwrap();
+        let start = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(start.len(), 1);
+        assert!(json_event_has_command(start, CLAUDE_REGISTER));
+        assert!(!json_event_has_command(start, OLD_CLAUDE_REGISTER_PARENT));
+    }
+
+    #[test]
     fn claude_install_replaces_old_env_hook() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -656,6 +693,35 @@ mod tests {
         assert!(contents.contains("[[hooks.SessionStart]]"));
         assert!(contents.contains("[[hooks.Stop]]"));
         assert!(contents.contains("[[hooks.SessionEnd]]"));
+    }
+
+    #[test]
+    fn codex_install_replaces_parent_only_register_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                r#"[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "{}"
+"#,
+                OLD_CODEX_REGISTER_PARENT
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+            ),
+        )
+        .unwrap();
+
+        assert!(install_codex_hooks(&path).unwrap().changed);
+
+        let root = read_toml_config(&path).unwrap();
+        let start = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(start.len(), 1);
+        assert!(toml_event_has_command(start, CODEX_REGISTER));
+        assert!(!toml_event_has_command(start, OLD_CODEX_REGISTER_PARENT));
     }
 
     #[test]
@@ -707,6 +773,11 @@ command = '{}'
         assert!(json_event_has_command(stop, GROK_REGISTER_SCRIPT_NAME));
         let end = root["hooks"]["SessionEnd"].as_array().unwrap();
         assert!(json_event_has_command(end, GROK_DEREGISTER));
+        assert!(
+            fs::read_to_string(&script_path)
+                .unwrap()
+                .contains("SESSION_GUARD_SHELL_PID")
+        );
 
         // Register script must not embed bare $VAR in the JSON command field —
         // Grok expands those and fails when unset (e.g. $PPID).
