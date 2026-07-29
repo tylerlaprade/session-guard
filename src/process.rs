@@ -22,28 +22,6 @@ pub fn pid_is_alive(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-pub fn pid_is_tool(pid: i32, tool: Tool) -> bool {
-    process_comm(pid)
-        .map(|comm| {
-            let comm = comm.to_ascii_lowercase();
-            comm.contains(tool.as_str())
-        })
-        .unwrap_or(false)
-}
-
-pub fn process_comm(pid: i32) -> Result<String> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .with_context(|| format!("failed to inspect pid {pid}"))?;
-
-    if !output.status.success() {
-        anyhow::bail!("ps could not inspect pid {pid}");
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 pub fn process_command(pid: i32) -> Result<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])

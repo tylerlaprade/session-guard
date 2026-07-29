@@ -348,7 +348,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
         let mut by_id: HashMap<String, SessionRecord> = HashMap::new();
         for session in alive_kept
             .into_iter()
-            .chain(opened.into_iter())
+            .chain(opened)
             .chain(sessions.drain(..))
         {
             by_id
