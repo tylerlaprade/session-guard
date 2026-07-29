@@ -166,12 +166,6 @@ fn run_cargo_target_cleanup() -> Result<()> {
                     summary.owned_targets
                 ))?;
             }
-            if summary.claude_scratch_targets > 0 {
-                log_line(&format!(
-                    "cleanup removed {} inactive Claude scratch Cargo targets",
-                    summary.claude_scratch_targets
-                ))?;
-            }
             for error in summary.errors {
                 log_line(&error)?;
             }

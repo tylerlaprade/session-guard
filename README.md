@@ -123,8 +123,5 @@ command if it cannot prove that ownership.
 The daemon reuses the target for that session while its exact owning process
 is alive. Once that PID and process-start identity are gone, it removes only
 the target bearing session-guard's matching ownership marker; recoverable
-session records and transcripts are unaffected. It also removes
-verified Cargo build-target directories inside Claude scratchpads whose exact
-session UUID is absent from the registry and whose transcript has been
-inactive for more than 24 hours. Scratch source, patches, task output, and all
-transcripts remain untouched.
+session records and transcripts are unaffected. Automatic cleanup never
+removes Cargo targets outside session-guard's own cache directory.

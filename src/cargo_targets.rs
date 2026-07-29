@@ -2,7 +2,6 @@ use crate::paths;
 use crate::process::{self, ProcInfo, ProcessIdentityStatus};
 use crate::scan;
 use crate::sessions::{self, SessionRecord};
-use crate::transcripts;
 use crate::{Tool, process::process_start_identity};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -14,13 +13,10 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
 
 const MARKER_FILE: &str = ".session-guard-owner.json";
 const LOCK_FILE: &str = ".session-guard-owner.lock";
 const MARKER_VERSION: u32 = 1;
-const CLAUDE_SCRATCH_INACTIVITY: Duration = Duration::from_secs(24 * 60 * 60);
-const CARGO_CACHE_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ProcessIdentity {
@@ -73,7 +69,6 @@ struct OwnedTargetLease {
 #[derive(Debug, Default)]
 pub struct CleanupSummary {
     pub owned_targets: usize,
-    pub claude_scratch_targets: usize,
     pub errors: Vec<String>,
 }
 
@@ -147,8 +142,6 @@ fn command_exit_code(status: std::process::ExitStatus) -> i32 {
 }
 
 pub fn cleanup_once() -> Result<CleanupSummary> {
-    let session_path = paths::sessions_file()?;
-    let active_sessions = sessions::read_sessions(&session_path)?;
     let cargo_targets_dir = paths::cargo_targets_dir()?;
     let _lifecycle = lock_cache_lifecycle(&cargo_targets_dir, true)?;
     let mut summary = CleanupSummary::default();
@@ -158,22 +151,6 @@ pub fn cleanup_once() -> Result<CleanupSummary> {
         Err(error) => summary
             .errors
             .push(format!("owned Cargo target cleanup failed: {error:#}")),
-    }
-
-    let transcript_root = transcripts::claude_projects_dir()?;
-    match prune_claude_scratch_targets(
-        &paths::claude_scratch_dir(),
-        &transcript_root,
-        &active_sessions,
-        SystemTime::now()
-            .checked_sub(CLAUDE_SCRATCH_INACTIVITY)
-            .unwrap_or(SystemTime::UNIX_EPOCH),
-        |session_id| scratch_liveness_allows_removal_now(session_id, &session_path),
-    ) {
-        Ok(count) => summary.claude_scratch_targets = count,
-        Err(error) => summary
-            .errors
-            .push(format!("Claude scratch target cleanup failed: {error:#}")),
     }
 
     Ok(summary)
@@ -389,7 +366,9 @@ fn update_owned_target(owner_dir: &Path, owner: &ResolvedOwner) -> Result<PathBu
     write_marker(&marker_path, &marker)?;
 
     let target_dir = owner_dir.join("target");
-    ensure_real_directory(&target_dir)?;
+    if target_dir.exists() {
+        ensure_real_directory(&target_dir)?;
+    }
     Ok(target_dir)
 }
 
@@ -576,7 +555,7 @@ fn prune_owned_targets(base: &Path) -> Result<usize> {
             }
 
             let target_dir = owner_dir.join("target");
-            if !target_is_removable(&target_dir) {
+            if target_dir.exists() && !is_real_directory(&target_dir) {
                 continue;
             }
             if target_dir.exists() {
@@ -596,274 +575,6 @@ fn read_valid_marker(path: &Path, tool: Tool, session_id: &str) -> Option<OwnedT
     let marker: OwnedTargetMarker = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     validate_marker(&marker, tool, session_id).ok()?;
     Some(marker)
-}
-
-fn target_is_removable(path: &Path) -> bool {
-    if !path.exists() {
-        return true;
-    }
-    if !is_real_directory(path) {
-        return false;
-    }
-    fs::read_dir(path)
-        .ok()
-        .is_some_and(|mut entries| entries.next().is_none())
-        || is_verified_cargo_target(path)
-}
-
-fn prune_claude_scratch_targets(
-    scratch_root: &Path,
-    transcript_root: &Path,
-    registered: &[SessionRecord],
-    inactive_before: SystemTime,
-    mut liveness_allows_removal: impl FnMut(&str) -> Result<bool>,
-) -> Result<usize> {
-    if !is_real_directory(scratch_root) || !is_real_directory(transcript_root) {
-        return Ok(0);
-    }
-
-    let transcript_activity = claude_transcript_activity(transcript_root);
-    let protected: HashSet<&str> = registered
-        .iter()
-        .filter(|session| session.tool == Tool::Claude)
-        .map(|session| session.session_id.as_str())
-        .collect();
-    let mut pruned = 0;
-
-    let projects = fs::read_dir(scratch_root)
-        .with_context(|| format!("failed to read {}", scratch_root.display()))?;
-    for project in projects.flatten() {
-        if !is_real_directory(&project.path()) {
-            continue;
-        }
-        let Ok(session_entries) = fs::read_dir(project.path()) else {
-            continue;
-        };
-        for session_entry in session_entries.flatten() {
-            let session_root = session_entry.path();
-            if !is_real_directory(&session_root) {
-                continue;
-            }
-            let Some(session_id) = session_entry.file_name().to_str().map(ToOwned::to_owned) else {
-                continue;
-            };
-            if validate_session_id(&session_id).is_err() || protected.contains(session_id.as_str())
-            {
-                continue;
-            }
-            let Some(last_activity) = transcript_activity.get(&session_id) else {
-                continue;
-            };
-            if *last_activity > inactive_before {
-                continue;
-            }
-
-            let scratchpad = session_root.join("scratchpad");
-            let mut targets = Vec::new();
-            collect_verified_cargo_targets(&scratchpad, &mut targets);
-            for target in targets {
-                // The directory walk and transcript timestamp are only
-                // candidate discovery. Session state can change while that
-                // work runs, so re-read liveness immediately before deletion.
-                if !liveness_allows_removal(&session_id)? {
-                    continue;
-                }
-                let Some(_cargo_locks) = acquire_cargo_target_locks(&target)? else {
-                    continue;
-                };
-                fs::remove_dir_all(&target)
-                    .with_context(|| format!("failed to remove {}", target.display()))?;
-                pruned += 1;
-            }
-        }
-    }
-
-    Ok(pruned)
-}
-
-fn scratch_liveness_allows_removal_now(session_id: &str, session_path: &Path) -> Result<bool> {
-    if !session_path.is_file() {
-        anyhow::bail!("session registry {} is unavailable", session_path.display());
-    }
-    let registered = sessions::read_sessions(session_path)?;
-    let processes = process::list_processes()?;
-    Ok(scratch_liveness_allows_removal(
-        session_id,
-        &registered,
-        &processes,
-    ))
-}
-
-fn scratch_liveness_allows_removal(
-    session_id: &str,
-    registered: &[SessionRecord],
-    processes: &[ProcInfo],
-) -> bool {
-    if registered
-        .iter()
-        .any(|session| session.tool == Tool::Claude && session.session_id == session_id)
-    {
-        return false;
-    }
-
-    let represented_pids: HashSet<i32> = registered
-        .iter()
-        .filter(|session| session.tool == Tool::Claude)
-        .filter_map(|session| session.pid)
-        .collect();
-    processes
-        .iter()
-        .filter(|process| scan::is_claude_process(process))
-        .all(|process| {
-            let command_session_id = scan::trackable_claude_session_id(process);
-            if command_session_id.as_deref() == Some(session_id) {
-                return false;
-            }
-            match command_session_id {
-                Some(command_session_id) => registered.iter().any(|session| {
-                    session.tool == Tool::Claude
-                        && session.pid == Some(process.pid)
-                        && session.session_id == command_session_id
-                }),
-                None => represented_pids.contains(&process.pid),
-            }
-        })
-}
-
-fn claude_transcript_activity(root: &Path) -> HashMap<String, SystemTime> {
-    let mut activity = HashMap::new();
-    let Ok(projects) = fs::read_dir(root) else {
-        return activity;
-    };
-    for project in projects.flatten() {
-        if !is_real_directory(&project.path()) {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(project.path()) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(session_id) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(ToOwned::to_owned)
-            else {
-                continue;
-            };
-            if validate_session_id(&session_id).is_err() {
-                continue;
-            }
-            let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
-                continue;
-            };
-            activity
-                .entry(session_id)
-                .and_modify(|existing| {
-                    if modified > *existing {
-                        *existing = modified;
-                    }
-                })
-                .or_insert(modified);
-        }
-    }
-    activity
-}
-
-fn collect_verified_cargo_targets(root: &Path, targets: &mut Vec<PathBuf>) {
-    if !is_real_directory(root) {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !is_real_directory(&path) {
-            continue;
-        }
-        if is_verified_cargo_target(&path) {
-            targets.push(path);
-            continue;
-        }
-        collect_verified_cargo_targets(&path, targets);
-    }
-}
-
-fn is_verified_cargo_target(path: &Path) -> bool {
-    let tag = path.join("CACHEDIR.TAG");
-    let Ok(contents) = fs::read_to_string(tag) else {
-        return false;
-    };
-    if !contents.contains(CARGO_CACHE_TAG_SIGNATURE) {
-        return false;
-    }
-    if path.join(".rustc_info.json").is_file() {
-        return true;
-    }
-
-    let Ok(entries) = fs::read_dir(path) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let profile = entry.path();
-        is_real_directory(&profile)
-            && (profile.join(".cargo-lock").is_file()
-                || profile.join(".fingerprint").is_dir()
-                || (profile.join("deps").is_dir() && profile.join("build").is_dir()))
-    })
-}
-
-fn acquire_cargo_target_locks(path: &Path) -> Result<Option<Vec<TargetLock>>> {
-    let mut lock_paths = Vec::new();
-    let entries = fs::read_dir(path)
-        .with_context(|| format!("failed to inspect Cargo target {}", path.display()))?;
-    for entry in entries.flatten() {
-        let child = entry.path();
-        if !is_real_directory(&child) {
-            continue;
-        }
-        let lock = child.join(".cargo-lock");
-        if lock.is_file() {
-            lock_paths.push(lock);
-        }
-
-        // Cross-compiled targets add one target-triple directory above the
-        // profile, e.g. target/aarch64-apple-darwin/debug/.cargo-lock.
-        let grandchildren = fs::read_dir(&child)
-            .with_context(|| format!("failed to inspect Cargo target {}", child.display()))?;
-        for grandchild in grandchildren.flatten() {
-            let grandchild = grandchild.path();
-            if !is_real_directory(&grandchild) {
-                continue;
-            }
-            let lock = grandchild.join(".cargo-lock");
-            if lock.is_file() {
-                lock_paths.push(lock);
-            }
-        }
-    }
-
-    let mut locks = Vec::new();
-    for path in lock_paths {
-        ensure_regular_file(&path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        match FileExt::try_lock_exclusive(&file) {
-            Ok(()) => locks.push(TargetLock(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to lock {}", path.display()));
-            }
-        }
-    }
-    Ok(Some(locks))
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -908,30 +619,8 @@ mod tests {
 
     fn make_cargo_target(path: &Path) {
         fs::create_dir_all(path.join("debug").join(".fingerprint")).unwrap();
-        fs::write(
-            path.join("CACHEDIR.TAG"),
-            b"Signature: 8a477f597d28d172789f06886806bc55\n# test\n",
-        )
-        .unwrap();
         fs::write(path.join("debug").join(".cargo-lock"), b"").unwrap();
         fs::write(path.join("debug").join("artifact"), b"generated").unwrap();
-    }
-
-    fn scratch_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
-        let scratch_root = temp.path().join("scratch");
-        let transcript_root = temp.path().join("projects");
-        let session_root = scratch_root.join("project").join(SESSION_ID);
-        let scratchpad = session_root.join("scratchpad");
-        let project_transcripts = transcript_root.join("project");
-        fs::create_dir_all(&scratchpad).unwrap();
-        fs::create_dir_all(&project_transcripts).unwrap();
-        fs::write(
-            project_transcripts.join(format!("{SESSION_ID}.jsonl")),
-            b"transcript\n",
-        )
-        .unwrap();
-        (temp, scratch_root, transcript_root, scratchpad)
     }
 
     #[test]
@@ -1013,179 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_claude_session_prunes_only_verified_target() {
-        let (_temp, scratch_root, transcript_root, scratchpad) = scratch_fixture();
-        let cargo_target = scratchpad.join("attrib-target");
-        make_cargo_target(&cargo_target);
-        let source = scratchpad.join("probe").join("src").join("main.rs");
-        fs::create_dir_all(source.parent().unwrap()).unwrap();
-        fs::write(&source, b"fn main() {}\n").unwrap();
-        let fake_target = scratchpad.join("notes").join("target");
-        fs::create_dir_all(&fake_target).unwrap();
-        fs::write(fake_target.join("important.patch"), b"patch").unwrap();
-
-        let count = prune_claude_scratch_targets(
-            &scratch_root,
-            &transcript_root,
-            &[],
-            SystemTime::now() + Duration::from_secs(1),
-            |_| Ok(true),
-        )
-        .unwrap();
-
-        assert_eq!(count, 1);
-        assert!(!cargo_target.exists());
-        assert!(source.exists(), "scratch source must be preserved");
-        assert!(fake_target.exists(), "unverified target must be preserved");
-    }
-
-    #[test]
-    fn registered_claude_session_preserves_scratch_target() {
-        let (_temp, scratch_root, transcript_root, scratchpad) = scratch_fixture();
-        let cargo_target = scratchpad.join("probe").join("target");
-        make_cargo_target(&cargo_target);
-
-        let count = prune_claude_scratch_targets(
-            &scratch_root,
-            &transcript_root,
-            &[session_record(SESSION_ID)],
-            SystemTime::now() + Duration::from_secs(1),
-            |_| Ok(true),
-        )
-        .unwrap();
-
-        assert_eq!(count, 0);
-        assert!(cargo_target.exists());
-    }
-
-    #[test]
-    fn recent_or_missing_transcript_preserves_scratch_target() {
-        let (_temp, scratch_root, transcript_root, scratchpad) = scratch_fixture();
-        let cargo_target = scratchpad.join("probe").join("target");
-        make_cargo_target(&cargo_target);
-
-        let count = prune_claude_scratch_targets(
-            &scratch_root,
-            &transcript_root,
-            &[],
-            SystemTime::now() - Duration::from_secs(1),
-            |_| Ok(true),
-        )
-        .unwrap();
-        assert_eq!(count, 0);
-        assert!(cargo_target.exists());
-
-        fs::remove_file(
-            transcript_root
-                .join("project")
-                .join(format!("{SESSION_ID}.jsonl")),
-        )
-        .unwrap();
-        let count = prune_claude_scratch_targets(
-            &scratch_root,
-            &transcript_root,
-            &[],
-            SystemTime::now() + Duration::from_secs(1),
-            |_| Ok(true),
-        )
-        .unwrap();
-        assert_eq!(count, 0);
-        assert!(cargo_target.exists());
-    }
-
-    #[test]
-    fn fresh_liveness_recheck_can_veto_each_scratch_deletion() {
-        let (_temp, scratch_root, transcript_root, scratchpad) = scratch_fixture();
-        let cargo_target = scratchpad.join("target-probe");
-        make_cargo_target(&cargo_target);
-        let mut checks = 0;
-
-        let count = prune_claude_scratch_targets(
-            &scratch_root,
-            &transcript_root,
-            &[],
-            SystemTime::now() + Duration::from_secs(1),
-            |_| {
-                checks += 1;
-                Ok(false)
-            },
-        )
-        .unwrap();
-
-        assert_eq!(checks, 1);
-        assert_eq!(count, 0);
-        assert!(cargo_target.exists());
-    }
-
-    #[test]
-    fn active_cargo_lock_vetoes_scratch_target_deletion() {
-        let (_temp, scratch_root, transcript_root, scratchpad) = scratch_fixture();
-        let cargo_target = scratchpad.join("qastate-target");
-        make_cargo_target(&cargo_target);
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(cargo_target.join("debug").join(".cargo-lock"))
-            .unwrap();
-        FileExt::lock_exclusive(&lock_file).unwrap();
-        let lock = TargetLock(lock_file);
-
-        let count = prune_claude_scratch_targets(
-            &scratch_root,
-            &transcript_root,
-            &[],
-            SystemTime::now() + Duration::from_secs(1),
-            |_| Ok(true),
-        )
-        .unwrap();
-        assert_eq!(count, 0);
-        assert!(cargo_target.exists());
-
-        drop(lock);
-        let count = prune_claude_scratch_targets(
-            &scratch_root,
-            &transcript_root,
-            &[],
-            SystemTime::now() + Duration::from_secs(1),
-            |_| Ok(true),
-        )
-        .unwrap();
-        assert_eq!(count, 1);
-        assert!(!cargo_target.exists());
-    }
-
-    #[test]
-    fn live_candidate_session_process_blocks_cleanup_despite_pid_reuse() {
-        let registered = vec![session_record("e0967971-0502-410f-9360-7a544567f57b")];
-        let represented = vec![ProcInfo {
-            pid: 999_999,
-            ppid: 1,
-            command: "claude --resume existing".to_string(),
-        }];
-        assert!(scratch_liveness_allows_removal(
-            SESSION_ID,
-            &registered,
-            &represented
-        ));
-
-        let unrepresented = vec![ProcInfo {
-            // This PID appears in the registry, but for a different session.
-            // A PID-only check would incorrectly treat the candidate as gone.
-            pid: 999_999,
-            ppid: 1,
-            command: format!(
-                "/Users/tyler/.local/share/claude/versions/2.1.206 --session-id {SESSION_ID}"
-            ),
-        }];
-        assert!(!scratch_liveness_allows_removal(
-            SESSION_ID,
-            &registered,
-            &unrepresented
-        ));
-    }
-
-    #[test]
-    fn recoverable_record_does_not_pin_dead_owned_target() {
+    fn legacy_untagged_owned_target_is_pruned_after_owner_exits() {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().join("cargo-targets");
         let owner = ResolvedOwner {
@@ -1199,11 +716,56 @@ mod tests {
         };
         let target = register_owned_target(&base, &owner).unwrap();
         make_cargo_target(&target);
+        assert!(!target.join("CACHEDIR.TAG").exists());
 
-        let recoverable = [session_record(SESSION_ID)];
         assert_eq!(prune_owned_targets(&base).unwrap(), 1);
         assert!(!target.exists());
-        assert_eq!(recoverable.len(), 1, "session records are never mutated");
+    }
+
+    #[test]
+    fn real_cargo_target_is_created_by_cargo_and_pruned() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("cargo-targets");
+        let owner = ResolvedOwner {
+            target_session_id: SESSION_ID.to_string(),
+            owner_session_id: Some(SESSION_ID.to_string()),
+            tool: Tool::Codex,
+            process: ProcessIdentity {
+                pid: 999_999,
+                started_at: "old process".to_string(),
+            },
+        };
+        let target = register_owned_target(&base, &owner).unwrap();
+        assert!(
+            !target.exists(),
+            "Cargo must create its own target directory"
+        );
+
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"cleanup-probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let status = Command::new("cargo")
+            .args([
+                "check",
+                "--offline",
+                "--quiet",
+                "--manifest-path",
+                project.join("Cargo.toml").to_str().unwrap(),
+            ])
+            .env("CARGO_TARGET_DIR", &target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(target.join("CACHEDIR.TAG").is_file());
+
+        assert_eq!(prune_owned_targets(&base).unwrap(), 1);
+        assert!(!target.exists());
     }
 
     #[test]
@@ -1252,6 +814,30 @@ mod tests {
 
         assert_eq!(prune_owned_targets(&linked_base).unwrap(), 0);
         assert!(target.exists());
+    }
+
+    #[test]
+    fn symlinked_target_is_never_traversed() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("cargo-targets");
+        let owner = ResolvedOwner {
+            target_session_id: SESSION_ID.to_string(),
+            owner_session_id: Some(SESSION_ID.to_string()),
+            tool: Tool::Claude,
+            process: ProcessIdentity {
+                pid: 999_999,
+                started_at: "old process".to_string(),
+            },
+        };
+        let target = register_owned_target(&base, &owner).unwrap();
+        let outside = temp.path().join("outside");
+        make_cargo_target(&outside);
+        symlink(&outside, &target).unwrap();
+
+        assert_eq!(prune_owned_targets(&base).unwrap(), 0);
+        assert!(outside.join("debug").join("artifact").is_file());
     }
 
     #[test]
