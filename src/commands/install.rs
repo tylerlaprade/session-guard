@@ -1,5 +1,5 @@
 use crate::TerminalKind;
-use crate::hooks;
+use crate::commands;
 use crate::paths;
 use crate::process;
 use anyhow::{Context, Result};
@@ -18,60 +18,16 @@ pub fn run(terminal: TerminalKind) -> Result<()> {
         .context("failed to write terminal choice")?;
     sessions_store_init()?;
 
-    let claude_installed = process::command_exists("claude");
-    let codex_installed = process::command_exists("codex");
-    let grok_installed = process::command_exists("grok");
-    let opencode_installed = process::command_exists("opencode");
-
-    let claude_hooks = if claude_installed {
-        Some(hooks::install_claude_hooks(&paths::claude_settings()?)?)
-    } else {
-        None
-    };
-    let codex_hooks = if codex_installed {
-        Some(hooks::install_codex_hooks(&paths::codex_config()?)?)
-    } else {
-        None
-    };
-    let grok_hooks = if grok_installed {
-        Some(hooks::install_grok_hooks(&paths::grok_hooks_dir()?)?)
-    } else {
-        None
-    };
-    let opencode_plugin = if opencode_installed {
-        Some(hooks::install_opencode_plugin(
-            &paths::opencode_plugin_dir()?,
-        )?)
-    } else {
-        None
-    };
+    let hook_report = commands::install_hooks::install_all()?;
 
     write_launch_agent()?;
     load_launch_agent(&paths::launch_agent_plist()?)?;
 
     println!("session-guard installed");
     println!("Terminal: {terminal}");
-    println!(
-        "Claude Code hooks: {}",
-        hook_summary(claude_installed, claude_hooks.as_ref())
-    );
-    println!(
-        "Codex hooks: {}",
-        hook_summary(codex_installed, codex_hooks.as_ref())
-    );
-    if codex_hooks.as_ref().is_some_and(|change| change.changed) {
-        println!(
-            "Codex asks once to trust new or changed hooks on the next interactive launch; they do not run until approved."
-        );
+    for line in hook_report {
+        println!("{line}");
     }
-    println!(
-        "Grok hooks: {}",
-        hook_summary(grok_installed, grok_hooks.as_ref())
-    );
-    println!(
-        "OpenCode plugin: {}",
-        hook_summary(opencode_installed, opencode_plugin.as_ref())
-    );
     if terminal == TerminalKind::Alacritty {
         println!("Alacritty has no tab control API; restores will open new windows.");
     }
@@ -82,18 +38,6 @@ pub fn run(terminal: TerminalKind) -> Result<()> {
 
 fn sessions_store_init() -> Result<()> {
     crate::sessions::ensure_store(&paths::sessions_file()?)
-}
-
-fn hook_summary(installed: bool, change: Option<&hooks::HookChange>) -> &'static str {
-    if !installed {
-        return "skipped; tool not found in PATH";
-    }
-
-    match change {
-        Some(change) if change.changed => "installed",
-        Some(_) => "already present",
-        None => "skipped",
-    }
 }
 
 fn ensure_terminal_available(terminal: TerminalKind) -> Result<()> {

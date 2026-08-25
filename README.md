@@ -139,6 +139,57 @@ sessions (`session_kind: "subagent"`) and headless runs (`-p`/`--single`,
 `CLAUDE_CODE_ENTRYPOINT` is `cli`, which excludes the desktop app, IDE
 extension panes, and SDK/headless runs.
 
+## Adding a harness
+
+Everything session-guard knows about one agent CLI lives in a single `Harness`
+entry in `src/harness.rs`. Nothing else in the codebase branches on which
+harness it is holding, so supporting another one means adding an entry to
+`HARNESSES` and nothing more:
+
+```rust
+Harness {
+    id: "amp",                       // the --tool value, and the on-disk name
+    display_name: "Amp",
+    binary: "amp",                   // must be in PATH before hooks install
+    home: ToolPath { env: Some("AMP_HOME"), default: &[".amp"], suffix: &[] },
+    resume: "amp --resume {session_id}",
+    discovery: Discovery::Jsonl {
+        root: &["sessions"],         // relative to home
+        session_id_from_stem: |stem| Some(stem.to_string()),
+        accept: None,
+    },
+    integration: Integration::JsonSettings {
+        path: ToolPath { env: Some("AMP_HOME"), default: &[".amp"], suffix: &["settings.json"] },
+        events: STANDARD_HOOKS,
+        register: AMP_REGISTER,
+        deregister: AMP_DEREGISTER,
+    },
+    session_id_env: Some("AMP_SESSION_ID"),
+    identifies_process: None,        // defaults to matching `binary`
+    session_id_from_process: None,
+    install_note: None,
+}
+```
+
+Four integration shapes are already implemented: hook arrays in a JSON settings
+file, hook tables in a TOML config, a hooks directory holding a script plus a
+manifest, and a plugin module dropped into a plugin directory. A harness that
+reuses one of those needs no Rust beyond its register and deregister command
+strings. Only a genuinely new config format calls for a new `Integration`
+variant.
+
+Where a harness needs bespoke parsing — a session id buried in a filename, a
+transcript that must be filtered before it counts — the entry carries a
+function pointer rather than forcing a match arm somewhere upstream. Codex uses
+both: its id is the trailing UUID of the rollout stem, and `accept` rejects
+threads that never held a terminal tab.
+
+If the harness keeps sessions somewhere the crash scan cannot read, use
+`Discovery::Opaque`; hooks still track it live, only the transcript fallback
+stops applying. The tests in `src/harness.rs` check every entry for a unique
+id, a resume template that interpolates `{session_id}`, declared hook events,
+and paths that resolve.
+
 ## Temporary Cargo targets
 
 Use the repository's normal shared Cargo target for routine builds. When a

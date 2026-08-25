@@ -46,48 +46,12 @@ pub fn cargo_targets_dir() -> Result<PathBuf> {
         .join("cargo-targets"))
 }
 
-pub fn claude_settings() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".claude").join("settings.json"))
-}
-
-pub fn codex_config() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".codex").join("config.toml"))
-}
-
-pub fn grok_hooks_dir() -> Result<PathBuf> {
-    Ok(tool_home(Tool::Grok)?.join("hooks"))
-}
-
-/// OpenCode auto-discovers plugins from `<config dir>/plugin/*.{js,ts}`.
-pub fn opencode_plugin_dir() -> Result<PathBuf> {
-    Ok(opencode_config_dir()?.join("plugin"))
-}
-
-fn opencode_config_dir() -> Result<PathBuf> {
-    Ok(env::var_os("OPENCODE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or(home_dir()?.join(".config").join("opencode")))
-}
-
 /// The tool's own config/state root, honoring the same env overrides the tools
 /// themselves use. Sessions whose working directory lives inside this root are
 /// internal tool activity (e.g. codex memory maintenance under `~/.codex`),
 /// never user project sessions.
 pub fn tool_home(tool: Tool) -> Result<PathBuf> {
-    match tool {
-        Tool::Claude => Ok(env::var_os("CLAUDE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or(home_dir()?.join(".claude"))),
-        Tool::Codex => Ok(env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .unwrap_or(home_dir()?.join(".codex"))),
-        Tool::Grok => Ok(env::var_os("GROK_HOME")
-            .map(PathBuf::from)
-            .unwrap_or(home_dir()?.join(".grok"))),
-        // OpenCode splits config (~/.config/opencode) from state; the state
-        // root is where internal activity would run.
-        Tool::Opencode => Ok(home_dir()?.join(".local").join("share").join("opencode")),
-    }
+    tool.spec().home.resolve()
 }
 
 pub fn launch_agent_plist() -> Result<PathBuf> {

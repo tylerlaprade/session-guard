@@ -1,7 +1,7 @@
 use crate::Tool;
+use crate::harness::Discovery;
 use crate::paths;
 use crate::sessions::{self, SessionRecord};
-use crate::transcripts;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::io::{self, IsTerminal, Read};
@@ -63,18 +63,21 @@ pub fn run(
         .as_ref()
         .and_then(|input| input.transcript_path.clone());
 
-    // The Codex desktop app, its scheduled automations, `codex exec`, and
-    // subagents fire these hooks too, but their threads live outside any
-    // terminal tab and restore as junk. The hook payload does not say which
-    // frontend owns the thread; the rollout's session_meta for this session's
-    // own id does (see codex_rollout_is_cli). No readable rollout at all also
-    // disqualifies: `codex resume` needs one, so the session could never be
-    // restored anyway.
-    if tool == Tool::Codex
+    // Some harnesses fire these hooks from frontends that never hold a
+    // terminal tab — the Codex desktop app, its automations, `codex exec`,
+    // subagents. The hook payload does not say which frontend owns the
+    // thread, so the harness supplies a gate that reads the transcript (see
+    // `Discovery::accept`). No readable transcript also disqualifies: resume
+    // needs one, so the session could never be restored anyway.
+    let accept = match &tool.spec().discovery {
+        Discovery::Jsonl { accept, .. } => *accept,
+        _ => None,
+    };
+    if let Some(accept) = accept
         && !explicit_session
         && !transcript_path
             .as_deref()
-            .is_some_and(|path| transcripts::codex_rollout_is_cli(path, &session_id))
+            .is_some_and(|path| accept(path, &session_id))
     {
         return Ok(());
     }

@@ -69,7 +69,6 @@ fn remember_and_deregister(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Tool;
     use crate::sessions::SessionRecord;
     use std::path::PathBuf;
 
@@ -79,7 +78,7 @@ mod tests {
         let sessions_path = dir.path().join("active-sessions.json");
         let last_sessions_path = dir.path().join("last-sessions.json");
         let mut session = SessionRecord::new(
-            Tool::Claude,
+            crate::tool("claude"),
             "session-a".to_string(),
             Some(10),
             Some(20),
@@ -97,7 +96,7 @@ mod tests {
         assert_eq!(
             last_sessions::find(
                 &last_sessions_path,
-                Tool::Claude,
+                crate::tool("claude"),
                 20,
                 "Wed Jan 1 00:00:00 2020"
             )
@@ -113,7 +112,7 @@ mod tests {
         shell_pid_started_at: Option<String>,
     ) -> SessionRecord {
         let mut session = SessionRecord::new(
-            Tool::Claude,
+            crate::tool("claude"),
             "session-a".to_string(),
             Some(10),
             None,

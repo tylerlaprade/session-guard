@@ -1,3 +1,5 @@
+use crate::Tool;
+use crate::harness::{HookAction, HookEvent, Integration};
 use anyhow::{Context, Result};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::fs;
@@ -6,108 +8,6 @@ use std::path::Path;
 use toml::Value as TomlValue;
 use toml::map::Map as TomlMap;
 
-// Every Claude frontend — terminal CLI, the desktop app, IDE extension
-// sidebars, SDK/headless runs — shares ~/.claude and fires these same hooks.
-// CLAUDE_CODE_ENTRYPOINT (inherited by hook subprocesses) names the frontend;
-// only "cli" sessions live in a terminal tab, so only those register. A
-// `claude` launched inside a VS Code integrated terminal is still "cli".
-// (Headless remote workers never register via hooks anyway; the process scan
-// tracks them.)
-const CLAUDE_REGISTER: &str = r#"[ "$CLAUDE_CODE_ENTRYPOINT" = cli ] || exit 0; tool_pid="$PPID"; shell_pid="${SESSION_GUARD_SHELL_PID:-}"; [ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool claude --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool claude --pid "$tool_pid"; fi"#;
-const CLAUDE_DEREGISTER: &str = "session-guard deregister";
-const CODEX_REGISTER: &str = r#"tool_pid="$PPID"; shell_pid="${SESSION_GUARD_SHELL_PID:-}"; [ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool codex --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool codex --pid "$tool_pid"; fi"#;
-const CODEX_DEREGISTER: &str = "session-guard deregister";
-// Grok expands $VAR / ${VAR} in hook `command` strings and fails the hook when
-// the var is unset. $PPID is a shell special, not an env var, so inline Claude-
-// style commands break. Keep the register logic in a companion script instead.
-const GROK_REGISTER_SCRIPT_NAME: &str = "session-guard-register.sh";
-const GROK_HOOKS_FILE_NAME: &str = "session-guard.json";
-const GROK_REGISTER_SCRIPT: &str = r#"#!/bin/sh
-tool_pid="$PPID"
-# Headless runs (-p/--single, --prompt-file) fire these hooks too, but they
-# print and exit — they never hold a terminal tab, so never register them.
-# Grok exposes no headless marker in the hook payload or env; the process
-# argv is the only signal. (A prompt whose text contains these flags with
-# surrounding spaces is misread as headless and merely goes untracked.)
-case " $(ps -o command= -p "$tool_pid") " in
-  *" -p "*|*" --single "*|*" --single="*|*" --prompt-file "*|*" --prompt-file="*) exit 0 ;;
-esac
-shell_pid="${SESSION_GUARD_SHELL_PID:-}"
-[ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"
-if [ -n "$shell_pid" ]; then
-  exec session-guard register --tool grok --pid "$tool_pid" --shell-pid "$shell_pid"
-else
-  exec session-guard register --tool grok --pid "$tool_pid"
-fi
-"#;
-const GROK_DEREGISTER: &str = "session-guard deregister";
-// OpenCode has no shell-command hooks; its extension point is a JS plugin
-// module loaded into the opencode process (Bun), discovered from
-// `<config>/plugin/*.js`. The plugin registers over the session event bus
-// and shells out to session-guard with Bun's `$`.
-const OPENCODE_PLUGIN_NAME: &str = "session-guard.js";
-const OPENCODE_PLUGIN: &str = r#"// Installed by `session-guard install`; removed by `session-guard uninstall`.
-// Do not edit: session-guard rewrites this file when its contents change.
-import { existsSync } from "node:fs";
-
-const REGISTER_THROTTLE_MS = 30_000;
-
-// Only interactive TUI sessions live in a terminal tab. Headless modes put a
-// subcommand in argv[2] (run, serve, web, acp, session, db, ...); the TUI is
-// invoked bare, with flags, or with a project path. OpenCode publishes no
-// official mode marker, so argv is the only signal.
-function isInteractiveTui() {
-  const sub = process.argv[2];
-  return !sub || sub.startsWith("-") || existsSync(sub);
-}
-
-export const SessionGuard = async ({ $, directory }) => {
-  if (!isInteractiveTui() || !$) return {};
-
-  const shellPid = process.env.SESSION_GUARD_SHELL_PID || process.ppid;
-  const lastRegistered = new Map();
-
-  const register = async (sessionID, dir) => {
-    const now = Date.now();
-    if (now - (lastRegistered.get(sessionID) ?? 0) < REGISTER_THROTTLE_MS) return;
-    lastRegistered.set(sessionID, now);
-    await $`session-guard register --tool opencode --session-id ${sessionID} --pid ${process.pid} --shell-pid ${shellPid} --directory ${dir}`
-      .quiet()
-      .nothrow();
-  };
-
-  // The stdin (hook) form, not --session-id: the hook path keeps the record
-  // when the tab's shell is already gone (GUI teardown), matching the other
-  // tools' SessionEnd behavior.
-  const deregister = async (sessionID) => {
-    const payload = JSON.stringify({ session_id: sessionID });
-    await $`echo ${payload} | session-guard deregister`.quiet().nothrow();
-  };
-
-  return {
-    event: async ({ event }) => {
-      const { type, properties } = event;
-      if (type === "session.created" || type === "session.updated") {
-        const info = properties.info;
-        if (info.parentID) return; // subagent child, never a tab
-        await register(info.id, info.directory || directory);
-      } else if (type === "session.idle") {
-        // Turn finished: force a fresh heartbeat like the other tools' Stop.
-        lastRegistered.delete(properties.sessionID);
-        await register(properties.sessionID, directory);
-      } else if (type === "session.deleted") {
-        lastRegistered.delete(properties.info.id);
-        await deregister(properties.info.id);
-      }
-    },
-    dispose: async () => {
-      for (const sessionID of lastRegistered.keys()) {
-        await deregister(sessionID);
-      }
-    },
-  };
-};
-"#;
 const OLD_CLAUDE_REGISTER: &str = "session-guard register --tool claude --pid \"$PPID\"";
 // The pre-entrypoint-gate register command; without it in the removal lists,
 // installs would leave both hooks and the ungated one would re-admit desktop
@@ -128,24 +28,126 @@ pub struct HookChange {
     pub changed: bool,
 }
 
-pub fn install_claude_hooks(path: &Path) -> Result<HookChange> {
+/// Installs the register/deregister hooks for one harness, in whatever shape
+/// that harness accepts. Adding a harness that reuses one of these shapes needs
+/// no code here — only a registry entry.
+pub fn install(tool: Tool) -> Result<HookChange> {
+    match &tool.spec().integration {
+        Integration::JsonSettings {
+            path,
+            events,
+            register,
+            deregister,
+        } => install_json_hooks(&path.resolve()?, events, register, deregister),
+        Integration::TomlConfig {
+            path,
+            events,
+            register,
+            deregister,
+        } => install_toml_hooks(&path.resolve()?, events, register, deregister),
+        Integration::ScriptDir {
+            path,
+            events,
+            script_name,
+            script,
+            manifest_name,
+            deregister,
+        } => install_script_dir(
+            &path.resolve()?,
+            events,
+            script_name,
+            script,
+            manifest_name,
+            deregister,
+        ),
+        Integration::PluginFile { path, name, source } => {
+            install_plugin_file(&path.resolve()?, name, source)
+        }
+    }
+}
+
+pub fn remove(tool: Tool) -> Result<HookChange> {
+    match &tool.spec().integration {
+        Integration::JsonSettings { path, .. } => remove_json_hooks(&path.resolve()?),
+        Integration::TomlConfig { path, .. } => remove_toml_hooks(&path.resolve()?),
+        Integration::ScriptDir {
+            path,
+            script_name,
+            manifest_name,
+            ..
+        } => remove_files(&path.resolve()?, &[manifest_name, script_name]),
+        Integration::PluginFile { path, name, .. } => remove_files(&path.resolve()?, &[name]),
+    }
+}
+
+/// Installs into an explicit directory or file instead of the harness's real
+/// path, so tests can exercise a harness end to end in a temp dir.
+#[cfg(test)]
+fn install_at(tool: Tool, path: &Path) -> Result<HookChange> {
+    match &tool.spec().integration {
+        Integration::JsonSettings {
+            events,
+            register,
+            deregister,
+            ..
+        } => install_json_hooks(path, events, register, deregister),
+        Integration::TomlConfig {
+            events,
+            register,
+            deregister,
+            ..
+        } => install_toml_hooks(path, events, register, deregister),
+        Integration::ScriptDir {
+            events,
+            script_name,
+            script,
+            manifest_name,
+            deregister,
+            ..
+        } => install_script_dir(path, events, script_name, script, manifest_name, deregister),
+        Integration::PluginFile { name, source, .. } => install_plugin_file(path, name, source),
+    }
+}
+
+#[cfg(test)]
+fn remove_at(tool: Tool, path: &Path) -> Result<HookChange> {
+    match &tool.spec().integration {
+        Integration::JsonSettings { .. } => remove_json_hooks(path),
+        Integration::TomlConfig { .. } => remove_toml_hooks(path),
+        Integration::ScriptDir {
+            script_name,
+            manifest_name,
+            ..
+        } => remove_files(path, &[manifest_name, script_name]),
+        Integration::PluginFile { name, .. } => remove_files(path, &[name]),
+    }
+}
+
+/// The command a hook runs for one lifecycle event.
+fn hook_command<'a>(event: &HookEvent, register: &'a str, deregister: &'a str) -> &'a str {
+    match event.action {
+        HookAction::Register => register,
+        HookAction::Deregister => deregister,
+    }
+}
+
+fn install_json_hooks(
+    path: &Path,
+    events: &[HookEvent],
+    register: &str,
+    deregister: &str,
+) -> Result<HookChange> {
     let mut root = read_json_config(path)?;
     let mut changed = remove_json_hook_commands(&mut root, old_hook_commands());
 
-    changed |= ensure_json_hook(
-        &mut root,
-        "SessionStart",
-        Some("startup|resume"),
-        CLAUDE_REGISTER,
-    )?;
-    // Claude fires SessionStart only at creation and never re-announces a live
-    // session, so a session that loses its registration mid-life stays lost: a
-    // stray SessionEnd (e.g. /clear, or switching away with /resume) deregisters
-    // it, and a SessionStart whose source the matcher skips (clear|compact) never
-    // re-adds it. Re-registering on Stop (every turn) self-heals this the same
-    // way the Codex Stop hook does, so a still-open session remains restorable.
-    changed |= ensure_json_hook(&mut root, "Stop", None, CLAUDE_REGISTER)?;
-    changed |= ensure_json_hook(&mut root, "SessionEnd", None, CLAUDE_DEREGISTER)?;
+    for event in events {
+        changed |= ensure_json_hook(
+            &mut root,
+            event.event,
+            event.matcher,
+            hook_command(event, register, deregister),
+        )?;
+    }
 
     if changed {
         write_json_config(path, &root)?;
@@ -154,13 +156,13 @@ pub fn install_claude_hooks(path: &Path) -> Result<HookChange> {
     Ok(HookChange { changed })
 }
 
-pub fn remove_claude_hooks(path: &Path) -> Result<HookChange> {
+fn remove_json_hooks(path: &Path) -> Result<HookChange> {
     if !path.exists() {
         return Ok(HookChange::default());
     }
 
     let mut root = read_json_config(path)?;
-    let changed = remove_json_hook_commands(&mut root, all_hook_commands());
+    let changed = remove_json_hook_commands(&mut root, &all_hook_commands());
 
     if changed {
         write_json_config(path, &root)?;
@@ -169,21 +171,23 @@ pub fn remove_claude_hooks(path: &Path) -> Result<HookChange> {
     Ok(HookChange { changed })
 }
 
-pub fn install_codex_hooks(path: &Path) -> Result<HookChange> {
+fn install_toml_hooks(
+    path: &Path,
+    events: &[HookEvent],
+    register: &str,
+    deregister: &str,
+) -> Result<HookChange> {
     let mut root = read_toml_config(path)?;
     let mut changed = remove_toml_hook_commands(&mut root, old_hook_commands())?;
 
-    changed |= ensure_toml_hook(
-        &mut root,
-        "SessionStart",
-        Some("startup|resume"),
-        CODEX_REGISTER,
-    )?;
-    changed |= ensure_toml_hook(&mut root, "Stop", None, CODEX_REGISTER)?;
-    // Codex 0.145 added a real SessionEnd hook. It fires only on graceful
-    // shutdown, so a crash still leaves the entry recoverable; a clean quit
-    // deregisters instead of lingering for the 7-day expiry.
-    changed |= ensure_toml_hook(&mut root, "SessionEnd", None, CODEX_DEREGISTER)?;
+    for event in events {
+        changed |= ensure_toml_hook(
+            &mut root,
+            event.event,
+            event.matcher,
+            hook_command(event, register, deregister),
+        )?;
+    }
 
     if changed {
         write_toml_config(path, &root)?;
@@ -192,13 +196,13 @@ pub fn install_codex_hooks(path: &Path) -> Result<HookChange> {
     Ok(HookChange { changed })
 }
 
-pub fn remove_codex_hooks(path: &Path) -> Result<HookChange> {
+fn remove_toml_hooks(path: &Path) -> Result<HookChange> {
     if !path.exists() {
         return Ok(HookChange::default());
     }
 
     let mut root = read_toml_config(path)?;
-    let changed = remove_toml_hook_commands(&mut root, all_hook_commands())?;
+    let changed = remove_toml_hook_commands(&mut root, &all_hook_commands())?;
 
     if changed {
         write_toml_config(path, &root)?;
@@ -207,15 +211,18 @@ pub fn remove_codex_hooks(path: &Path) -> Result<HookChange> {
     Ok(HookChange { changed })
 }
 
-pub fn install_grok_hooks(hooks_dir: &Path) -> Result<HookChange> {
-    fs::create_dir_all(hooks_dir)
-        .with_context(|| format!("failed to create {}", hooks_dir.display()))?;
+fn install_script_dir(
+    dir: &Path,
+    events: &[HookEvent],
+    script_name: &str,
+    script: &str,
+    manifest_name: &str,
+    deregister: &str,
+) -> Result<HookChange> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
-    let script_path = hooks_dir.join(GROK_REGISTER_SCRIPT_NAME);
-    let json_path = hooks_dir.join(GROK_HOOKS_FILE_NAME);
-    let mut changed = false;
-
-    changed |= write_if_changed(&script_path, GROK_REGISTER_SCRIPT)?;
+    let script_path = dir.join(script_name);
+    let mut changed = write_if_changed(&script_path, script)?;
     if changed || !is_executable(&script_path) {
         let mut perms = fs::metadata(&script_path)
             .with_context(|| format!("failed to stat {}", script_path.display()))?
@@ -226,16 +233,22 @@ pub fn install_grok_hooks(hooks_dir: &Path) -> Result<HookChange> {
         changed = true;
     }
 
-    let desired = grok_hooks_json();
-    changed |= write_if_changed(&json_path, &desired)?;
+    let manifest = hooks_manifest_json(events, script_name, deregister);
+    changed |= write_if_changed(&dir.join(manifest_name), &manifest)?;
 
     Ok(HookChange { changed })
 }
 
-pub fn remove_grok_hooks(hooks_dir: &Path) -> Result<HookChange> {
+fn install_plugin_file(dir: &Path, name: &str, source: &str) -> Result<HookChange> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let changed = write_if_changed(&dir.join(name), source)?;
+    Ok(HookChange { changed })
+}
+
+fn remove_files(dir: &Path, names: &[&str]) -> Result<HookChange> {
     let mut changed = false;
-    for name in [GROK_HOOKS_FILE_NAME, GROK_REGISTER_SCRIPT_NAME] {
-        let path = hooks_dir.join(name);
+    for name in names {
+        let path = dir.join(name);
         if path.exists() {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to remove {}", path.display()))?;
@@ -245,49 +258,23 @@ pub fn remove_grok_hooks(hooks_dir: &Path) -> Result<HookChange> {
     Ok(HookChange { changed })
 }
 
-pub fn install_opencode_plugin(plugin_dir: &Path) -> Result<HookChange> {
-    fs::create_dir_all(plugin_dir)
-        .with_context(|| format!("failed to create {}", plugin_dir.display()))?;
-    let changed = write_if_changed(&plugin_dir.join(OPENCODE_PLUGIN_NAME), OPENCODE_PLUGIN)?;
-    Ok(HookChange { changed })
-}
-
-pub fn remove_opencode_plugin(plugin_dir: &Path) -> Result<HookChange> {
-    let path = plugin_dir.join(OPENCODE_PLUGIN_NAME);
-    if !path.exists() {
-        return Ok(HookChange::default());
+/// A standalone hooks manifest: `{"hooks": {"<Event>": [{"hooks": [...]}]}}`.
+fn hooks_manifest_json(events: &[HookEvent], register: &str, deregister: &str) -> String {
+    let mut hooks = serde_json::Map::new();
+    for event in events {
+        let command = hook_command(event, register, deregister);
+        hooks
+            .entry(event.event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("hook event array")
+            .push(json!({
+                "hooks": [{ "type": "command", "command": command }]
+            }));
     }
-    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
-    Ok(HookChange { changed: true })
-}
 
-fn grok_hooks_json() -> String {
-    // SessionStart has no matcher: Grok rejects matchers on lifecycle events.
-    // Stop re-registers each turn so a session that lost its registration stays
-    // restorable, matching Claude/Codex.
-    let root = json!({
-        "hooks": {
-            "SessionStart": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": GROK_REGISTER_SCRIPT_NAME
-                }]
-            }],
-            "Stop": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": GROK_REGISTER_SCRIPT_NAME
-                }]
-            }],
-            "SessionEnd": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": GROK_DEREGISTER
-                }]
-            }]
-        }
-    });
-    let mut contents = serde_json::to_string_pretty(&root).expect("static grok hooks json");
+    let mut contents = serde_json::to_string_pretty(&json!({ "hooks": hooks }))
+        .expect("static hooks manifest json");
     contents.push('\n');
     contents
 }
@@ -349,21 +336,30 @@ fn old_hook_commands() -> &'static [&'static str] {
     ]
 }
 
-fn all_hook_commands() -> &'static [&'static str] {
-    &[
-        CLAUDE_REGISTER,
-        CLAUDE_DEREGISTER,
-        CODEX_REGISTER,
-        OLD_CLAUDE_REGISTER,
-        OLD_CLAUDE_REGISTER_UNGATED,
-        OLD_CLAUDE_REGISTER_PARENT,
-        OLD_CLAUDE_REGISTER_ENV,
-        OLD_CLAUDE_DEREGISTER_ENV,
-        OLD_CODEX_REGISTER,
-        OLD_CODEX_REGISTER_PARENT,
-        OLD_CODEX_REGISTER_ENV,
-        OLD_CODEX_DEREGISTER_ENV,
-    ]
+/// Every command session-guard has ever installed, current and retired, so an
+/// uninstall leaves nothing behind. Current commands come from the registry, so
+/// a new harness is covered the moment it is added.
+fn all_hook_commands() -> Vec<&'static str> {
+    let mut commands: Vec<&'static str> = Tool::all()
+        .flat_map(|tool| match &tool.spec().integration {
+            Integration::JsonSettings {
+                register,
+                deregister,
+                ..
+            }
+            | Integration::TomlConfig {
+                register,
+                deregister,
+                ..
+            } => vec![*register, *deregister],
+            Integration::ScriptDir { deregister, .. } => vec![*deregister],
+            Integration::PluginFile { .. } => Vec::new(),
+        })
+        .collect();
+    commands.extend_from_slice(old_hook_commands());
+    commands.sort_unstable();
+    commands.dedup();
+    commands
 }
 
 fn ensure_json_hook(
@@ -651,14 +647,18 @@ fn toml_array_mut<'a>(value: &'a mut TomlValue, name: &str) -> Result<&'a mut Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::{
+        CLAUDE_REGISTER, CODEX_DEREGISTER, CODEX_REGISTER, GROK_DEREGISTER, GROK_HOOKS_FILE_NAME,
+        GROK_REGISTER_SCRIPT_NAME, OPENCODE_PLUGIN_NAME,
+    };
 
     #[test]
     fn claude_hook_install_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
-        assert!(install_claude_hooks(&path).unwrap().changed);
-        assert!(!install_claude_hooks(&path).unwrap().changed);
+        assert!(install_at(crate::tool("claude"), &path).unwrap().changed);
+        assert!(!install_at(crate::tool("claude"), &path).unwrap().changed);
 
         let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
@@ -689,7 +689,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(install_claude_hooks(&path).unwrap().changed);
+        assert!(install_at(crate::tool("claude"), &path).unwrap().changed);
 
         let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
@@ -719,7 +719,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(install_claude_hooks(&path).unwrap().changed);
+        assert!(install_at(crate::tool("claude"), &path).unwrap().changed);
 
         let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
@@ -748,7 +748,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(install_claude_hooks(&path).unwrap().changed);
+        assert!(install_at(crate::tool("claude"), &path).unwrap().changed);
 
         let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
@@ -762,8 +762,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        assert!(install_codex_hooks(&path).unwrap().changed);
-        assert!(!install_codex_hooks(&path).unwrap().changed);
+        assert!(install_at(crate::tool("codex"), &path).unwrap().changed);
+        assert!(!install_at(crate::tool("codex"), &path).unwrap().changed);
 
         let root = read_toml_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
@@ -798,7 +798,7 @@ command = "{}"
         )
         .unwrap();
 
-        assert!(install_codex_hooks(&path).unwrap().changed);
+        assert!(install_at(crate::tool("codex"), &path).unwrap().changed);
 
         let root = read_toml_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
@@ -825,7 +825,7 @@ command = '{}'
         )
         .unwrap();
 
-        assert!(install_codex_hooks(&path).unwrap().changed);
+        assert!(install_at(crate::tool("codex"), &path).unwrap().changed);
 
         let root = read_toml_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
@@ -839,8 +839,8 @@ command = '{}'
         let dir = tempfile::tempdir().unwrap();
         let hooks_dir = dir.path().join("hooks");
 
-        assert!(install_grok_hooks(&hooks_dir).unwrap().changed);
-        assert!(!install_grok_hooks(&hooks_dir).unwrap().changed);
+        assert!(install_at(crate::tool("grok"), &hooks_dir).unwrap().changed);
+        assert!(!install_at(crate::tool("grok"), &hooks_dir).unwrap().changed);
 
         let json_path = hooks_dir.join(GROK_HOOKS_FILE_NAME);
         let script_path = hooks_dir.join(GROK_REGISTER_SCRIPT_NAME);
@@ -874,8 +874,16 @@ command = '{}'
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("plugin");
 
-        assert!(install_opencode_plugin(&plugin_dir).unwrap().changed);
-        assert!(!install_opencode_plugin(&plugin_dir).unwrap().changed);
+        assert!(
+            install_at(crate::tool("opencode"), &plugin_dir)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !install_at(crate::tool("opencode"), &plugin_dir)
+                .unwrap()
+                .changed
+        );
 
         let path = plugin_dir.join(OPENCODE_PLUGIN_NAME);
         let contents = fs::read_to_string(&path).unwrap();
@@ -883,19 +891,27 @@ command = '{}'
         assert!(contents.contains("session-guard deregister"));
         assert!(contents.contains("export const SessionGuard"));
 
-        assert!(remove_opencode_plugin(&plugin_dir).unwrap().changed);
+        assert!(
+            remove_at(crate::tool("opencode"), &plugin_dir)
+                .unwrap()
+                .changed
+        );
         assert!(!path.exists());
-        assert!(!remove_opencode_plugin(&plugin_dir).unwrap().changed);
+        assert!(
+            !remove_at(crate::tool("opencode"), &plugin_dir)
+                .unwrap()
+                .changed
+        );
     }
 
     #[test]
     fn grok_hook_remove_deletes_owned_files() {
         let dir = tempfile::tempdir().unwrap();
         let hooks_dir = dir.path().join("hooks");
-        assert!(install_grok_hooks(&hooks_dir).unwrap().changed);
-        assert!(remove_grok_hooks(&hooks_dir).unwrap().changed);
+        assert!(install_at(crate::tool("grok"), &hooks_dir).unwrap().changed);
+        assert!(remove_at(crate::tool("grok"), &hooks_dir).unwrap().changed);
         assert!(!hooks_dir.join(GROK_HOOKS_FILE_NAME).exists());
         assert!(!hooks_dir.join(GROK_REGISTER_SCRIPT_NAME).exists());
-        assert!(!remove_grok_hooks(&hooks_dir).unwrap().changed);
+        assert!(!remove_at(crate::tool("grok"), &hooks_dir).unwrap().changed);
     }
 }

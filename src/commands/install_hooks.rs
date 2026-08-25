@@ -1,59 +1,53 @@
+use crate::Tool;
+use crate::harness::Integration;
 use crate::hooks;
-use crate::paths;
 use crate::process;
 use anyhow::Result;
 
 pub fn run() -> Result<()> {
-    let claude_installed = process::command_exists("claude");
-    let codex_installed = process::command_exists("codex");
-    let grok_installed = process::command_exists("grok");
-    let opencode_installed = process::command_exists("opencode");
-
-    let claude_hooks = if claude_installed {
-        Some(hooks::install_claude_hooks(&paths::claude_settings()?)?)
-    } else {
-        None
-    };
-    let codex_hooks = if codex_installed {
-        Some(hooks::install_codex_hooks(&paths::codex_config()?)?)
-    } else {
-        None
-    };
-    let grok_hooks = if grok_installed {
-        Some(hooks::install_grok_hooks(&paths::grok_hooks_dir()?)?)
-    } else {
-        None
-    };
-    let opencode_plugin = if opencode_installed {
-        Some(hooks::install_opencode_plugin(
-            &paths::opencode_plugin_dir()?,
-        )?)
-    } else {
-        None
-    };
-
-    println!(
-        "Claude Code hooks: {}",
-        hook_summary(claude_installed, claude_hooks.as_ref())
-    );
-    println!(
-        "Codex hooks: {}",
-        hook_summary(codex_installed, codex_hooks.as_ref())
-    );
-    if codex_hooks.as_ref().is_some_and(|change| change.changed) {
-        println!(
-            "Codex asks once to trust new or changed hooks on the next interactive launch; they do not run until approved."
-        );
+    for line in install_all()? {
+        println!("{line}");
     }
-    println!(
-        "Grok hooks: {}",
-        hook_summary(grok_installed, grok_hooks.as_ref())
-    );
-    println!(
-        "OpenCode plugin: {}",
-        hook_summary(opencode_installed, opencode_plugin.as_ref())
-    );
     Ok(())
+}
+
+/// Installs hooks for every harness found in PATH and returns the report lines,
+/// one per harness plus any note the harness asked to show.
+pub fn install_all() -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+
+    for tool in Tool::all() {
+        let spec = tool.spec();
+        let present = process::command_exists(spec.binary);
+        let change = if present {
+            Some(hooks::install(tool)?)
+        } else {
+            None
+        };
+
+        lines.push(format!(
+            "{} {}: {}",
+            spec.display_name,
+            surface(tool),
+            hook_summary(present, change.as_ref())
+        ));
+
+        if let Some(note) = spec.install_note
+            && change.is_some_and(|change| change.changed)
+        {
+            lines.push(note.to_string());
+        }
+    }
+
+    Ok(lines)
+}
+
+/// What the harness calls the thing being installed.
+pub fn surface(tool: Tool) -> &'static str {
+    match tool.spec().integration {
+        Integration::PluginFile { .. } => "plugin",
+        _ => "hooks",
+    }
 }
 
 fn hook_summary(installed: bool, change: Option<&hooks::HookChange>) -> &'static str {

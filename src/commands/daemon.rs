@@ -9,6 +9,7 @@ use crate::{TerminalKind, Tool};
 use anyhow::{Context, Result};
 use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
 use signal_hook::flag;
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -21,10 +22,9 @@ const CARGO_TARGET_CLEANUP_MONITOR_CYCLES: u16 = 60;
 
 #[derive(Debug, Default)]
 pub struct RestoreSummary {
-    pub restored_claude: usize,
-    pub restored_codex: usize,
-    pub restored_grok: usize,
-    pub restored_opencode: usize,
+    /// Restores per harness, keyed by tool. Harness-agnostic so a new harness
+    /// counts itself without a new field.
+    pub restored: BTreeMap<Tool, usize>,
     pub pruned_missing_dirs: usize,
     pub pruned_duplicates: usize,
     pub fallback_sessions: usize,
@@ -34,17 +34,27 @@ pub struct RestoreSummary {
 
 impl RestoreSummary {
     pub fn restored_total(&self) -> usize {
-        self.restored_claude + self.restored_codex + self.restored_grok + self.restored_opencode
+        self.restored.values().sum()
+    }
+
+    pub fn record_restore(&mut self, tool: Tool) {
+        *self.restored.entry(tool).or_default() += 1;
     }
 
     pub fn message(&self) -> String {
+        let per_tool: Vec<String> = Tool::all()
+            .map(|tool| {
+                format!(
+                    "{} {}",
+                    self.restored.get(&tool).copied().unwrap_or_default(),
+                    tool.spec().display_name
+                )
+            })
+            .collect();
         let mut message = format!(
-            "Restored {} sessions ({} Claude Code, {} Codex, {} Grok, {} OpenCode). Pruned {} (directory gone).",
+            "Restored {} sessions ({}). Pruned {} (directory gone).",
             self.restored_total(),
-            self.restored_claude,
-            self.restored_codex,
-            self.restored_grok,
-            self.restored_opencode,
+            per_tool.join(", "),
             self.pruned_missing_dirs,
         );
         if self.pruned_duplicates > 0 {
@@ -338,12 +348,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             .open_tab(&session.directory, &command)
         {
             Ok(()) => {
-                match session.tool {
-                    Tool::Claude => summary.restored_claude += 1,
-                    Tool::Codex => summary.restored_codex += 1,
-                    Tool::Grok => summary.restored_grok += 1,
-                    Tool::Opencode => summary.restored_opencode += 1,
-                }
+                summary.record_restore(session.tool);
                 session.source = Some(RESTORED_SOURCE.to_string());
                 session.last_seen_at = now;
             }
@@ -612,13 +617,11 @@ fn should_replace(
 }
 
 fn resume_command(session: &SessionRecord) -> String {
-    let session_id = shell_quote(&session.session_id);
-    match session.tool {
-        Tool::Claude => format!("claude --resume {session_id}"),
-        Tool::Codex => format!("codex resume {session_id}"),
-        Tool::Grok => format!("grok --resume {session_id}"),
-        Tool::Opencode => format!("opencode --session {session_id}"),
-    }
+    session
+        .tool
+        .spec()
+        .resume
+        .replace("{session_id}", &shell_quote(&session.session_id))
 }
 
 #[cfg(test)]
@@ -644,19 +647,19 @@ mod tests {
     #[test]
     fn resume_commands_match_each_tool() {
         assert_eq!(
-            resume_command(&sample(Tool::Claude, "abc")),
+            resume_command(&sample(crate::tool("claude"), "abc")),
             "claude --resume 'abc'"
         );
         assert_eq!(
-            resume_command(&sample(Tool::Codex, "def")),
+            resume_command(&sample(crate::tool("codex"), "def")),
             "codex resume 'def'"
         );
         assert_eq!(
-            resume_command(&sample(Tool::Grok, "ghi")),
+            resume_command(&sample(crate::tool("grok"), "ghi")),
             "grok --resume 'ghi'"
         );
         assert_eq!(
-            resume_command(&sample(Tool::Opencode, "ses_abc")),
+            resume_command(&sample(crate::tool("opencode"), "ses_abc")),
             "opencode --session 'ses_abc'"
         );
     }
@@ -665,7 +668,7 @@ mod tests {
     fn tool_liveness_requires_matching_start_identity() {
         let pid = std::process::id() as i32;
         let processes = ProcessSnapshot::capture().unwrap();
-        let mut session = sample(Tool::Claude, "abc");
+        let mut session = sample(crate::tool("claude"), "abc");
         session.pid = Some(pid);
 
         // Same PID number, different process start time: a recycled PID.
@@ -682,7 +685,7 @@ mod tests {
     fn shell_liveness_requires_matching_start_identity() {
         let pid = std::process::id() as i32;
         let processes = ProcessSnapshot::capture().unwrap();
-        let mut session = sample(Tool::Claude, "abc");
+        let mut session = sample(crate::tool("claude"), "abc");
         session.shell_pid = Some(pid);
 
         session.shell_pid_started_at = Some("Wed Jan 1 00:00:00 2020".to_string());
@@ -739,7 +742,7 @@ mod tests {
     #[test]
     fn recently_restored_respects_source_and_cooldown() {
         let now = Utc::now();
-        let mut session = sample(Tool::Claude, "abc");
+        let mut session = sample(crate::tool("claude"), "abc");
         assert!(!recently_restored(&session, now));
 
         session.source = Some(RESTORED_SOURCE.to_string());
@@ -752,11 +755,13 @@ mod tests {
 
     #[test]
     fn restore_summary_message_lists_counts() {
+        let mut restored = BTreeMap::new();
+        restored.insert(crate::tool("claude"), 2);
+        restored.insert(crate::tool("codex"), 1);
+        restored.insert(crate::tool("grok"), 1);
+        restored.insert(crate::tool("opencode"), 1);
         let summary = RestoreSummary {
-            restored_claude: 2,
-            restored_codex: 1,
-            restored_grok: 1,
-            restored_opencode: 1,
+            restored,
             pruned_missing_dirs: 0,
             pruned_duplicates: 1,
             fallback_sessions: 0,

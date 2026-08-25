@@ -1,6 +1,7 @@
 mod adapters;
 mod cargo_targets;
 mod commands;
+mod harness;
 mod hooks;
 mod last_sessions;
 mod paths;
@@ -15,30 +16,99 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Tool {
-    Claude,
-    Codex,
-    Grok,
-    Opencode,
-}
+/// A supported harness, identified by its registry entry. Every tool-specific
+/// fact lives behind `spec()`; nothing outside `harness.rs` branches on which
+/// harness this is.
+#[derive(Clone, Copy)]
+pub struct Tool(&'static harness::Harness);
 
 impl Tool {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Grok => "grok",
-            Self::Opencode => "opencode",
-        }
+        self.0.id
+    }
+
+    #[must_use]
+    pub fn spec(self) -> &'static harness::Harness {
+        self.0
+    }
+
+    pub fn all() -> impl Iterator<Item = Tool> {
+        harness::HARNESSES.iter().map(Tool)
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        harness::find(id).map(Tool)
+    }
+}
+
+/// Ids are unique across the registry, so they decide identity.
+impl PartialEq for Tool {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+
+impl Eq for Tool {}
+
+impl std::hash::Hash for Tool {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.id.hash(state);
+    }
+}
+
+impl PartialOrd for Tool {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Tool {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.id.cmp(other.0.id)
+    }
+}
+
+impl std::fmt::Debug for Tool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.id)
     }
 }
 
 impl std::fmt::Display for Tool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(self.0.id)
     }
+}
+
+impl Serialize for Tool {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.id)
+    }
+}
+
+impl<'de> Deserialize<'de> for Tool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(deserializer)?;
+        Tool::from_id(&id).ok_or_else(|| serde::de::Error::custom(format!("unknown tool '{id}'")))
+    }
+}
+
+impl ValueEnum for Tool {
+    fn value_variants<'a>() -> &'a [Self] {
+        static VARIANTS: std::sync::OnceLock<Vec<Tool>> = std::sync::OnceLock::new();
+        VARIANTS.get_or_init(|| Tool::all().collect())
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.0.id))
+    }
+}
+
+/// Test-only lookup so cases can name a harness without a registry index.
+#[cfg(test)]
+pub fn tool(id: &str) -> Tool {
+    Tool::from_id(id).expect("known harness")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -88,9 +158,7 @@ impl std::fmt::Display for TerminalKind {
 
 #[derive(Parser)]
 #[command(name = "session-guard")]
-#[command(
-    about = "Restore Claude Code, Codex CLI, and Grok sessions after a macOS crash or reboot"
-)]
+#[command(about = "Restore agent CLI sessions after a macOS crash or reboot")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

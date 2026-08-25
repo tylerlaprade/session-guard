@@ -1,6 +1,5 @@
 use crate::paths;
 use crate::process::{self, ProcInfo, ProcessIdentityStatus};
-use crate::scan;
 use crate::sessions::{self, SessionRecord};
 use crate::{Tool, process::process_start_identity};
 use anyhow::{Context, Result};
@@ -204,9 +203,10 @@ fn select_owner(
         if matching_environment_ids.len() > 1 {
             anyhow::bail!("multiple session ids are set for {tool}");
         }
-        let command_session_id = (tool == Tool::Claude)
-            .then(|| scan::trackable_claude_session_id(process))
-            .flatten();
+        let command_session_id = tool
+            .spec()
+            .session_id_from_process
+            .and_then(|from_process| from_process(process));
         let asserted_session_id = matching_environment_ids
             .first()
             .copied()
@@ -245,35 +245,21 @@ fn select_owner(
     }
 
     anyhow::bail!(
-        "could not identify an owning agent session; run this only inside Claude, Codex, or Grok"
+        "could not identify an owning agent session; run this only inside {}",
+        crate::harness::name_list()
     )
 }
 
 fn process_tool(process: &ProcInfo) -> Option<Tool> {
-    if scan::is_claude_session_process(process) {
-        return Some(Tool::Claude);
-    }
-    let name = process
-        .command
-        .split_whitespace()
-        .next()
-        .and_then(|executable| Path::new(executable).file_name())
-        .and_then(|name| name.to_str())?;
-    match name {
-        "codex" => Some(Tool::Codex),
-        "grok" => Some(Tool::Grok),
-        _ => None,
-    }
+    Tool::all().find(|tool| tool.spec().owns_process(process))
 }
 
 fn environment_session_ids() -> Result<Vec<(Tool, String)>> {
-    let candidates = [
-        (Tool::Claude, "CLAUDE_CODE_SESSION_ID"),
-        (Tool::Codex, "CODEX_THREAD_ID"),
-        (Tool::Grok, "GROK_SESSION_ID"),
-    ];
     let mut ids = Vec::new();
-    for (tool, name) in candidates {
+    for tool in Tool::all() {
+        let Some(name) = tool.spec().session_id_env else {
+            continue;
+        };
         if let Some(value) = std::env::var_os(name) {
             let value = value
                 .into_string()
@@ -429,10 +415,7 @@ fn owned_cache_layout_is_valid(base: &Path) -> Result<bool> {
         let Some(tool_name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
             return Ok(false);
         };
-        if ![Tool::Claude, Tool::Codex, Tool::Grok]
-            .iter()
-            .any(|tool| tool.as_str() == tool_name)
-            || !is_real_directory(&entry.path())
+        if !Tool::all().any(|tool| tool.as_str() == tool_name) || !is_real_directory(&entry.path())
         {
             return Ok(false);
         }
@@ -514,7 +497,7 @@ fn prune_owned_targets(base: &Path) -> Result<usize> {
     }
 
     let mut pruned = 0;
-    for tool in [Tool::Claude, Tool::Codex, Tool::Grok] {
+    for tool in Tool::all() {
         let tool_dir = base.join(tool.as_str());
         if !is_real_directory(&tool_dir) {
             continue;
@@ -606,7 +589,7 @@ mod tests {
 
     fn session_record(session_id: &str) -> SessionRecord {
         SessionRecord::new(
-            Tool::Claude,
+            crate::tool("claude"),
             session_id.to_string(),
             Some(999_999),
             Some(999_998),
@@ -683,8 +666,8 @@ mod tests {
         let mut outer = session_record(outer_id);
         outer.pid = Some(200);
         let environment_ids = vec![
-            (Tool::Claude, outer_id.to_string()),
-            (Tool::Codex, inner_id.to_string()),
+            (crate::tool("claude"), outer_id.to_string()),
+            (crate::tool("codex"), inner_id.to_string()),
         ];
 
         let selection = select_owner(
@@ -695,7 +678,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selection.tool, Tool::Codex);
+        assert_eq!(selection.tool, crate::tool("codex"));
         assert_eq!(selection.pid, 100);
         assert_eq!(selection.target_session_id, inner_id);
         assert_eq!(selection.owner_session_id, None);
@@ -708,7 +691,7 @@ mod tests {
         let owner = ResolvedOwner {
             target_session_id: SESSION_ID.to_string(),
             owner_session_id: Some(SESSION_ID.to_string()),
-            tool: Tool::Claude,
+            tool: crate::tool("claude"),
             process: ProcessIdentity {
                 pid: 999_999,
                 started_at: "old process".to_string(),
@@ -729,7 +712,7 @@ mod tests {
         let owner = ResolvedOwner {
             target_session_id: SESSION_ID.to_string(),
             owner_session_id: Some(SESSION_ID.to_string()),
-            tool: Tool::Codex,
+            tool: crate::tool("codex"),
             process: ProcessIdentity {
                 pid: 999_999,
                 started_at: "old process".to_string(),
@@ -775,7 +758,7 @@ mod tests {
         let owner = ResolvedOwner {
             target_session_id: SESSION_ID.to_string(),
             owner_session_id: Some(SESSION_ID.to_string()),
-            tool: Tool::Claude,
+            tool: crate::tool("claude"),
             process: ProcessIdentity {
                 pid: 999_999,
                 started_at: "old process".to_string(),
@@ -801,7 +784,7 @@ mod tests {
         let owner = ResolvedOwner {
             target_session_id: SESSION_ID.to_string(),
             owner_session_id: Some(SESSION_ID.to_string()),
-            tool: Tool::Claude,
+            tool: crate::tool("claude"),
             process: ProcessIdentity {
                 pid: 999_999,
                 started_at: "old process".to_string(),
@@ -825,7 +808,7 @@ mod tests {
         let owner = ResolvedOwner {
             target_session_id: SESSION_ID.to_string(),
             owner_session_id: Some(SESSION_ID.to_string()),
-            tool: Tool::Claude,
+            tool: crate::tool("claude"),
             process: ProcessIdentity {
                 pid: 999_999,
                 started_at: "old process".to_string(),
@@ -847,7 +830,7 @@ mod tests {
         let owner = ResolvedOwner {
             target_session_id: SESSION_ID.to_string(),
             owner_session_id: Some(SESSION_ID.to_string()),
-            tool: Tool::Claude,
+            tool: crate::tool("claude"),
             process: ProcessIdentity {
                 pid: 999_999,
                 started_at: "old process".to_string(),
@@ -871,7 +854,7 @@ mod tests {
         let owner = ResolvedOwner {
             target_session_id: SESSION_ID.to_string(),
             owner_session_id: Some(SESSION_ID.to_string()),
-            tool: Tool::Claude,
+            tool: crate::tool("claude"),
             process: ProcessIdentity {
                 pid: 999_999,
                 started_at: "old process".to_string(),
@@ -900,7 +883,7 @@ mod tests {
         let owner = ResolvedOwner {
             target_session_id: SESSION_ID.to_string(),
             owner_session_id: Some(SESSION_ID.to_string()),
-            tool: Tool::Codex,
+            tool: crate::tool("codex"),
             process: ProcessIdentity {
                 pid,
                 started_at: process_start_identity(pid).unwrap(),
@@ -920,7 +903,7 @@ mod tests {
         let owner = ResolvedOwner {
             target_session_id: SESSION_ID.to_string(),
             owner_session_id: Some(SESSION_ID.to_string()),
-            tool: Tool::Codex,
+            tool: crate::tool("codex"),
             process: ProcessIdentity {
                 pid: std::process::id() as i32,
                 started_at: "now".to_string(),

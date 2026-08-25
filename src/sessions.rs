@@ -283,7 +283,7 @@ mod tests {
         register(
             &path,
             SessionRecord::new(
-                Tool::Claude,
+                crate::tool("claude"),
                 "abc".to_string(),
                 Some(1),
                 Some(10),
@@ -297,7 +297,7 @@ mod tests {
         register(
             &path,
             SessionRecord::new(
-                Tool::Claude,
+                crate::tool("claude"),
                 "abc".to_string(),
                 Some(2),
                 Some(20),
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn mark_active_clears_restored_cooldown_source() {
         let mut session = SessionRecord::new(
-            Tool::Claude,
+            crate::tool("claude"),
             "abc".to_string(),
             Some(1),
             Some(2),

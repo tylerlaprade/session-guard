@@ -15,45 +15,51 @@ use std::path::PathBuf;
 
 pub fn discover_sessions(processes: &[ProcInfo]) -> Result<Vec<SessionRecord>> {
     let mut records = Vec::new();
-    let claude_home = paths::tool_home(Tool::Claude)?;
 
-    for process in processes {
-        let Some(session_id) = trackable_claude_session_id(process) else {
+    for tool in Tool::all() {
+        // Only harnesses that can name a live session from its argv are
+        // recoverable this way; Codex interactive argv, for one, does not
+        // carry the id, so it is skipped rather than guessed at.
+        let Some(session_id_from_process) = tool.spec().session_id_from_process else {
             continue;
         };
-        let Some((directory, transcript_path)) =
-            resolve_claude_session(&session_id).unwrap_or_default()
-        else {
-            continue;
-        };
+        let tool_home = paths::tool_home(tool)?;
 
-        if register::is_internal_directory(&directory, &claude_home) {
-            continue;
+        for process in processes {
+            let Some(session_id) = session_id_from_process(process) else {
+                continue;
+            };
+            let Some((directory, transcript_path)) =
+                resolve_session(tool, &session_id).unwrap_or_default()
+            else {
+                continue;
+            };
+
+            if register::is_internal_directory(&directory, &tool_home) {
+                continue;
+            }
+
+            records.push(SessionRecord::new(
+                tool,
+                session_id,
+                Some(process.pid),
+                None,
+                directory,
+                Some(transcript_path),
+                None,
+                Some("scan".to_string()),
+            ));
         }
-
-        records.push(SessionRecord::new(
-            Tool::Claude,
-            session_id,
-            Some(process.pid),
-            None,
-            directory,
-            Some(transcript_path),
-            None,
-            Some("scan".to_string()),
-        ));
     }
 
-    // Codex interactive argv does not reliably carry the live session id, so
-    // the process scanner intentionally skips Codex rather than guessing.
     Ok(records)
 }
 
-fn resolve_claude_session(session_id: &str) -> Result<Option<(PathBuf, PathBuf)>> {
-    let Some(transcript_path) = transcripts::claude_transcript_path(session_id)? else {
+fn resolve_session(tool: Tool, session_id: &str) -> Result<Option<(PathBuf, PathBuf)>> {
+    let Some(transcript_path) = transcripts::transcript_path(tool, session_id)? else {
         return Ok(None);
     };
-    let Some((metadata_id, directory, _)) =
-        transcripts::read_metadata(&transcript_path, Tool::Claude)?
+    let Some((metadata_id, directory, _)) = transcripts::read_metadata(&transcript_path, tool)?
     else {
         return Ok(None);
     };
@@ -65,7 +71,7 @@ fn resolve_claude_session(session_id: &str) -> Result<Option<(PathBuf, PathBuf)>
     Ok(Some((directory, transcript_path)))
 }
 
-pub(crate) fn trackable_claude_session_id(process: &ProcInfo) -> Option<String> {
+pub(crate) fn claude_session_id_from_process(process: &ProcInfo) -> Option<String> {
     if !is_claude_session_process(process) {
         return None;
     }
@@ -162,7 +168,7 @@ mod tests {
         ));
 
         assert_eq!(
-            trackable_claude_session_id(&process),
+            claude_session_id_from_process(&process),
             Some(SESSION_ID.to_string())
         );
     }
@@ -173,7 +179,7 @@ mod tests {
             "/Users/tyler/.local/share/claude/versions/2.1.159 --bg-pty-host /tmp/cc-daemon-501/pty/1.sock 143 43 -- /Users/tyler/.local/share/claude/versions/2.1.159 --session-id {SESSION_ID} --fork-session --resume /Users/tyler/.claude/projects/-Users-tyler-Code-flint/ad7acbf1-a306-4467-8b35-4bed04670d21.jsonl --model opus"
         ));
 
-        assert_eq!(trackable_claude_session_id(&process), None);
+        assert_eq!(claude_session_id_from_process(&process), None);
     }
 
     #[test]
@@ -182,7 +188,7 @@ mod tests {
             "/Users/tyler/.local/share/claude/versions/2.1.159 --bg-spare --session-id {SESSION_ID}"
         ));
 
-        assert_eq!(trackable_claude_session_id(&process), None);
+        assert_eq!(claude_session_id_from_process(&process), None);
     }
 
     #[test]
@@ -191,7 +197,7 @@ mod tests {
             "/Users/tyler/.local/bin/claude daemon run --session-id {SESSION_ID}"
         ));
 
-        assert_eq!(trackable_claude_session_id(&process), None);
+        assert_eq!(claude_session_id_from_process(&process), None);
     }
 
     #[test]
@@ -200,7 +206,7 @@ mod tests {
             "/Applications/Claude.app/Contents/MacOS/Claude Helper --session-id {SESSION_ID}"
         ));
 
-        assert_eq!(trackable_claude_session_id(&process), None);
+        assert_eq!(claude_session_id_from_process(&process), None);
     }
 
     #[test]

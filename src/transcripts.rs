@@ -1,4 +1,5 @@
 use crate::Tool;
+use crate::harness::{Discovery, SessionMetadata};
 use crate::paths;
 use crate::sessions::{DEFAULT_RECOVERABLE_DAYS, SessionRecord};
 use anyhow::Result;
@@ -10,62 +11,69 @@ use std::path::{Path, PathBuf};
 
 pub fn discover_recent_sessions() -> Result<Vec<SessionRecord>> {
     let mut sessions = Vec::new();
-    discover_claude_sessions(&mut sessions)?;
-    discover_codex_sessions(&mut sessions)?;
-    discover_grok_sessions(&mut sessions)?;
+    for tool in Tool::all() {
+        let root = discovery_root(tool)?;
+        match &tool.spec().discovery {
+            Discovery::Jsonl {
+                session_id_from_stem,
+                accept,
+                ..
+            } => discover_jsonl(&root, tool, *session_id_from_stem, *accept, &mut sessions),
+            Discovery::SummaryDirs { file, read, .. } => {
+                discover_summary_dirs(&root, tool, file, *read, &mut sessions);
+            }
+            Discovery::Opaque => {}
+        }
+    }
     Ok(sessions)
 }
 
-pub fn claude_projects_dir() -> Result<PathBuf> {
-    Ok(std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or(paths::home_dir()?.join(".claude"))
-        .join("projects"))
+/// Where the harness keeps its sessions, or the harness home when it keeps none.
+fn discovery_root(tool: Tool) -> Result<PathBuf> {
+    let mut root = paths::tool_home(tool)?;
+    match &tool.spec().discovery {
+        Discovery::Jsonl { root: suffix, .. } | Discovery::SummaryDirs { root: suffix, .. } => {
+            root.extend(*suffix);
+        }
+        Discovery::Opaque => {}
+    }
+    Ok(root)
 }
 
-pub fn claude_transcript_path(session_id: &str) -> Result<Option<PathBuf>> {
-    let root = claude_projects_dir()?;
-    let file_name = format!("{session_id}.jsonl");
-    let Ok(entries) = fs::read_dir(root) else {
+/// The transcript for one session, for harnesses that keep sessions in files.
+pub fn transcript_path(tool: Tool, session_id: &str) -> Result<Option<PathBuf>> {
+    let Discovery::Jsonl {
+        session_id_from_stem,
+        ..
+    } = &tool.spec().discovery
+    else {
         return Ok(None);
     };
 
-    for entry in entries.flatten() {
-        let project_dir = entry.path();
-        if !project_dir.is_dir() {
-            continue;
-        }
-
-        let path = project_dir.join(&file_name);
-        if path.is_file() {
-            return Ok(Some(path));
-        }
-    }
-
-    Ok(None)
+    let mut files = Vec::new();
+    collect_jsonl_files(&discovery_root(tool)?, &mut files);
+    Ok(files.into_iter().find(|path| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(session_id_from_stem)
+            .is_some_and(|id| id == session_id)
+    }))
 }
 
-fn discover_claude_sessions(sessions: &mut Vec<SessionRecord>) -> Result<()> {
-    let root = claude_projects_dir()?;
-    discover_jsonl(&root, Tool::Claude, sessions)
-}
-
-fn discover_codex_sessions(sessions: &mut Vec<SessionRecord>) -> Result<()> {
-    let root = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or(paths::home_dir()?.join(".codex"))
-        .join("sessions");
-    discover_jsonl(&root, Tool::Codex, sessions)
-}
-
-fn discover_grok_sessions(sessions: &mut Vec<SessionRecord>) -> Result<()> {
-    let root = paths::tool_home(Tool::Grok)?.join("sessions");
+/// `<root>/<cwd>/<session>/<file>`: one directory per session, holding a summary.
+fn discover_summary_dirs(
+    root: &Path,
+    tool: Tool,
+    file: &str,
+    read: fn(&Path) -> Result<Option<SessionMetadata>>,
+    sessions: &mut Vec<SessionRecord>,
+) {
     if !root.is_dir() {
-        return Ok(());
+        return;
     }
 
-    let Ok(cwd_entries) = fs::read_dir(&root) else {
-        return Ok(());
+    let Ok(cwd_entries) = fs::read_dir(root) else {
+        return;
     };
     for cwd_entry in cwd_entries.flatten() {
         let cwd_dir = cwd_entry.path();
@@ -82,18 +90,17 @@ fn discover_grok_sessions(sessions: &mut Vec<SessionRecord>) -> Result<()> {
                 continue;
             }
 
-            let summary_path = session_dir.join("summary.json");
+            let summary_path = session_dir.join(file);
             if !summary_path.is_file() || !is_recent(&summary_path).unwrap_or(false) {
                 continue;
             }
 
-            let Some((session_id, directory, timestamp)) =
-                read_grok_summary(&summary_path).ok().flatten()
+            let Some((session_id, directory, timestamp)) = read(&summary_path).ok().flatten()
             else {
                 continue;
             };
             sessions.push(SessionRecord::from_transcript(
-                Tool::Grok,
+                tool,
                 session_id,
                 directory,
                 summary_path,
@@ -101,11 +108,9 @@ fn discover_grok_sessions(sessions: &mut Vec<SessionRecord>) -> Result<()> {
             ));
         }
     }
-
-    Ok(())
 }
 
-fn read_grok_summary(path: &Path) -> Result<Option<(String, PathBuf, DateTime<Utc>)>> {
+pub(crate) fn read_grok_summary(path: &Path) -> Result<Option<SessionMetadata>> {
     let contents = fs::read_to_string(path)?;
     let value: Value = serde_json::from_str(&contents)?;
 
@@ -145,9 +150,15 @@ fn read_grok_summary(path: &Path) -> Result<Option<(String, PathBuf, DateTime<Ut
     })
 }
 
-fn discover_jsonl(root: &Path, tool: Tool, sessions: &mut Vec<SessionRecord>) -> Result<()> {
+fn discover_jsonl(
+    root: &Path,
+    tool: Tool,
+    session_id_from_stem: fn(&str) -> Option<String>,
+    accept: Option<fn(&Path, &str) -> bool>,
+    sessions: &mut Vec<SessionRecord>,
+) {
     if !root.is_dir() {
-        return Ok(());
+        return;
     }
 
     let mut files = Vec::new();
@@ -157,9 +168,9 @@ fn discover_jsonl(root: &Path, tool: Tool, sessions: &mut Vec<SessionRecord>) ->
             continue;
         }
 
-        if tool == Tool::Codex
-            && !filename_session_id(&path, tool)
-                .is_some_and(|session_id| codex_rollout_is_cli(&path, &session_id))
+        if let Some(accept) = accept
+            && !filename_session_id(&path, session_id_from_stem)
+                .is_some_and(|session_id| accept(&path, &session_id))
         {
             continue;
         }
@@ -172,8 +183,6 @@ fn discover_jsonl(root: &Path, tool: Tool, sessions: &mut Vec<SessionRecord>) ->
             tool, session_id, directory, path, timestamp,
         ));
     }
-
-    Ok(())
 }
 
 /// The Codex desktop app, its scheduled automations, `codex exec`, and
@@ -237,10 +246,16 @@ fn is_recent(path: &Path) -> Result<bool> {
     Ok(modified >= Utc::now() - Duration::days(DEFAULT_RECOVERABLE_DAYS))
 }
 
-pub fn read_metadata(path: &Path, tool: Tool) -> Result<Option<(String, PathBuf, DateTime<Utc>)>> {
+pub fn read_metadata(path: &Path, tool: Tool) -> Result<Option<SessionMetadata>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let mut session_id = filename_session_id(path, tool);
+    let mut session_id = match &tool.spec().discovery {
+        Discovery::Jsonl {
+            session_id_from_stem,
+            ..
+        } => filename_session_id(path, *session_id_from_stem),
+        _ => None,
+    };
     let mut cwd = None;
     let mut timestamp = file_modified_at(path).ok();
 
@@ -277,20 +292,8 @@ pub fn read_metadata(path: &Path, tool: Tool) -> Result<Option<(String, PathBuf,
     })
 }
 
-fn filename_session_id(path: &Path, tool: Tool) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    match tool {
-        Tool::Claude => Some(stem.to_string()),
-        Tool::Codex => stem
-            .len()
-            .checked_sub(36)
-            .and_then(|start| stem.get(start..))
-            .map(ToOwned::to_owned),
-        // Grok sessions are directories; summary.json is handled separately.
-        // OpenCode sessions live in sqlite, not per-session files, so the
-        // transcript fallback never discovers them.
-        Tool::Grok | Tool::Opencode => None,
-    }
+fn filename_session_id(path: &Path, from_stem: fn(&str) -> Option<String>) -> Option<String> {
+    from_stem(path.file_stem()?.to_str()?)
 }
 
 fn json_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -326,7 +329,7 @@ mod tests {
         )
         .unwrap();
 
-        let (id, cwd, _) = read_metadata(&path, Tool::Codex).unwrap().unwrap();
+        let (id, cwd, _) = read_metadata(&path, crate::tool("codex")).unwrap().unwrap();
         assert_eq!(id, "019dd0a8-a320-78b3-a770-fffc78f09c5d");
         assert_eq!(cwd, PathBuf::from("/tmp/project"));
     }

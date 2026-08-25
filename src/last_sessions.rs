@@ -151,10 +151,13 @@ mod tests {
         let path = dir.path().join("last-sessions.json");
 
         for record in [
-            LastSessionRecord::from_session(&session("claude-old", Tool::Claude, 20)).unwrap(),
-            LastSessionRecord::from_session(&session("codex", Tool::Codex, 20)).unwrap(),
-            LastSessionRecord::from_session(&session("other-shell", Tool::Claude, 30)).unwrap(),
-            LastSessionRecord::from_session(&session("claude-new", Tool::Claude, 20)).unwrap(),
+            LastSessionRecord::from_session(&session("claude-old", crate::tool("claude"), 20))
+                .unwrap(),
+            LastSessionRecord::from_session(&session("codex", crate::tool("codex"), 20)).unwrap(),
+            LastSessionRecord::from_session(&session("other-shell", crate::tool("claude"), 30))
+                .unwrap(),
+            LastSessionRecord::from_session(&session("claude-new", crate::tool("claude"), 20))
+                .unwrap(),
         ] {
             remember(&path, record).unwrap();
         }
@@ -162,7 +165,7 @@ mod tests {
         let records = read_records(&path).unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(
-            find(&path, Tool::Claude, 20, "Wed Jan 1 00:00:00 2020")
+            find(&path, crate::tool("claude"), 20, "Wed Jan 1 00:00:00 2020")
                 .unwrap()
                 .unwrap()
                 .session_id,

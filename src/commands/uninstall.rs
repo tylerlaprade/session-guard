@@ -1,4 +1,6 @@
+use crate::Tool;
 use crate::cargo_targets::{self, CacheRemoval};
+use crate::commands;
 use crate::hooks;
 use crate::paths;
 use anyhow::{Context, Result};
@@ -11,10 +13,9 @@ pub fn run(purge: bool) -> Result<()> {
     // removal, so another tab cannot start using a target mid-uninstall.
     let cargo_cache_plan = cargo_targets::prepare_cache_removal()?;
 
-    let claude = hooks::remove_claude_hooks(&paths::claude_settings()?)?;
-    let codex = hooks::remove_codex_hooks(&paths::codex_config()?)?;
-    let grok = hooks::remove_grok_hooks(&paths::grok_hooks_dir()?)?;
-    let opencode = hooks::remove_opencode_plugin(&paths::opencode_plugin_dir()?)?;
+    let removals: Vec<(Tool, hooks::HookChange)> = Tool::all()
+        .map(|tool| Ok((tool, hooks::remove(tool)?)))
+        .collect::<Result<_>>()?;
 
     let plist = paths::launch_agent_plist()?;
     if plist.exists() {
@@ -33,38 +34,18 @@ pub fn run(purge: bool) -> Result<()> {
     let cargo_cache = cargo_cache_plan.remove()?;
 
     println!("session-guard uninstalled");
-    println!(
-        "Claude Code hooks: {}",
-        if claude.changed {
-            "removed"
-        } else {
-            "not present"
-        }
-    );
-    println!(
-        "Codex hooks: {}",
-        if codex.changed {
-            "removed"
-        } else {
-            "not present"
-        }
-    );
-    println!(
-        "Grok hooks: {}",
-        if grok.changed {
-            "removed"
-        } else {
-            "not present"
-        }
-    );
-    println!(
-        "OpenCode plugin: {}",
-        if opencode.changed {
-            "removed"
-        } else {
-            "not present"
-        }
-    );
+    for (tool, change) in removals {
+        println!(
+            "{} {}: {}",
+            tool.spec().display_name,
+            commands::install_hooks::surface(tool),
+            if change.changed {
+                "removed"
+            } else {
+                "not present"
+            }
+        );
+    }
     println!("LaunchAgent: removed");
     println!(
         "Session-owned Cargo targets: {}",
