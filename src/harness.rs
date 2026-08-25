@@ -61,7 +61,7 @@ pub(crate) const OPENCODE_PLUGIN: &str = r#"// Installed by `session-guard insta
 // Do not edit: session-guard rewrites this file when its contents change.
 import { existsSync } from "node:fs";
 
-pub(crate) const REGISTER_THROTTLE_MS = 30_000;
+const REGISTER_THROTTLE_MS = 30_000;
 
 // Only interactive TUI sessions live in a terminal tab. Headless modes put a
 // subcommand in argv[2] (run, serve, web, acp, session, db, ...); the TUI is
@@ -491,6 +491,38 @@ mod tests {
             };
             assert!(path.resolve().is_ok(), "{} integration path", harness.id);
         }
+    }
+
+    /// The payloads are shell and JavaScript held in Rust string literals, so
+    /// a careless edit to the Rust around them can leak into the payload and
+    /// ship a broken hook. Rust syntax inside one is always that mistake.
+    #[test]
+    fn payloads_contain_no_rust_syntax() {
+        let payloads = [
+            ("CLAUDE_REGISTER", super::CLAUDE_REGISTER),
+            ("CLAUDE_DEREGISTER", super::CLAUDE_DEREGISTER),
+            ("CODEX_REGISTER", super::CODEX_REGISTER),
+            ("CODEX_DEREGISTER", super::CODEX_DEREGISTER),
+            ("GROK_REGISTER_SCRIPT", super::GROK_REGISTER_SCRIPT),
+            ("GROK_DEREGISTER", super::GROK_DEREGISTER),
+            ("OPENCODE_PLUGIN", super::OPENCODE_PLUGIN),
+        ];
+        for (name, payload) in payloads {
+            for marker in ["pub(crate)", "&'static str", "-> Result<"] {
+                assert!(
+                    !payload.contains(marker),
+                    "{name} contains Rust syntax {marker:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_plugin_declares_its_throttle() {
+        assert!(
+            super::OPENCODE_PLUGIN.contains("\nconst REGISTER_THROTTLE_MS = 30_000;\n"),
+            "the plugin's throttle declaration must stay valid JavaScript"
+        );
     }
 
     #[test]
