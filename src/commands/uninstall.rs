@@ -14,6 +14,7 @@ pub fn run(purge: bool) -> Result<()> {
     let claude = hooks::remove_claude_hooks(&paths::claude_settings()?)?;
     let codex = hooks::remove_codex_hooks(&paths::codex_config()?)?;
     let grok = hooks::remove_grok_hooks(&paths::grok_hooks_dir()?)?;
+    let opencode = hooks::remove_opencode_plugin(&paths::opencode_plugin_dir()?)?;
 
     let plist = paths::launch_agent_plist()?;
     if plist.exists() {
@@ -51,6 +52,14 @@ pub fn run(purge: bool) -> Result<()> {
     println!(
         "Grok hooks: {}",
         if grok.changed {
+            "removed"
+        } else {
+            "not present"
+        }
+    );
+    println!(
+        "OpenCode plugin: {}",
+        if opencode.changed {
             "removed"
         } else {
             "not present"

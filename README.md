@@ -1,7 +1,7 @@
 # session-guard
 
-`session-guard` tracks active Claude Code, Codex CLI, and Grok sessions and
-restores them after a macOS crash or reboot.
+`session-guard` tracks active Claude Code, Codex CLI, Grok, and OpenCode
+sessions and restores them after a macOS crash or reboot.
 
 Licensed under [GPL-3.0-only](LICENSE).
 
@@ -52,6 +52,18 @@ on Codex 0.145+ — a `SessionEnd` hook, which Codex fires only on graceful
 shutdown. Grok hooks live in `~/.grok/hooks/` (global) and use a companion
 register script because Grok expands `$VAR` in inline hook commands and
 rejects unset vars such as `$PPID`.
+
+OpenCode has no shell-command hooks; session-guard installs a JS plugin at
+`~/.config/opencode/plugin/session-guard.js` that OpenCode loads into its
+process. The plugin registers on `session.created`/`session.updated`, uses
+`session.idle` as the per-turn heartbeat, and deregisters through `dispose`
+on graceful shutdown (via hook stdin, so the teardown gate applies). It
+registers only interactive TUI sessions — headless modes (`opencode run`,
+`serve`, `web`, `acp`) carry a subcommand in argv, which is the only mode
+marker OpenCode exposes — and skips subagent child sessions (`parentID`).
+Restores run `opencode --session <id>`; session ids are stable across
+resume. OpenCode keeps sessions in sqlite, so the transcript fallback does
+not cover it.
 
 The Codex desktop app, its scheduled automations, `codex exec`, and subagents
 run through the same codex core and fire the same hooks, but their threads

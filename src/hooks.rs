@@ -41,6 +41,73 @@ else
 fi
 "#;
 const GROK_DEREGISTER: &str = "session-guard deregister";
+// OpenCode has no shell-command hooks; its extension point is a JS plugin
+// module loaded into the opencode process (Bun), discovered from
+// `<config>/plugin/*.js`. The plugin registers over the session event bus
+// and shells out to session-guard with Bun's `$`.
+const OPENCODE_PLUGIN_NAME: &str = "session-guard.js";
+const OPENCODE_PLUGIN: &str = r#"// Installed by `session-guard install`; removed by `session-guard uninstall`.
+// Do not edit: session-guard rewrites this file when its contents change.
+import { existsSync } from "node:fs";
+
+const REGISTER_THROTTLE_MS = 30_000;
+
+// Only interactive TUI sessions live in a terminal tab. Headless modes put a
+// subcommand in argv[2] (run, serve, web, acp, session, db, ...); the TUI is
+// invoked bare, with flags, or with a project path. OpenCode publishes no
+// official mode marker, so argv is the only signal.
+function isInteractiveTui() {
+  const sub = process.argv[2];
+  return !sub || sub.startsWith("-") || existsSync(sub);
+}
+
+export const SessionGuard = async ({ $, directory }) => {
+  if (!isInteractiveTui() || !$) return {};
+
+  const shellPid = process.env.SESSION_GUARD_SHELL_PID || process.ppid;
+  const lastRegistered = new Map();
+
+  const register = async (sessionID, dir) => {
+    const now = Date.now();
+    if (now - (lastRegistered.get(sessionID) ?? 0) < REGISTER_THROTTLE_MS) return;
+    lastRegistered.set(sessionID, now);
+    await $`session-guard register --tool opencode --session-id ${sessionID} --pid ${process.pid} --shell-pid ${shellPid} --directory ${dir}`
+      .quiet()
+      .nothrow();
+  };
+
+  // The stdin (hook) form, not --session-id: the hook path keeps the record
+  // when the tab's shell is already gone (GUI teardown), matching the other
+  // tools' SessionEnd behavior.
+  const deregister = async (sessionID) => {
+    const payload = JSON.stringify({ session_id: sessionID });
+    await $`echo ${payload} | session-guard deregister`.quiet().nothrow();
+  };
+
+  return {
+    event: async ({ event }) => {
+      const { type, properties } = event;
+      if (type === "session.created" || type === "session.updated") {
+        const info = properties.info;
+        if (info.parentID) return; // subagent child, never a tab
+        await register(info.id, info.directory || directory);
+      } else if (type === "session.idle") {
+        // Turn finished: force a fresh heartbeat like the other tools' Stop.
+        lastRegistered.delete(properties.sessionID);
+        await register(properties.sessionID, directory);
+      } else if (type === "session.deleted") {
+        lastRegistered.delete(properties.info.id);
+        await deregister(properties.info.id);
+      }
+    },
+    dispose: async () => {
+      for (const sessionID of lastRegistered.keys()) {
+        await deregister(sessionID);
+      }
+    },
+  };
+};
+"#;
 const OLD_CLAUDE_REGISTER: &str = "session-guard register --tool claude --pid \"$PPID\"";
 // The pre-entrypoint-gate register command; without it in the removal lists,
 // installs would leave both hooks and the ungated one would re-admit desktop
@@ -176,6 +243,22 @@ pub fn remove_grok_hooks(hooks_dir: &Path) -> Result<HookChange> {
         }
     }
     Ok(HookChange { changed })
+}
+
+pub fn install_opencode_plugin(plugin_dir: &Path) -> Result<HookChange> {
+    fs::create_dir_all(plugin_dir)
+        .with_context(|| format!("failed to create {}", plugin_dir.display()))?;
+    let changed = write_if_changed(&plugin_dir.join(OPENCODE_PLUGIN_NAME), OPENCODE_PLUGIN)?;
+    Ok(HookChange { changed })
+}
+
+pub fn remove_opencode_plugin(plugin_dir: &Path) -> Result<HookChange> {
+    let path = plugin_dir.join(OPENCODE_PLUGIN_NAME);
+    if !path.exists() {
+        return Ok(HookChange::default());
+    }
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    Ok(HookChange { changed: true })
 }
 
 fn grok_hooks_json() -> String {
@@ -784,6 +867,25 @@ command = '{}'
         let json_text = fs::read_to_string(json_path).unwrap();
         assert!(!json_text.contains("$PPID"));
         assert!(!json_text.contains("${"));
+    }
+
+    #[test]
+    fn opencode_plugin_install_is_idempotent_and_removable() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugin");
+
+        assert!(install_opencode_plugin(&plugin_dir).unwrap().changed);
+        assert!(!install_opencode_plugin(&plugin_dir).unwrap().changed);
+
+        let path = plugin_dir.join(OPENCODE_PLUGIN_NAME);
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("session-guard register --tool opencode"));
+        assert!(contents.contains("session-guard deregister"));
+        assert!(contents.contains("export const SessionGuard"));
+
+        assert!(remove_opencode_plugin(&plugin_dir).unwrap().changed);
+        assert!(!path.exists());
+        assert!(!remove_opencode_plugin(&plugin_dir).unwrap().changed);
     }
 
     #[test]

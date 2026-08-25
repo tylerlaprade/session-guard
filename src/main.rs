@@ -21,6 +21,7 @@ pub enum Tool {
     Claude,
     Codex,
     Grok,
+    Opencode,
 }
 
 impl Tool {
@@ -29,6 +30,7 @@ impl Tool {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::Opencode => "opencode",
         }
     }
 }

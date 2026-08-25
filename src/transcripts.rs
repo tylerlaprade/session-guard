@@ -287,7 +287,9 @@ fn filename_session_id(path: &Path, tool: Tool) -> Option<String> {
             .and_then(|start| stem.get(start..))
             .map(ToOwned::to_owned),
         // Grok sessions are directories; summary.json is handled separately.
-        Tool::Grok => None,
+        // OpenCode sessions live in sqlite, not per-session files, so the
+        // transcript fallback never discovers them.
+        Tool::Grok | Tool::Opencode => None,
     }
 }
 

@@ -24,6 +24,7 @@ pub struct RestoreSummary {
     pub restored_claude: usize,
     pub restored_codex: usize,
     pub restored_grok: usize,
+    pub restored_opencode: usize,
     pub pruned_missing_dirs: usize,
     pub pruned_duplicates: usize,
     pub fallback_sessions: usize,
@@ -33,16 +34,17 @@ pub struct RestoreSummary {
 
 impl RestoreSummary {
     pub fn restored_total(&self) -> usize {
-        self.restored_claude + self.restored_codex + self.restored_grok
+        self.restored_claude + self.restored_codex + self.restored_grok + self.restored_opencode
     }
 
     pub fn message(&self) -> String {
         let mut message = format!(
-            "Restored {} sessions ({} Claude Code, {} Codex, {} Grok). Pruned {} (directory gone).",
+            "Restored {} sessions ({} Claude Code, {} Codex, {} Grok, {} OpenCode). Pruned {} (directory gone).",
             self.restored_total(),
             self.restored_claude,
             self.restored_codex,
             self.restored_grok,
+            self.restored_opencode,
             self.pruned_missing_dirs,
         );
         if self.pruned_duplicates > 0 {
@@ -340,6 +342,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                     Tool::Claude => summary.restored_claude += 1,
                     Tool::Codex => summary.restored_codex += 1,
                     Tool::Grok => summary.restored_grok += 1,
+                    Tool::Opencode => summary.restored_opencode += 1,
                 }
                 session.source = Some(RESTORED_SOURCE.to_string());
                 session.last_seen_at = now;
@@ -614,6 +617,7 @@ fn resume_command(session: &SessionRecord) -> String {
         Tool::Claude => format!("claude --resume {session_id}"),
         Tool::Codex => format!("codex resume {session_id}"),
         Tool::Grok => format!("grok --resume {session_id}"),
+        Tool::Opencode => format!("opencode --session {session_id}"),
     }
 }
 
@@ -650,6 +654,10 @@ mod tests {
         assert_eq!(
             resume_command(&sample(Tool::Grok, "ghi")),
             "grok --resume 'ghi'"
+        );
+        assert_eq!(
+            resume_command(&sample(Tool::Opencode, "ses_abc")),
+            "opencode --session 'ses_abc'"
         );
     }
 
@@ -748,6 +756,7 @@ mod tests {
             restored_claude: 2,
             restored_codex: 1,
             restored_grok: 1,
+            restored_opencode: 1,
             pruned_missing_dirs: 0,
             pruned_duplicates: 1,
             fallback_sessions: 0,
@@ -755,7 +764,8 @@ mod tests {
             errors: vec![],
         };
         let message = summary.message();
-        assert!(message.contains("Restored 4 sessions"));
+        assert!(message.contains("Restored 5 sessions"));
+        assert!(message.contains("1 OpenCode"));
         assert!(message.contains("Pruned 1 duplicate"));
     }
 }

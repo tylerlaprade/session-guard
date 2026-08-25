@@ -7,6 +7,7 @@ pub fn run() -> Result<()> {
     let claude_installed = process::command_exists("claude");
     let codex_installed = process::command_exists("codex");
     let grok_installed = process::command_exists("grok");
+    let opencode_installed = process::command_exists("opencode");
 
     let claude_hooks = if claude_installed {
         Some(hooks::install_claude_hooks(&paths::claude_settings()?)?)
@@ -20,6 +21,13 @@ pub fn run() -> Result<()> {
     };
     let grok_hooks = if grok_installed {
         Some(hooks::install_grok_hooks(&paths::grok_hooks_dir()?)?)
+    } else {
+        None
+    };
+    let opencode_plugin = if opencode_installed {
+        Some(hooks::install_opencode_plugin(
+            &paths::opencode_plugin_dir()?,
+        )?)
     } else {
         None
     };
@@ -40,6 +48,10 @@ pub fn run() -> Result<()> {
     println!(
         "Grok hooks: {}",
         hook_summary(grok_installed, grok_hooks.as_ref())
+    );
+    println!(
+        "OpenCode plugin: {}",
+        hook_summary(opencode_installed, opencode_plugin.as_ref())
     );
     Ok(())
 }

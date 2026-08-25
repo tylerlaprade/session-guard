@@ -58,6 +58,17 @@ pub fn grok_hooks_dir() -> Result<PathBuf> {
     Ok(tool_home(Tool::Grok)?.join("hooks"))
 }
 
+/// OpenCode auto-discovers plugins from `<config dir>/plugin/*.{js,ts}`.
+pub fn opencode_plugin_dir() -> Result<PathBuf> {
+    Ok(opencode_config_dir()?.join("plugin"))
+}
+
+fn opencode_config_dir() -> Result<PathBuf> {
+    Ok(env::var_os("OPENCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(home_dir()?.join(".config").join("opencode")))
+}
+
 /// The tool's own config/state root, honoring the same env overrides the tools
 /// themselves use. Sessions whose working directory lives inside this root are
 /// internal tool activity (e.g. codex memory maintenance under `~/.codex`),
@@ -73,6 +84,9 @@ pub fn tool_home(tool: Tool) -> Result<PathBuf> {
         Tool::Grok => Ok(env::var_os("GROK_HOME")
             .map(PathBuf::from)
             .unwrap_or(home_dir()?.join(".grok"))),
+        // OpenCode splits config (~/.config/opencode) from state; the state
+        // root is where internal activity would run.
+        Tool::Opencode => Ok(home_dir()?.join(".local").join("share").join("opencode")),
     }
 }
 
