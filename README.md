@@ -16,7 +16,7 @@ Supported terminal values:
 
 | Value | Restore behavior |
 | --- | --- |
-| `ghostty` | Opens tabs in Ghostty via its native AppleScript scripting dictionary (`new tab with configuration`). No keystroke automation, so no Accessibility permission is needed. |
+| `ghostty` | Opens tabs in Ghostty via its native AppleScript scripting dictionary (`new tab with configuration`). No keystroke automation, so no Accessibility permission is needed. A wedged Ghostty can return a tab id yet never start the surface process (a permanent "ghost" tab, seen under memory pressure); restore polls the new surface's working directory — reported once the shell starts, via Ghostty's default shell integration — and counts a tab that never starts as a failed restore, so the session keeps no restore cooldown and stays retryable. |
 | `iterm2` | Opens tabs in the current iTerm2 window. |
 | `terminal` | Uses Terminal.app `do script`. |
 | `kitty` | Uses `kitty @ launch --type=tab`. |

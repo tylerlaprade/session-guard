@@ -61,9 +61,22 @@ pub fn run_checked_timeout(
     description: &str,
     timeout: std::time::Duration,
 ) -> Result<()> {
+    run_capture_timeout(command, description, timeout).map(|_| ())
+}
+
+/// Like `run_checked_timeout`, but returns trimmed stdout. Only for commands
+/// with small output (an AppleScript result): stdout is drained after exit,
+/// so output larger than the pipe buffer would deadlock the wait loop.
+pub fn run_capture_timeout(
+    command: &mut std::process::Command,
+    description: &str,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    use std::io::Read;
     use std::thread;
     use std::time::{Duration, Instant};
 
+    command.stdout(std::process::Stdio::piped());
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn for {description}"))?;
@@ -74,10 +87,14 @@ pub fn run_checked_timeout(
             .with_context(|| format!("failed to wait for {description}"))?
         {
             Some(status) => {
+                let mut output = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_string(&mut output);
+                }
                 if !status.success() {
                     anyhow::bail!("{description} failed with status {status}");
                 }
-                return Ok(());
+                return Ok(output.trim().to_string());
             }
             None => {
                 if start.elapsed() > timeout {
