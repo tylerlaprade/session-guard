@@ -59,7 +59,10 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "record construction mirrors the hook payload fields"
+    )]
     pub fn new(
         tool: Tool,
         session_id: String,

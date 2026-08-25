@@ -34,6 +34,10 @@ pub fn run(
         None
     };
 
+    // An explicit --session-id is an operator decision; only hook-driven
+    // registrations get the Codex frontend filter below (a hook cannot say
+    // which frontend owns the thread, an operator can).
+    let explicit_session = session_id.is_some();
     let session_id = session_id
         .or_else(|| {
             hook_input
@@ -67,6 +71,7 @@ pub fn run(
     // disqualifies: `codex resume` needs one, so the session could never be
     // restored anyway.
     if tool == Tool::Codex
+        && !explicit_session
         && !transcript_path
             .as_deref()
             .is_some_and(|path| transcripts::codex_rollout_is_cli(path, &session_id))

@@ -63,6 +63,23 @@ root terminal's `cli` meta — which is why only own-id metas count. Codex asks
 once to trust a new or changed hook at the next interactive launch; until
 approved, that hook does not run.
 
+A SessionEnd hook only retires a session when the recorded terminal shell is
+still alive — proof of an in-tab end (quit, `/clear`, `/resume` switching
+away). When the shell is already gone, the SessionEnd came from a GUI
+teardown (WindowServer death, logout) whose dying tools still flush their
+hooks; deregistering there would erase tabs that crash restore must reopen.
+Tabless (scan-tracked) sessions still deregister on SessionEnd, since a
+graceful end is the only cleanup they get.
+
+The daemon writes a heartbeat timestamp (`daemon-heartbeat`) after every
+monitor pass. At startup restore, a dead session still marked active counts
+as a crash victim when its `last_seen` sits near either the newest recorded
+activity or that final heartbeat. The second anchor matters because jetsam
+usually kills the daemon before the tools: busy sessions keep advancing
+`last_seen` through their Stop hooks after the monitor dies, while idle
+sessions stay frozen at the monitor's last tick and would otherwise be
+misread as old closes.
+
 The daemon does not treat a dead tool PID as proof that a session should be
 forgotten. Jetsam (memory pressure) and WindowServer crashes often kill the
 tool and shell while the daemon keeps running; that must not erase the

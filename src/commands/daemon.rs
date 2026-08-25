@@ -107,6 +107,9 @@ pub fn run() -> Result<()> {
     if added > 0 {
         log_line(&format!("scan added {added} sessions"))?;
     }
+    // First observation of this epoch; failures (e.g. disk full) must not
+    // stop monitoring, and the registry writes fail loudly on their own.
+    let _ = write_daemon_heartbeat();
     run_cargo_target_cleanup()?;
 
     let mut seconds_until_monitor = 60;
@@ -210,9 +213,16 @@ pub fn reconcile_from_scan() -> Result<usize> {
 // - Startup restore: only unobserved deaths in the crash cluster — sessions
 //   still marked active on disk (no epoch's monitor saw them die) whose
 //   last_seen falls within 2 minutes of the newest last_seen already in the
-//   file. That reopens sessions that died with the previous daemon epoch,
-//   without reopening intentional closes when the daemon is merely restarted
-//   for an upgrade.
+//   file, OR within 2 minutes of the previous epoch's final monitor
+//   heartbeat. The second cluster exists because jetsam usually kills the
+//   daemon before the tools: hook-driven Stop heartbeats keep advancing the
+//   newest last_seen for busy sessions after the monitor dies, while idle
+//   sessions stay frozen at the monitor's last tick. Anchoring only on the
+//   newest last_seen then misreads those idle crash victims as an older
+//   recoverable pile (the 2026-08-25 incident: only the two Grok tabs still
+//   chatting near the end were reopened). Together the clusters still avoid
+//   reopening intentional closes when the daemon is merely restarted for an
+//   upgrade.
 // - Restore runs before process scan so survivors cannot rewrite heartbeats.
 // - After open_tab succeeds, keep the record (source="restored") with a
 //   cooldown so a second restore does not spam duplicate tabs.
@@ -226,6 +236,12 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let _ = sessions::repair_if_corrupt(&path)?;
     let fallback_sessions = transcripts::discover_recent_sessions().unwrap_or_default();
     let now = chrono::Utc::now();
+    // The previous epoch's final observation, read before this epoch starts
+    // writing its own heartbeats.
+    let previous_heartbeat = match mode {
+        RestoreMode::Startup => read_daemon_heartbeat(),
+        RestoreMode::Manual => None,
+    };
     // One ps pass for every liveness check below: per-PID ps calls under the
     // exclusive sessions lock stall hook-driven register/deregister (codex
     // kills its SessionEnd hook after one second).
@@ -290,9 +306,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 continue;
             }
 
-            if let Some(cutoff) = activity_cutoff
-                && session.last_seen_at < cutoff
-            {
+            if outside_startup_clusters(session.last_seen_at, activity_cutoff, previous_heartbeat) {
                 // Older recoverable pile (earlier intentional closes, etc.)
                 alive_kept.push(session);
                 continue;
@@ -367,6 +381,43 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     Ok(summary)
 }
 
+// A dead active-on-disk session at startup is a crash victim when it belongs
+// to either cluster: near the newest on-disk last_seen (sessions whose hooks
+// kept heartbeating up to the catastrophe), or near the previous epoch's
+// final monitor heartbeat (idle sessions the dead daemon was refreshing).
+fn outside_startup_clusters(
+    last_seen: chrono::DateTime<chrono::Utc>,
+    activity_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    previous_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    let Some(cutoff) = activity_cutoff else {
+        return false;
+    };
+    if last_seen >= cutoff {
+        return false;
+    }
+    let Some(heartbeat) = previous_heartbeat else {
+        return true;
+    };
+    (heartbeat - last_seen).num_seconds().abs() > LIVENESS_CLUSTER_WINDOW_SECS
+}
+
+fn read_daemon_heartbeat() -> Option<chrono::DateTime<chrono::Utc>> {
+    let path = paths::daemon_heartbeat().ok()?;
+    let contents = fs::read_to_string(path).ok()?;
+    chrono::DateTime::parse_from_rfc3339(contents.trim())
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+}
+
+fn write_daemon_heartbeat() -> Result<()> {
+    fs::write(
+        paths::daemon_heartbeat()?,
+        format!("{}\n", chrono::Utc::now().to_rfc3339()),
+    )
+    .context("failed to write daemon heartbeat")
+}
+
 fn recently_restored(session: &SessionRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
     if session.source.as_deref() != Some(RESTORED_SOURCE) {
         return false;
@@ -383,7 +434,7 @@ pub fn monitor_once() -> Result<MonitorSummary> {
     let Ok(processes) = ProcessSnapshot::capture() else {
         return Ok(MonitorSummary::default());
     };
-    sessions::with_sessions_mut(&paths::sessions_file()?, |sessions| {
+    let summary = sessions::with_sessions_mut(&paths::sessions_file()?, |sessions| {
         let mut summary = MonitorSummary::default();
         for session in sessions.iter_mut() {
             if session_is_alive(session, &processes) {
@@ -404,7 +455,11 @@ pub fn monitor_once() -> Result<MonitorSummary> {
         sessions.retain(|session| !session.recoverable_expired());
         summary.pruned_expired = before - sessions.len();
         Ok(summary)
-    })
+    })?;
+    // Only after a real observation pass: a stale heartbeat must mean "the
+    // monitor stopped watching here", never "ps kept failing".
+    let _ = write_daemon_heartbeat();
+    Ok(summary)
 }
 
 pub fn running_daemon_pid() -> Result<Option<i32>> {
@@ -627,6 +682,50 @@ mod tests {
 
         session.shell_pid_started_at = process::process_start_identity(pid).ok();
         assert!(session_shell_is_alive(&session, &processes));
+    }
+
+    #[test]
+    fn startup_clusters_admit_idle_sessions_frozen_at_the_dead_monitors_tick() {
+        // The 2026-08-25 incident: the daemon died at 11:24:14 while Grok Stop
+        // hooks kept heartbeating until 11:52. Idle Claude/Codex sessions froze
+        // at the monitor's last tick and must still count as crash victims.
+        let heartbeat = Utc::now();
+        let newest = heartbeat + Duration::minutes(28);
+        let cutoff = Some(newest - Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS));
+
+        // Idle session refreshed by the monitor's final tick.
+        assert!(!outside_startup_clusters(
+            heartbeat,
+            cutoff,
+            Some(heartbeat)
+        ));
+        // Busy session that heartbeated up to the catastrophe.
+        assert!(!outside_startup_clusters(newest, cutoff, Some(heartbeat)));
+        // Genuinely older pile stays excluded.
+        let old = heartbeat - Duration::hours(3);
+        assert!(outside_startup_clusters(old, cutoff, Some(heartbeat)));
+        // A session that heartbeated shortly after the monitor died but well
+        // before the catastrophe is ambiguous; keep excluding it.
+        let between = heartbeat + Duration::minutes(10);
+        assert!(outside_startup_clusters(between, cutoff, Some(heartbeat)));
+    }
+
+    #[test]
+    fn startup_clusters_without_heartbeat_fall_back_to_newest_activity() {
+        let newest = Utc::now();
+        let cutoff = Some(newest - Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS));
+        assert!(!outside_startup_clusters(newest, cutoff, None));
+        assert!(outside_startup_clusters(
+            newest - Duration::minutes(30),
+            cutoff,
+            None
+        ));
+    }
+
+    #[test]
+    fn manual_restore_has_no_cluster_gate() {
+        let ancient = Utc::now() - Duration::days(6);
+        assert!(!outside_startup_clusters(ancient, None, None));
     }
 
     #[test]

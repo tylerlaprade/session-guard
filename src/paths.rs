@@ -34,6 +34,10 @@ pub fn daemon_pid() -> Result<PathBuf> {
     Ok(config_dir()?.join("daemon.pid"))
 }
 
+pub fn daemon_heartbeat() -> Result<PathBuf> {
+    Ok(config_dir()?.join("daemon-heartbeat"))
+}
+
 pub fn cargo_targets_dir() -> Result<PathBuf> {
     Ok(home_dir()?
         .join("Library")
