@@ -13,10 +13,26 @@ struct HookInput {
     #[serde(default, alias = "sessionId")]
     session_id: Option<String>,
     cwd: Option<PathBuf>,
+    // Grok 1.0.13+ names the workspace `workspaceRoot` on every event.
+    #[serde(default, alias = "workspaceRoot")]
+    workspace_root: Option<PathBuf>,
     #[serde(default, alias = "transcriptPath")]
     transcript_path: Option<PathBuf>,
     source: Option<String>,
     name: Option<String>,
+}
+
+const SESSION_ID_ENVS: &[&str] = &[
+    "GROK_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+];
+const DIRECTORY_ENVS: &[&str] = &["GROK_WORKSPACE_ROOT", "CLAUDE_PROJECT_DIR"];
+
+fn first_env(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
 }
 
 pub fn run(
@@ -44,11 +60,18 @@ pub fn run(
                 .as_ref()
                 .and_then(|input| input.session_id.clone())
         })
+        .or_else(|| first_env(SESSION_ID_ENVS))
         .context(
             "missing session id; pass --session-id or run from a hook that provides session_id",
         )?;
     let directory = directory
         .or_else(|| hook_input.as_ref().and_then(|input| input.cwd.clone()))
+        .or_else(|| {
+            hook_input
+                .as_ref()
+                .and_then(|input| input.workspace_root.clone())
+        })
+        .or_else(|| first_env(DIRECTORY_ENVS).map(PathBuf::from))
         .context("missing directory; pass --directory or run from a hook that provides cwd")?;
 
     // The tools fire their session hooks for internal activity too — e.g. codex
@@ -104,7 +127,9 @@ pub(crate) fn is_internal_directory(directory: &Path, tool_home: &Path) -> bool 
 }
 
 pub fn read_session_id_from_hook_stdin() -> Result<Option<String>> {
-    Ok(read_hook_input()?.and_then(|input| input.session_id))
+    Ok(read_hook_input()?
+        .and_then(|input| input.session_id)
+        .or_else(|| first_env(SESSION_ID_ENVS)))
 }
 
 fn read_hook_input() -> Result<Option<HookInput>> {
@@ -154,5 +179,36 @@ mod tests {
             Path::new("/Users/tyler/.codex-backup"),
             home
         ));
+    }
+
+    #[test]
+    fn grok_hook_json_accepts_workspace_root_when_cwd_is_absent() {
+        let input: HookInput = serde_json::from_str(
+            r#"{"sessionId":"abc","workspaceRoot":"/tmp/proj","transcriptPath":"/tmp/t.jsonl"}"#,
+        )
+        .unwrap();
+        assert_eq!(input.session_id.as_deref(), Some("abc"));
+        assert_eq!(input.cwd, None);
+        assert_eq!(
+            input.workspace_root.as_deref(),
+            Some(Path::new("/tmp/proj"))
+        );
+        assert_eq!(
+            input.transcript_path.as_deref(),
+            Some(Path::new("/tmp/t.jsonl"))
+        );
+    }
+
+    #[test]
+    fn grok_hook_json_keeps_cwd_when_both_are_present() {
+        let input: HookInput = serde_json::from_str(
+            r#"{"sessionId":"abc","cwd":"/tmp/cwd","workspaceRoot":"/tmp/root"}"#,
+        )
+        .unwrap();
+        assert_eq!(input.cwd.as_deref(), Some(Path::new("/tmp/cwd")));
+        assert_eq!(
+            input.workspace_root.as_deref(),
+            Some(Path::new("/tmp/root"))
+        );
     }
 }

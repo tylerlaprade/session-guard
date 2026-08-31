@@ -856,11 +856,11 @@ command = '{}'
         assert!(json_event_has_command(stop, GROK_REGISTER_SCRIPT_NAME));
         let end = root["hooks"]["SessionEnd"].as_array().unwrap();
         assert!(json_event_has_command(end, GROK_DEREGISTER));
-        assert!(
-            fs::read_to_string(&script_path)
-                .unwrap()
-                .contains("SESSION_GUARD_SHELL_PID")
-        );
+        let script = fs::read_to_string(&script_path).unwrap();
+        assert!(script.contains("SESSION_GUARD_SHELL_PID"));
+        assert!(script.contains("GROK_SESSION_ID"));
+        assert!(script.contains("GROK_WORKSPACE_ROOT"));
+        assert!(script.contains("/bin/ps"));
 
         // Register script must not embed bare $VAR in the JSON command field —
         // Grok expands those and fails when unset (e.g. $PPID).

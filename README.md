@@ -43,15 +43,18 @@ right session. The selected terminal is stored in
 ## Recovery Model
 
 Hook identity comes from the JSON payload Claude Code, Codex, and Grok provide
-on stdin. The installed hook commands store the tool PID, the parent shell
-PID, and each PID's process start time (`ps lstart`) when the hook process can
-derive them. A launcher that inserts an intermediate process can pass
+on stdin, and from runner-injected environment variables when those are set.
+The installed hook commands store the tool PID, the parent shell PID, and each
+PID's process start time (`ps lstart`) when the hook process can derive them.
+A launcher that inserts an intermediate process can pass
 `SESSION_GUARD_SHELL_PID` to preserve the owning terminal shell. Codex installs
 a `SessionStart` hook, a `Stop` heartbeat, and —
 on Codex 0.145+ — a `SessionEnd` hook, which Codex fires only on graceful
 shutdown. Grok hooks live in `~/.grok/hooks/` (global) and use a companion
 register script because Grok expands `$VAR` in inline hook commands and
-rejects unset vars such as `$PPID`.
+rejects unset vars such as `$PPID`. Grok 1.0.13+ injects `GROK_SESSION_ID`
+and `GROK_WORKSPACE_ROOT` on every hook; the script passes those as flags so
+register does not depend on stdin JSON field names (`cwd` vs `workspaceRoot`).
 
 OpenCode has no shell-command hooks; session-guard installs a JS plugin at
 `~/.config/opencode/plugin/session-guard.js` that OpenCode loads into its
