@@ -1,5 +1,6 @@
 use crate::adapters::{adapter_for, shell_quote};
 use crate::cargo_targets;
+use crate::last_sessions::{self, LastSessionRecord};
 use crate::paths;
 use crate::process::{self, ProcessSnapshot};
 use crate::scan;
@@ -7,7 +8,7 @@ use crate::sessions::{self, SessionRecord, SessionState};
 use crate::transcripts;
 use crate::{TerminalKind, Tool};
 use anyhow::{Context, Result};
-use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1};
+use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::flag;
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
@@ -28,6 +29,7 @@ pub struct RestoreSummary {
     pub pruned_missing_dirs: usize,
     pub pruned_duplicates: usize,
     pub fallback_sessions: usize,
+    pub retired: usize,
     pub failed: usize,
     pub errors: Vec<String>,
 }
@@ -42,6 +44,7 @@ impl RestoreSummary {
     }
 
     pub fn message(&self) -> String {
+        use std::fmt::Write as _;
         let per_tool: Vec<String> = Tool::all()
             .map(|tool| {
                 format!(
@@ -58,19 +61,24 @@ impl RestoreSummary {
             self.pruned_missing_dirs,
         );
         if self.pruned_duplicates > 0 {
-            message.push_str(&format!(
+            let _ = write!(
+                message,
                 " Pruned {} duplicate entries.",
                 self.pruned_duplicates
-            ));
+            );
         }
         if self.fallback_sessions > 0 {
-            message.push_str(&format!(
+            let _ = write!(
+                message,
                 " Added {} transcript fallback sessions.",
                 self.fallback_sessions
-            ));
+            );
+        }
+        if self.retired > 0 {
+            let _ = write!(message, " Retired {} ended sessions.", self.retired);
         }
         if self.failed > 0 {
-            message.push_str(&format!(" Failed to restore {} sessions.", self.failed));
+            let _ = write!(message, " Failed to restore {} sessions.", self.failed);
         }
         message
     }
@@ -82,10 +90,17 @@ pub struct MonitorSummary {
     pub pruned_expired: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default)]
+pub struct SettleSummary {
+    pub retired: usize,
+    pub marked_recoverable: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreMode {
     Startup,
     Manual,
+    All,
 }
 
 pub fn run() -> Result<()> {
@@ -105,9 +120,11 @@ pub fn run() -> Result<()> {
     // "now" and would push crash-window sessions outside any startup window.
     let shutdown = Arc::new(AtomicBool::new(false));
     let restore_requested = Arc::new(AtomicBool::new(false));
+    let restore_all_requested = Arc::new(AtomicBool::new(false));
     flag::register(SIGTERM, Arc::clone(&shutdown))?;
     flag::register(SIGINT, Arc::clone(&shutdown))?;
     flag::register(SIGUSR1, Arc::clone(&restore_requested))?;
+    flag::register(SIGUSR2, Arc::clone(&restore_all_requested))?;
 
     let summary = restore_once(RestoreMode::Startup)?;
     log_line(&summary.message())?;
@@ -125,6 +142,7 @@ pub fn run() -> Result<()> {
     run_cargo_target_cleanup()?;
 
     let mut seconds_until_monitor = 60;
+    let mut seconds_until_settle = SESSION_END_SETTLE_INTERVAL_SECS;
     let mut monitor_cycles_until_cleanup = CARGO_TARGET_CLEANUP_MONITOR_CYCLES;
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
@@ -135,6 +153,27 @@ pub fn run() -> Result<()> {
             for error in &summary.errors {
                 log_line(error)?;
             }
+        }
+        if restore_all_requested.swap(false, Ordering::Relaxed) {
+            let summary = restore_once(RestoreMode::All)?;
+            log_line(&format!("manual restore --all: {}", summary.message()))?;
+            for error in &summary.errors {
+                log_line(error)?;
+            }
+        }
+
+        seconds_until_settle -= 1;
+        if seconds_until_settle == 0 {
+            let summary = settle_endings()?;
+            if summary.retired > 0 || summary.marked_recoverable > 0 {
+                log_line(&format!(
+                    "settled {} ended sessions: {} retired, {} recoverable",
+                    summary.retired + summary.marked_recoverable,
+                    summary.retired,
+                    summary.marked_recoverable
+                ))?;
+            }
+            seconds_until_settle = SESSION_END_SETTLE_INTERVAL_SECS;
         }
 
         seconds_until_monitor -= 1;
@@ -221,7 +260,14 @@ pub fn reconcile_from_scan() -> Result<usize> {
 //
 // Restore policy:
 // - Never open a new tab if the recorded shell is still alive (tab still open).
-// - Manual restore: every both-dead recoverable session.
+// - Manual restore: the newest cluster of deaths — every both-dead session
+//   whose death (dead_at, else its SessionEnd, else last_seen) falls within
+//   2 minutes of the newest such death. Observed-recoverable records count,
+//   because the daemon usually survives a terminal quit and has marked the
+//   victims by the time the user asks. Older recoverable piles stay put
+//   (2026-09-03: a Ghostty quit killed 5 tabs; the manual restore reopened
+//   those plus 20 stale Codex/Grok records from the previous week).
+// - Manual restore --all: every both-dead recoverable session.
 // - Startup restore: only unobserved deaths in the crash cluster — sessions
 //   still marked active on disk (no epoch's monitor saw them die) whose
 //   last_seen falls within 2 minutes of the newest last_seen already in the
@@ -242,6 +288,11 @@ pub fn reconcile_from_scan() -> Result<usize> {
 const LIVENESS_CLUSTER_WINDOW_SECS: i64 = 120;
 const RESTORE_COOLDOWN_SECS: i64 = 30 * 60;
 const RESTORED_SOURCE: &str = "restored";
+// A quitting terminal tears its tabs down one by one and can still be running
+// when the last tab's SessionEnd fires (Ghostty took six seconds on
+// 2026-09-03), so the aftermath is judged only after this grace.
+const SESSION_END_GRACE_SECS: i64 = 10;
+const SESSION_END_SETTLE_INTERVAL_SECS: u32 = 5;
 
 pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let path = paths::sessions_file()?;
@@ -252,12 +303,14 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     // writing its own heartbeats.
     let previous_heartbeat = match mode {
         RestoreMode::Startup => read_daemon_heartbeat(),
-        RestoreMode::Manual => None,
+        RestoreMode::Manual | RestoreMode::All => None,
     };
     // One ps pass for every liveness check below: per-PID ps calls under the
     // exclusive sessions lock stall hook-driven register/deregister (codex
     // kills its SessionEnd hook after one second).
     let processes = ProcessSnapshot::capture()?;
+    let terminal = configured_terminal().ok();
+    let last_sessions_path = paths::last_sessions_file()?;
 
     // Phase 1: decide who to restore under the sessions lock (no AppleScript).
     let (mut summary, alive_kept, to_open) = sessions::with_sessions_mut(&path, |sessions| {
@@ -269,21 +322,39 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
 
         let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary, &processes);
 
-        // Crash cluster uses on-disk last_seen only (before mark_active).
-        let activity_cutoff =
-            matches!(mode, RestoreMode::Startup)
-                .then(|| {
-                    unique.iter().map(|s| s.last_seen_at).max().map(|t_max| {
-                        t_max - chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS)
-                    })
-                })
-                .flatten();
+        // Cluster anchors use on-disk timestamps only (before mark_active /
+        // mark_recoverable rewrite them).
+        let window = chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS);
+        let cluster_cutoff = match mode {
+            RestoreMode::Startup => unique.iter().map(|s| s.last_seen_at).max(),
+            RestoreMode::Manual => unique
+                .iter()
+                .filter(|s| !session_shell_is_alive(s, &processes))
+                .map(death_time)
+                .max(),
+            RestoreMode::All => None,
+        }
+        .map(|newest| newest - window);
 
         let mut alive_kept = Vec::new();
         let mut to_open = Vec::new();
 
         for mut session in unique {
             let was_recoverable = session.state == SessionState::Recoverable;
+            let death_time = death_time(&session);
+
+            if session.state == SessionState::Ending
+                && ending_verdict(
+                    &session,
+                    &processes,
+                    terminal.map(TerminalKind::process_name),
+                ) == EndingVerdict::Retire
+            {
+                remember(&last_sessions_path, &session)?;
+                summary.retired += 1;
+                continue;
+            }
+
             if session_is_alive(&session, &processes) {
                 session.mark_active();
                 alive_kept.push(session);
@@ -301,7 +372,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             // this session die — an observed close, not one that fell with
             // the epoch. A daemon upgrade/restart must not resurrect it.
             // Manual restore still offers it.
-            if matches!(mode, RestoreMode::Startup) && was_recoverable {
+            if mode == RestoreMode::Startup && was_recoverable {
                 alive_kept.push(session);
                 continue;
             }
@@ -318,7 +389,11 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 continue;
             }
 
-            if outside_startup_clusters(session.last_seen_at, activity_cutoff, previous_heartbeat) {
+            let anchor = match mode {
+                RestoreMode::Startup => session.last_seen_at,
+                RestoreMode::Manual | RestoreMode::All => death_time,
+            };
+            if outside_death_cluster(anchor, cluster_cutoff, previous_heartbeat) {
                 // Older recoverable pile (earlier intentional closes, etc.)
                 alive_kept.push(session);
                 continue;
@@ -389,25 +464,125 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     Ok(summary)
 }
 
-// A dead active-on-disk session at startup is a crash victim when it belongs
-// to either cluster: near the newest on-disk last_seen (sessions whose hooks
-// kept heartbeating up to the catastrophe), or near the previous epoch's
-// final monitor heartbeat (idle sessions the dead daemon was refreshing).
-fn outside_startup_clusters(
-    last_seen: chrono::DateTime<chrono::Utc>,
-    activity_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+// A dead session is a crash victim when it belongs to either cluster: near the
+// newest death or on-disk last_seen (sessions whose hooks kept heartbeating up
+// to the catastrophe), or — at startup — near the previous epoch's final
+// monitor heartbeat (idle sessions the dead daemon was refreshing).
+fn outside_death_cluster(
+    anchor: chrono::DateTime<chrono::Utc>,
+    cluster_cutoff: Option<chrono::DateTime<chrono::Utc>>,
     previous_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
-    let Some(cutoff) = activity_cutoff else {
+    let Some(cutoff) = cluster_cutoff else {
         return false;
     };
-    if last_seen >= cutoff {
+    if anchor >= cutoff {
         return false;
     }
     let Some(heartbeat) = previous_heartbeat else {
         return true;
     };
-    (heartbeat - last_seen).num_seconds().abs() > LIVENESS_CLUSTER_WINDOW_SECS
+    (heartbeat - anchor).num_seconds().abs() > LIVENESS_CLUSTER_WINDOW_SECS
+}
+
+// The best on-disk estimate of when a session's tab died: the monitor's mark,
+// else the SessionEnd the hook reported, else the last heartbeat.
+fn death_time(session: &SessionRecord) -> chrono::DateTime<chrono::Utc> {
+    session
+        .dead_at
+        .or(session.ending_at)
+        .unwrap_or(session.last_seen_at)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndingVerdict {
+    Retire,
+    Recoverable,
+}
+
+// A SessionEnd is the tool's word that the session id is done, not whether the
+// user ended it or the terminal fell out from under it. The aftermath tells:
+// the tool or its shell still running means an in-tab end (/exit, /clear,
+// /resume switching away), and a dead tab under a terminal that is still up
+// means the tab was closed on purpose (Cmd-W). A terminal that started after
+// the shell cannot have owned the tab, so a quick relaunch does not count.
+// Without a known terminal, err toward keeping: retirement is irreversible
+// and a recoverable record expires on its own.
+fn ending_verdict(
+    session: &SessionRecord,
+    processes: &ProcessSnapshot,
+    terminal_executable: Option<&str>,
+) -> EndingVerdict {
+    if session_tool_is_alive(session, processes) || session_shell_is_alive(session, processes) {
+        return EndingVerdict::Retire;
+    }
+    let terminal_outlived_the_tab = terminal_executable.is_some_and(|executable| {
+        processes.instance_running_since(executable, session.shell_pid_started_at.as_deref())
+    });
+    if terminal_outlived_the_tab {
+        EndingVerdict::Retire
+    } else {
+        EndingVerdict::Recoverable
+    }
+}
+
+fn ending_settled(session: &SessionRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
+    session.state == SessionState::Ending
+        && session
+            .ending_at
+            .is_some_and(|ending_at| (now - ending_at).num_seconds() >= SESSION_END_GRACE_SECS)
+}
+
+fn remember(last_sessions_path: &std::path::Path, session: &SessionRecord) -> Result<()> {
+    if let Some(record) = LastSessionRecord::from_session(session) {
+        last_sessions::remember(last_sessions_path, record)?;
+    }
+    Ok(())
+}
+
+pub fn settle_endings() -> Result<SettleSummary> {
+    let path = paths::sessions_file()?;
+    let now = chrono::Utc::now();
+    let _ = sessions::repair_if_corrupt(&path)?;
+    if !sessions::read_sessions(&path)?
+        .iter()
+        .any(|session| ending_settled(session, now))
+    {
+        return Ok(SettleSummary::default());
+    }
+    let Ok(processes) = ProcessSnapshot::capture() else {
+        return Ok(SettleSummary::default());
+    };
+    let terminal = configured_terminal().ok();
+    let last_sessions_path = paths::last_sessions_file()?;
+
+    sessions::with_sessions_mut(&path, |sessions| {
+        let mut summary = SettleSummary::default();
+        let mut kept = Vec::with_capacity(sessions.len());
+        for mut session in sessions.drain(..) {
+            if !ending_settled(&session, now) {
+                kept.push(session);
+                continue;
+            }
+            match ending_verdict(
+                &session,
+                &processes,
+                terminal.map(TerminalKind::process_name),
+            ) {
+                EndingVerdict::Retire => {
+                    remember(&last_sessions_path, &session)?;
+                    summary.retired += 1;
+                }
+                EndingVerdict::Recoverable => {
+                    session.mark_recoverable();
+                    summary.marked_recoverable += 1;
+                    kept.push(session);
+                }
+            }
+        }
+        *sessions = kept;
+        Ok(summary)
+    })
 }
 
 fn read_daemon_heartbeat() -> Option<chrono::DateTime<chrono::Utc>> {
@@ -445,6 +620,11 @@ pub fn monitor_once() -> Result<MonitorSummary> {
     let summary = sessions::with_sessions_mut(&paths::sessions_file()?, |sessions| {
         let mut summary = MonitorSummary::default();
         for session in sessions.iter_mut() {
+            // Ending records belong to settle_endings; a still-running tool
+            // must not revive an id its own SessionEnd already closed.
+            if session.state == SessionState::Ending {
+                continue;
+            }
             if session_is_alive(session, &processes) {
                 session.mark_active();
                 continue;
@@ -705,28 +885,24 @@ mod tests {
         let cutoff = Some(newest - Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS));
 
         // Idle session refreshed by the monitor's final tick.
-        assert!(!outside_startup_clusters(
-            heartbeat,
-            cutoff,
-            Some(heartbeat)
-        ));
+        assert!(!outside_death_cluster(heartbeat, cutoff, Some(heartbeat)));
         // Busy session that heartbeated up to the catastrophe.
-        assert!(!outside_startup_clusters(newest, cutoff, Some(heartbeat)));
+        assert!(!outside_death_cluster(newest, cutoff, Some(heartbeat)));
         // Genuinely older pile stays excluded.
         let old = heartbeat - Duration::hours(3);
-        assert!(outside_startup_clusters(old, cutoff, Some(heartbeat)));
+        assert!(outside_death_cluster(old, cutoff, Some(heartbeat)));
         // A session that heartbeated shortly after the monitor died but well
         // before the catastrophe is ambiguous; keep excluding it.
         let between = heartbeat + Duration::minutes(10);
-        assert!(outside_startup_clusters(between, cutoff, Some(heartbeat)));
+        assert!(outside_death_cluster(between, cutoff, Some(heartbeat)));
     }
 
     #[test]
     fn startup_clusters_without_heartbeat_fall_back_to_newest_activity() {
         let newest = Utc::now();
         let cutoff = Some(newest - Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS));
-        assert!(!outside_startup_clusters(newest, cutoff, None));
-        assert!(outside_startup_clusters(
+        assert!(!outside_death_cluster(newest, cutoff, None));
+        assert!(outside_death_cluster(
             newest - Duration::minutes(30),
             cutoff,
             None
@@ -734,9 +910,124 @@ mod tests {
     }
 
     #[test]
-    fn manual_restore_has_no_cluster_gate() {
+    fn manual_restore_reopens_only_the_newest_death_cluster() {
+        // The 2026-09-03 incident: a Ghostty quit killed five tabs at 15:20;
+        // thirteen Codex and seven Grok records had died over the previous
+        // week. A manual restore must reopen the five, not the twenty-five.
+        let quit = Utc::now() - Duration::minutes(2);
+        let cutoff = Some(quit - Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS));
+        assert!(!outside_death_cluster(quit, cutoff, None));
+        // Idle victim last marked alive by the monitor's tick before the quit.
+        assert!(!outside_death_cluster(
+            quit - Duration::seconds(59),
+            cutoff,
+            None
+        ));
+        assert!(outside_death_cluster(
+            quit - Duration::days(3),
+            cutoff,
+            None
+        ));
+    }
+
+    #[test]
+    fn restore_all_has_no_cluster_gate() {
         let ancient = Utc::now() - Duration::days(6);
-        assert!(!outside_startup_clusters(ancient, None, None));
+        assert!(!outside_death_cluster(ancient, None, None));
+    }
+
+    #[test]
+    fn death_time_prefers_the_monitor_mark_then_the_session_end() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        assert_eq!(death_time(&session), session.last_seen_at);
+        session.mark_ending();
+        assert_eq!(death_time(&session), session.ending_at.unwrap());
+        session.mark_recoverable();
+        assert_eq!(death_time(&session), session.dead_at.unwrap());
+    }
+
+    fn own_executable() -> String {
+        std::env::current_exe()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+    }
+
+    fn ended_session(shell_pid: i32, shell_started_at: &str) -> SessionRecord {
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.pid = Some(i32::MAX);
+        session.pid_started_at = Some("Wed Jan 1 00:00:00 2020".to_string());
+        session.shell_pid = Some(shell_pid);
+        session.shell_pid_started_at = Some(shell_started_at.to_string());
+        session.mark_ending();
+        session
+    }
+
+    #[test]
+    fn ending_verdict_retires_an_in_tab_end() {
+        let pid = std::process::id() as i32;
+        let processes = ProcessSnapshot::capture().unwrap();
+        let session = ended_session(pid, &process::process_start_identity(pid).unwrap());
+        assert_eq!(
+            ending_verdict(&session, &processes, None),
+            EndingVerdict::Retire
+        );
+    }
+
+    #[test]
+    fn ending_verdict_retires_a_tab_closed_under_a_living_terminal() {
+        // The test binary stands in for the terminal: it predates a shell
+        // "started" in 2100, so it owned that tab and is still up.
+        let processes = ProcessSnapshot::capture().unwrap();
+        let session = ended_session(i32::MAX, "Fri Jan 1 00:00:00 2100");
+        assert_eq!(
+            ending_verdict(&session, &processes, Some(&own_executable())),
+            EndingVerdict::Retire
+        );
+    }
+
+    #[test]
+    fn ending_verdict_keeps_a_tab_whose_terminal_went_down() {
+        let processes = ProcessSnapshot::capture().unwrap();
+        let session = ended_session(i32::MAX, "Fri Jan 1 00:00:00 2100");
+        assert_eq!(
+            ending_verdict(&session, &processes, Some("no-such-terminal-xyz")),
+            EndingVerdict::Recoverable
+        );
+        assert_eq!(
+            ending_verdict(&session, &processes, None),
+            EndingVerdict::Recoverable
+        );
+    }
+
+    #[test]
+    fn ending_verdict_ignores_a_terminal_relaunched_after_the_shell() {
+        // Ghostty quit at 11:20:51 and was back by 11:21:14; the new instance
+        // started after every dead shell and must not claim their tabs.
+        let processes = ProcessSnapshot::capture().unwrap();
+        let session = ended_session(i32::MAX, "Wed Jan 1 00:00:00 2020");
+        assert_eq!(
+            ending_verdict(&session, &processes, Some(&own_executable())),
+            EndingVerdict::Recoverable
+        );
+    }
+
+    #[test]
+    fn ending_settles_only_after_the_grace_period() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        assert!(!ending_settled(&session, Utc::now()));
+        session.mark_ending();
+        let ending_at = session.ending_at.unwrap();
+        assert!(!ending_settled(
+            &session,
+            ending_at + Duration::seconds(SESSION_END_GRACE_SECS - 1)
+        ));
+        assert!(ending_settled(
+            &session,
+            ending_at + Duration::seconds(SESSION_END_GRACE_SECS)
+        ));
     }
 
     #[test]
@@ -765,6 +1056,7 @@ mod tests {
             pruned_missing_dirs: 0,
             pruned_duplicates: 1,
             fallback_sessions: 0,
+            retired: 2,
             failed: 0,
             errors: vec![],
         };
@@ -772,5 +1064,6 @@ mod tests {
         assert!(message.contains("Restored 5 sessions"));
         assert!(message.contains("1 OpenCode"));
         assert!(message.contains("Pruned 1 duplicate"));
+        assert!(message.contains("Retired 2 ended sessions"));
     }
 }

@@ -132,6 +132,19 @@ impl TerminalKind {
             Self::Alacritty => "alacritty",
         }
     }
+
+    /// Executable name as `ps -o comm=` reports it, lowercased.
+    #[must_use]
+    pub fn process_name(self) -> &'static str {
+        match self {
+            Self::Ghostty => "ghostty",
+            Self::Iterm2 => "iterm2",
+            Self::Terminal => "terminal",
+            Self::Kitty => "kitty",
+            Self::Wezterm => "wezterm-gui",
+            Self::Alacritty => "alacritty",
+        }
+    }
 }
 
 impl std::str::FromStr for TerminalKind {
@@ -210,7 +223,13 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    Restore,
+    Restore {
+        #[arg(
+            long,
+            help = "Reopen every dead recoverable session instead of only the newest cluster of deaths"
+        )]
+        all: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -233,6 +252,6 @@ fn main() -> Result<()> {
             name,
         } => commands::register::run(tool, session_id, pid, shell_pid, directory, name),
         Command::Deregister { session_id } => commands::deregister::run(session_id),
-        Command::Restore => commands::restore::run(),
+        Command::Restore { all } => commands::restore::run(all),
     }
 }

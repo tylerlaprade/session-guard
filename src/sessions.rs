@@ -14,6 +14,7 @@ pub const DEFAULT_RECOVERABLE_DAYS: i64 = 7;
 #[serde(rename_all = "lowercase")]
 pub enum SessionState {
     Active,
+    Ending,
     Recoverable,
 }
 
@@ -54,6 +55,12 @@ pub struct SessionRecord {
     pub dead_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub recoverable_until: Option<DateTime<Utc>>,
+    // When a hook-driven SessionEnd arrived. The daemon settles the record
+    // once the aftermath is visible (daemon::settle_endings): retired when the
+    // tab or its terminal outlived the tool, recoverable when the terminal
+    // went down with it.
+    #[serde(default)]
+    pub ending_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub source: Option<String>,
 }
@@ -90,6 +97,7 @@ impl SessionRecord {
             state: SessionState::Active,
             dead_at: None,
             recoverable_until: None,
+            ending_at: None,
             source,
         }
     }
@@ -116,22 +124,29 @@ impl SessionRecord {
             state: SessionState::Recoverable,
             dead_at: Some(timestamp),
             recoverable_until: Some(timestamp + Duration::days(DEFAULT_RECOVERABLE_DAYS)),
+            ending_at: None,
             source: Some("transcript-fallback".to_string()),
         }
     }
 
+    pub fn mark_ending(&mut self) {
+        self.state = SessionState::Ending;
+        self.ending_at.get_or_insert(Utc::now());
+    }
+
     pub fn mark_recoverable(&mut self) {
-        let now = Utc::now();
+        let dead_at = self.ending_at.unwrap_or_else(Utc::now);
         self.state = SessionState::Recoverable;
-        self.dead_at.get_or_insert(now);
+        self.dead_at.get_or_insert(dead_at);
         self.recoverable_until
-            .get_or_insert(now + Duration::days(DEFAULT_RECOVERABLE_DAYS));
+            .get_or_insert(dead_at + Duration::days(DEFAULT_RECOVERABLE_DAYS));
     }
 
     pub fn mark_active(&mut self) {
         self.state = SessionState::Active;
         self.dead_at = None;
         self.recoverable_until = None;
+        self.ending_at = None;
         self.last_seen_at = Utc::now();
         // Clear restore-cooldown tag so a later crash can re-open this session.
         if self.source.as_deref() == Some("restored") {
@@ -354,5 +369,32 @@ mod tests {
         assert_eq!(session.state, SessionState::Active);
         assert!(session.source.is_none());
         assert!(session.dead_at.is_none());
+    }
+
+    #[test]
+    fn ending_session_dies_at_its_session_end_not_at_settlement() {
+        let mut session = SessionRecord::new(
+            crate::tool("claude"),
+            "abc".to_string(),
+            Some(1),
+            Some(2),
+            PathBuf::from("/tmp/p"),
+            None,
+            None,
+            None,
+        );
+        session.mark_ending();
+        assert_eq!(session.state, SessionState::Ending);
+        let ending_at = session.ending_at.unwrap();
+
+        session.mark_recoverable();
+        assert_eq!(session.dead_at, Some(ending_at));
+        assert_eq!(
+            session.recoverable_until,
+            Some(ending_at + Duration::days(DEFAULT_RECOVERABLE_DAYS))
+        );
+
+        session.mark_active();
+        assert!(session.ending_at.is_none());
     }
 }

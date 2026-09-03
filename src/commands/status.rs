@@ -67,6 +67,7 @@ pub fn run() -> Result<()> {
 fn state_text(state: SessionState) -> &'static str {
     match state {
         SessionState::Active => "active",
+        SessionState::Ending => "ending",
         SessionState::Recoverable => "recoverable",
     }
 }

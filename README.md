@@ -28,6 +28,7 @@ Supported terminal values:
 ```sh
 session-guard status
 session-guard restore
+session-guard restore --all
 session-guard daemon
 session-guard cargo-target -- cargo test -p my-crate
 session-guard uninstall
@@ -78,13 +79,18 @@ root terminal's `cli` meta — which is why only own-id metas count. Codex asks
 once to trust a new or changed hook at the next interactive launch; until
 approved, that hook does not run.
 
-A SessionEnd hook only retires a session when the recorded terminal shell is
-still alive — proof of an in-tab end (quit, `/clear`, `/resume` switching
-away). When the shell is already gone, the SessionEnd came from a GUI
-teardown (WindowServer death, logout) whose dying tools still flush their
-hooks; deregistering there would erase tabs that crash restore must reopen.
-Tabless (scan-tracked) sessions still deregister on SessionEnd, since a
-graceful end is the only cleanup they get.
+A SessionEnd hook says the session id is finished, not why: tools fire it for
+an in-tab end (quit, `/clear`, `/resume` switching away), for a tab closed
+with the tool inside (Cmd-W), and while the terminal itself is quitting or
+dying — and the tab's shell can be alive or dead at that instant in every one
+of those cases. So the hook only marks the record `ending`. About ten seconds
+later the daemon settles it: the tool or shell still running, or the terminal
+instance that owned the tab still up, means the user ended it and the record
+retires to `last-sessions.json`; a dead tab under a terminal that is gone (or
+was relaunched after the shell started) means a teardown and the record
+becomes recoverable, dated at its SessionEnd. Tabless (scan-tracked) sessions
+retire on SessionEnd directly, since a graceful end is the only cleanup they
+get.
 
 The daemon writes a heartbeat timestamp (`daemon-heartbeat`) after every
 monitor pass. At startup restore, a dead session still marked active counts
@@ -120,7 +126,12 @@ sessions still marked active on disk (no monitor witnessed them die) whose
 file (and whose tool *and* shell are dead). That brings back work that died
 with the previous daemon epoch without reopening observed closes when the
 daemon is merely restarted for an upgrade. **Manual** `session-guard restore`
-reopens every both-dead recoverable session.
+reopens the newest cluster of deaths: every both-dead session whose death
+(the monitor's mark, else its SessionEnd, else its last heartbeat) falls
+within 2 minutes of the newest such death, whether or not the monitor already
+marked it recoverable — the daemon usually outlives a terminal quit and has
+marked the victims by the time you ask. Older recoverable piles stay put;
+`session-guard restore --all` reopens every both-dead recoverable session.
 
 Restore runs before process scan so surviving headless workers cannot rewrite
 heartbeats. After a successful tab open the record stays recoverable until

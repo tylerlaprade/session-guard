@@ -125,6 +125,26 @@ impl ProcessSnapshot {
             .get(&pid)
             .is_some_and(|(start, _)| start == expected_start)
     }
+
+    /// Whether a process running `executable` (final path component,
+    /// lowercase) that started no later than `started_by` is still up. Tells a
+    /// tab closed under a living terminal from a terminal that went down with
+    /// its tabs: a terminal relaunched after the shell started cannot have
+    /// owned it. Without a comparable start, any instance counts.
+    pub fn instance_running_since(&self, executable: &str, started_by: Option<&str>) -> bool {
+        let deadline = started_by.and_then(parse_identity);
+        self.processes.values().any(|(start, comm)| {
+            comm.rsplit('/').next() == Some(executable)
+                && match (deadline, parse_identity(start)) {
+                    (Some(deadline), Some(start)) => start <= deadline,
+                    _ => true,
+                }
+        })
+    }
+}
+
+fn parse_identity(identity: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(identity, "%a %b %d %H:%M:%S %Y").ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,5 +282,31 @@ mod tests {
         assert!(snapshot.identity_matches(pid, &identity));
         assert!(!snapshot.identity_matches(pid, "Wed Jan 1 00:00:00 2020"));
         assert!(!snapshot.is_alive(-1));
+    }
+
+    #[test]
+    fn identities_parse_with_unpadded_days() {
+        let early = parse_identity("Thu Jul 2 09:03:01 2026").unwrap();
+        let late = parse_identity("Sat Jul 11 09:03:01 2026").unwrap();
+        assert!(early < late);
+        assert!(parse_identity("not a start time").is_none());
+    }
+
+    #[test]
+    fn instance_running_since_counts_only_processes_older_than_the_shell() {
+        let snapshot = ProcessSnapshot::capture().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        let own_start = process_start_identity(std::process::id() as i32).unwrap();
+
+        assert!(snapshot.instance_running_since(&executable, Some(&own_start)));
+        assert!(snapshot.instance_running_since(&executable, None));
+        assert!(snapshot.instance_running_since(&executable, Some("Fri Jan 1 00:00:00 2100")));
+        assert!(!snapshot.instance_running_since(&executable, Some("Wed Jan 1 00:00:00 2020")));
+        assert!(!snapshot.instance_running_since("no-such-terminal-xyz", None));
     }
 }
