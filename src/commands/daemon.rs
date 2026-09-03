@@ -143,6 +143,7 @@ pub fn run() -> Result<()> {
 
     let mut seconds_until_monitor = 60;
     let mut seconds_until_settle = SESSION_END_SETTLE_INTERVAL_SECS;
+    let mut terminal_watch = TerminalWatch::default();
     let mut monitor_cycles_until_cleanup = CARGO_TARGET_CLEANUP_MONITOR_CYCLES;
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
@@ -164,16 +165,25 @@ pub fn run() -> Result<()> {
 
         seconds_until_settle -= 1;
         if seconds_until_settle == 0 {
-            let summary = settle_endings()?;
-            if summary.retired > 0 || summary.marked_recoverable > 0 {
-                log_line(&format!(
-                    "settled {} ended sessions: {} retired, {} recoverable",
-                    summary.retired + summary.marked_recoverable,
-                    summary.retired,
-                    summary.marked_recoverable
-                ))?;
-            }
             seconds_until_settle = SESSION_END_SETTLE_INTERVAL_SECS;
+            if let Ok(processes) = ProcessSnapshot::capture() {
+                let summary = settle_endings(&processes)?;
+                if summary.retired > 0 || summary.marked_recoverable > 0 {
+                    log_line(&format!(
+                        "settled {} ended sessions: {} retired, {} recoverable",
+                        summary.retired + summary.marked_recoverable,
+                        summary.retired,
+                        summary.marked_recoverable
+                    ))?;
+                }
+                if terminal_returned_with_victims(&mut terminal_watch, &processes)? {
+                    let summary = restore_once(RestoreMode::Manual)?;
+                    log_line(&format!("terminal returned: {}", summary.message()))?;
+                    for error in &summary.errors {
+                        log_line(error)?;
+                    }
+                }
+            }
         }
 
         seconds_until_monitor -= 1;
@@ -265,7 +275,7 @@ pub fn reconcile_from_scan() -> Result<usize> {
 //   2 minutes of the newest such death. Observed-recoverable records count,
 //   because the daemon usually survives a terminal quit and has marked the
 //   victims by the time the user asks. Older recoverable piles stay put
-//   (2026-09-03: a Ghostty quit killed 5 tabs; the manual restore reopened
+//   (2026-09-03: a Ghostty crash killed 5 tabs; the manual restore reopened
 //   those plus 20 stale Codex/Grok records from the previous week).
 // - Manual restore --all: every both-dead recoverable session.
 // - Startup restore: only unobserved deaths in the crash cluster — sessions
@@ -288,11 +298,17 @@ pub fn reconcile_from_scan() -> Result<usize> {
 const LIVENESS_CLUSTER_WINDOW_SECS: i64 = 120;
 const RESTORE_COOLDOWN_SECS: i64 = 30 * 60;
 const RESTORED_SOURCE: &str = "restored";
-// A quitting terminal tears its tabs down one by one and can still be running
-// when the last tab's SessionEnd fires (Ghostty took six seconds on
-// 2026-09-03), so the aftermath is judged only after this grace.
+// A terminal quitting gracefully closes tabs one by one and can still be
+// running when a tab's SessionEnd fires; a crashed one is gone before the hooks
+// run and may already be back (2026-09-03: Ghostty died at :51, the hooks
+// fired at :52, its relaunch started at :55). The aftermath is judged only
+// after this grace, and only a terminal older than the shell counts as its
+// owner.
 const SESSION_END_GRACE_SECS: i64 = 10;
 const SESSION_END_SETTLE_INTERVAL_SECS: u32 = 5;
+// AppleScript into a terminal that is still launching fails or opens ghost
+// tabs, so a returned terminal is given this long before its tabs come back.
+const TERMINAL_RELAUNCH_SETTLE_SECS: i64 = 5;
 
 pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let path = paths::sessions_file()?;
@@ -540,7 +556,69 @@ fn remember(last_sessions_path: &std::path::Path, session: &SessionRecord) -> Re
     Ok(())
 }
 
-pub fn settle_endings() -> Result<SettleSummary> {
+// The terminal coming back after a teardown is the moment the user wants the
+// tabs back (2026-09-03: Ghostty crashed at 11:20:51, was relaunched at
+// 11:20:55, and the restore waited on a hand-typed command a minute later).
+// A relaunch shows as a new earliest start time among the terminal's
+// processes, or as none-then-some; the daemon's first observation is neither.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum TerminalWatch {
+    #[default]
+    Unobserved,
+    Observed(Option<chrono::NaiveDateTime>),
+}
+
+impl TerminalWatch {
+    /// The start time of a terminal instance that appeared since the previous
+    /// observation and has been up long enough to script. A younger instance
+    /// stays unrecorded so the next observation still sees the relaunch.
+    fn relaunched(
+        &mut self,
+        current: Option<chrono::NaiveDateTime>,
+        now: chrono::NaiveDateTime,
+    ) -> Option<chrono::NaiveDateTime> {
+        let Self::Observed(previous) = *self else {
+            *self = Self::Observed(current);
+            return None;
+        };
+        if previous == current {
+            return None;
+        }
+        let Some(started) = current else {
+            *self = Self::Observed(None);
+            return None;
+        };
+        if (now - started).num_seconds() < TERMINAL_RELAUNCH_SETTLE_SECS {
+            return None;
+        }
+        *self = Self::Observed(current);
+        Some(started)
+    }
+}
+
+// Restore on relaunch only when tabs died with the previous instance; a stale
+// pile alone must not reopen just because the terminal was reopened.
+fn terminal_returned_with_victims(
+    watch: &mut TerminalWatch,
+    processes: &ProcessSnapshot,
+) -> Result<bool> {
+    let Ok(terminal) = configured_terminal() else {
+        return Ok(false);
+    };
+    let now = chrono::Utc::now();
+    let Some(started_at) = watch.relaunched(
+        processes.instance_started_at(terminal.process_name()),
+        now.naive_utc(),
+    ) else {
+        return Ok(false);
+    };
+    let since = started_at.and_utc() - chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS);
+    Ok(sessions::read_sessions(&paths::sessions_file()?)?
+        .iter()
+        .any(|session| !session_shell_is_alive(session, processes) && death_time(session) >= since))
+}
+
+pub fn settle_endings(processes: &ProcessSnapshot) -> Result<SettleSummary> {
     let path = paths::sessions_file()?;
     let now = chrono::Utc::now();
     let _ = sessions::repair_if_corrupt(&path)?;
@@ -550,9 +628,6 @@ pub fn settle_endings() -> Result<SettleSummary> {
     {
         return Ok(SettleSummary::default());
     }
-    let Ok(processes) = ProcessSnapshot::capture() else {
-        return Ok(SettleSummary::default());
-    };
     let terminal = configured_terminal().ok();
     let last_sessions_path = paths::last_sessions_file()?;
 
@@ -566,7 +641,7 @@ pub fn settle_endings() -> Result<SettleSummary> {
             }
             match ending_verdict(
                 &session,
-                &processes,
+                processes,
                 terminal.map(TerminalKind::process_name),
             ) {
                 EndingVerdict::Retire => {
@@ -1028,6 +1103,46 @@ mod tests {
             &session,
             ending_at + Duration::seconds(SESSION_END_GRACE_SECS)
         ));
+    }
+
+    #[test]
+    fn terminal_watch_reports_a_relaunch_once_the_new_instance_can_be_scripted() {
+        let now = Utc::now().naive_utc();
+        let old = now - Duration::hours(2);
+        let fresh = now - Duration::seconds(TERMINAL_RELAUNCH_SETTLE_SECS - 1);
+        let settled = now - Duration::seconds(TERMINAL_RELAUNCH_SETTLE_SECS);
+        let mut watch = TerminalWatch::default();
+
+        // First observation and steady state are not relaunches.
+        assert_eq!(watch.relaunched(Some(old), now), None);
+        assert_eq!(watch.relaunched(Some(old), now), None);
+        // A younger instance is a relaunch, reported once it has settled.
+        assert_eq!(watch.relaunched(Some(fresh), now), None);
+        assert_eq!(watch.relaunched(Some(settled), now), Some(settled));
+        assert_eq!(watch.relaunched(Some(settled), now), None);
+    }
+
+    #[test]
+    fn terminal_watch_treats_none_then_some_as_a_relaunch() {
+        let now = Utc::now().naive_utc();
+        let back = now - Duration::minutes(1);
+        let mut watch = TerminalWatch::default();
+
+        assert_eq!(watch.relaunched(Some(back - Duration::hours(1)), now), None);
+        assert_eq!(watch.relaunched(None, now), None);
+        assert_eq!(watch.relaunched(None, now), None);
+        assert_eq!(watch.relaunched(Some(back), now), Some(back));
+    }
+
+    #[test]
+    fn terminal_watch_ignores_a_daemon_that_starts_with_no_terminal() {
+        let now = Utc::now().naive_utc();
+        let mut watch = TerminalWatch::default();
+        assert_eq!(watch.relaunched(None, now), None);
+        assert_eq!(
+            watch.relaunched(Some(now - Duration::minutes(1)), now),
+            Some(now - Duration::minutes(1))
+        );
     }
 
     #[test]

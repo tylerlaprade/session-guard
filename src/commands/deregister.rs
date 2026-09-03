@@ -37,7 +37,7 @@ pub fn run(session_id: Option<String>) -> Result<()> {
 // itself is going down — and at that instant the tab's shell can be alive or
 // dead in every one of those cases (2026-08-25 lost three live tabs because
 // the shells were already gone; 2026-09-03 lost four because the shells
-// outlived a quitting Ghostty by a second). So the hook only marks the record
+// outlived a crashed Ghostty by a second). So the hook only marks the record
 // ending; the daemon settles it once the aftermath is visible
 // (daemon::settle_endings). Tabless (scan-tracked) sessions carry no tab to
 // observe, so a graceful end is the only cleanup they get.

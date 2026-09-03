@@ -143,6 +143,19 @@ impl ProcessSnapshot {
     }
 }
 
+impl ProcessSnapshot {
+    /// Start time of the oldest running process of `executable`: the
+    /// terminal instance itself, with its per-surface helpers being younger.
+    /// A later value on a later snapshot means the terminal was relaunched.
+    pub fn instance_started_at(&self, executable: &str) -> Option<chrono::NaiveDateTime> {
+        self.processes
+            .values()
+            .filter(|(_, comm)| comm.rsplit('/').next() == Some(executable))
+            .filter_map(|(start, _)| parse_identity(start))
+            .min()
+    }
+}
+
 fn parse_identity(identity: &str) -> Option<chrono::NaiveDateTime> {
     chrono::NaiveDateTime::parse_from_str(identity, "%a %b %d %H:%M:%S %Y").ok()
 }

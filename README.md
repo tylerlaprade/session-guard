@@ -133,6 +133,14 @@ marked it recoverable — the daemon usually outlives a terminal quit and has
 marked the victims by the time you ask. Older recoverable piles stay put;
 `session-guard restore --all` reopens every both-dead recoverable session.
 
+The daemon also runs that same restore on its own when the configured
+terminal comes back: every five seconds it notes the start time of the
+oldest terminal process, and a newer start time (or none, then one) after a
+teardown that left dead tabs means the terminal relaunched. It waits five
+seconds after the relaunch before scripting it, and it does nothing when no
+tab died within two minutes of the new instance's start — reopening the
+terminal is not a reason to reopen an old pile.
+
 Restore runs before process scan so surviving headless workers cannot rewrite
 heartbeats. After a successful tab open the record stays recoverable until
 hooks re-register it live; a 30-minute cooldown prevents duplicate tabs.
