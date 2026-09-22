@@ -199,6 +199,8 @@ enum Command {
     },
     Status,
     #[command(hide = true)]
+    ShellStart,
+    #[command(hide = true)]
     Launch {
         #[arg(long)]
         session_id: String,
@@ -249,6 +251,7 @@ fn main() -> Result<()> {
         Command::InstallHooks => commands::install_hooks::run(),
         Command::Uninstall { purge } => commands::uninstall::run(purge),
         Command::Status => commands::status::run(),
+        Command::ShellStart => commands::shell_start::run(),
         Command::Launch { session_id } => commands::launch::run(&session_id),
         Command::LastSession { tool, shell_pid } => commands::last_session::run(tool, shell_pid),
         Command::Register {

@@ -1,5 +1,5 @@
 mod alacritty;
-mod ghostty;
+pub(crate) mod ghostty;
 mod iterm2;
 mod kitty;
 mod terminal_app;

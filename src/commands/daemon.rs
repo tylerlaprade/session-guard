@@ -8,6 +8,7 @@ use crate::sessions::{self, SessionRecord, SessionState};
 use crate::transcripts;
 use crate::{TerminalKind, Tool};
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::flag;
 use std::collections::BTreeMap;
@@ -278,6 +279,8 @@ const SESSION_END_SETTLE_INTERVAL_SECS: u32 = 5;
 const TERMINAL_RELAUNCH_SETTLE_SECS: i64 = 5;
 
 pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
+    let restore_lock = crate::commands::restore::lock()?;
+    restore_lock.lock_exclusive()?;
     let path = paths::sessions_file()?;
     let _ = sessions::repair_if_corrupt(&path)?;
     let fallback_sessions = if sessions::read_sessions(&path)?.is_empty() {
@@ -438,7 +441,7 @@ fn wait_for_restore_owner(path: &std::path::Path, session_id: &str) -> Result<()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndingVerdict {
+pub(crate) enum EndingVerdict {
     Retire,
     Recoverable,
 }
@@ -451,7 +454,7 @@ enum EndingVerdict {
 // the shell cannot have owned the tab, so a quick relaunch does not count.
 // Without a known terminal, err toward keeping: retirement is irreversible
 // and a recoverable record expires on its own.
-fn ending_verdict(
+pub(crate) fn ending_verdict(
     session: &SessionRecord,
     processes: &ProcessSnapshot,
     terminal_executable: Option<&str>,
@@ -541,7 +544,7 @@ fn terminal_returned_with_victims(
     Ok(has_victims)
 }
 
-fn needs_terminal_restore(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
+pub(crate) fn needs_terminal_restore(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
     (session.restore_pending || session.state != SessionState::Recoverable)
         && !session_is_alive(session, processes)
         && !session_shell_is_alive(session, processes)

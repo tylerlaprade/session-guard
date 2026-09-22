@@ -6,5 +6,6 @@ pub mod last_session;
 pub mod launch;
 pub mod register;
 pub mod restore;
+pub mod shell_start;
 pub mod status;
 pub mod uninstall;

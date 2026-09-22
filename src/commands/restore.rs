@@ -1,5 +1,20 @@
 use crate::commands::daemon::{self, RestoreMode};
 use anyhow::{Context, Result};
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+
+pub(crate) fn lock() -> Result<File> {
+    let directory = crate::paths::config_dir()?;
+    fs::create_dir_all(&directory)?;
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(directory.join("restore.lock"))
+        .context("failed to open restore lock")
+}
 
 pub fn run(all: bool) -> Result<()> {
     let (mode, signal) = if all {

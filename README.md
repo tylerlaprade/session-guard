@@ -114,6 +114,35 @@ Registry updates replace complete, synced snapshots under a stable lock.
 Pending records remain on disk throughout launch. A failed launch retains its
 recovery record and reports the failure.
 
+### Reusing Ghostty's first tab
+
+For zsh with Ghostty's native shell integration, put this near the end of
+`.zshrc`, before any plugin that must be sourced last:
+
+```zsh
+if [[ $ZSH_EVAL_CONTEXT == file && -o login && -o interactive &&
+      -z $ZSH_EXECUTION_STRING && $TERM_PROGRAM == ghostty ]] &&
+    (( ${+_ghostty_state} && _ghostty_state == 0 )); then
+    session-guard shell-start
+fi
+```
+
+The shell makes one attempt before its first prompt. It can claim one confirmed
+interruption from an earlier Ghostty instance only when it is Ghostty's sole
+terminal and has no queued input, including an unfinished line. The claim uses
+the same registry and launcher as ordinary restoration. A shared restore lock
+prevents the daemon and shell from opening the same session; a busy lock makes
+the shell skip reuse without waiting. The daemon restores the remaining sessions.
+
+Existing prompts, re-sourced configuration, subshells, multiple tabs or splits,
+unknown legacy records, and failed native lookups are never reclaimed. There is
+no polling of the prompt and no injected command or keystroke. Native lookup
+targets the running Ghostty PID without permission to reconnect or relaunch it.
+
+When session-guard itself launches Ghostty, it disables the default empty window
+for that launch only. The first restored session creates the first window.
+Neither path submits a continuation prompt to the agent.
+
 The daemon restores pending sessions when the terminal returns. An existing
 surviving terminal process or a missed process snapshot does not count as a
 relaunch. The short startup delay is only for terminal readiness.

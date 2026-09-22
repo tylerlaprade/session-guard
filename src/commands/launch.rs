@@ -19,27 +19,36 @@ pub fn run(session_id: &str) -> Result<()> {
         if daemon::session_is_alive(session, &processes) {
             bail!("session {session_id} already has a live owner");
         }
-        session.pid = Some(owner);
-        session.shell_pid = Some(owner);
-        session.pid_started_at = Some(owner_started.clone());
-        session.shell_pid_started_at = Some(owner_started.clone());
-        session.mark_active();
-        session.source = Some("restore-launch".to_string());
+        claim(session, owner, &owner_started);
         Ok(session.clone())
     })?;
+    run_claimed(&record)
+}
+
+pub(crate) fn claim(session: &mut SessionRecord, owner: i32, started: &str) {
+    session.pid = Some(owner);
+    session.shell_pid = Some(owner);
+    session.pid_started_at = Some(started.to_string());
+    session.shell_pid_started_at = Some(started.to_string());
+    session.mark_active();
+    session.source = Some("restore-launch".to_string());
+}
+
+pub(crate) fn run_claimed(record: &SessionRecord) -> Result<()> {
+    let owner = std::process::id();
     daemon::log_line(&format!(
         "restore owner registered: {} {} pid={owner}",
         record.tool, record.session_id
     ))?;
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-    let command = daemon::resume_command(&record);
+    let command = daemon::resume_command(record);
     let result = Command::new(shell)
         .args(["-ic", &command])
         .current_dir(&record.directory)
         .env("SESSION_GUARD_SHELL_PID", owner.to_string())
         .status();
     finish(
-        &record,
+        record,
         result.as_ref().is_ok_and(std::process::ExitStatus::success),
     )?;
     let status = result.context("failed to launch restored session")?;

@@ -190,7 +190,7 @@ impl ProcessSnapshot {
     }
 }
 
-fn parse_identity(identity: &str) -> Option<chrono::NaiveDateTime> {
+pub(crate) fn parse_identity(identity: &str) -> Option<chrono::NaiveDateTime> {
     chrono::NaiveDateTime::parse_from_str(identity, "%a %b %d %H:%M:%S %Y").ok()
 }
 

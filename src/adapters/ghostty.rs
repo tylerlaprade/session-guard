@@ -13,6 +13,23 @@ const SURFACE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct Ghostty;
 
+pub(crate) fn is_only_terminal(tty: &str) -> Result<bool> {
+    let mut command = Command::new("osascript");
+    command.args([
+        "-l",
+        "JavaScript",
+        "-e",
+        include_str!("ghostty_first_terminal.js"),
+        tty,
+    ]);
+    super::run_capture_timeout(
+        &mut command,
+        "checking first Ghostty terminal",
+        Duration::from_secs(2),
+    )
+    .map(|result| result == "true")
+}
+
 impl TerminalAdapter for Ghostty {
     fn open_tab(&self, directory: &Path, command: &str) -> Result<()> {
         if !self.is_running() {
@@ -60,7 +77,7 @@ end tell"#,
 
     fn launch(&self) -> Result<()> {
         let mut command = Command::new("open");
-        command.args(["-a", "Ghostty"]);
+        command.args(["-a", "Ghostty", "--args", "--initial-window=false"]);
         run_checked(command, "launching Ghostty")
     }
 }
