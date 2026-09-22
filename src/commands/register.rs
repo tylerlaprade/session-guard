@@ -64,6 +64,9 @@ pub fn run(
         .context(
             "missing session id; pass --session-id or run from a hook that provides session_id",
         )?;
+    if !explicit_session && crate::scan::is_unused_spare(tool, &session_id) {
+        return Ok(());
+    }
     let directory = directory
         .or_else(|| hook_input.as_ref().and_then(|input| input.cwd.clone()))
         .or_else(|| {

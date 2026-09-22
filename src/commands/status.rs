@@ -53,8 +53,7 @@ pub fn run() -> Result<()> {
             truncate(&session.directory.display().to_string(), 36),
             session
                 .pid
-                .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+                .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
             alive_text,
             shell_text,
             age(session.registered_at)

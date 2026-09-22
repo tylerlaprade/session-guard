@@ -35,7 +35,7 @@ pub fn shell_quote(value: &str) -> String {
 }
 
 pub fn applescript_quote(value: &str) -> String {
-    format!("{:?}", value)
+    format!("{value:?}")
 }
 
 pub fn shell_line(directory: &Path, command: &str) -> String {
@@ -65,7 +65,7 @@ pub fn run_checked_timeout(
 }
 
 /// Like `run_checked_timeout`, but returns trimmed stdout. Only for commands
-/// with small output (an AppleScript result): stdout is drained after exit,
+/// with small output (an `AppleScript` result): stdout is drained after exit,
 /// so output larger than the pipe buffer would deadlock the wait loop.
 pub fn run_capture_timeout(
     command: &mut std::process::Command,
@@ -82,28 +82,24 @@ pub fn run_capture_timeout(
         .with_context(|| format!("failed to spawn for {description}"))?;
     let start = Instant::now();
     loop {
-        match child
+        if let Some(status) = child
             .try_wait()
             .with_context(|| format!("failed to wait for {description}"))?
         {
-            Some(status) => {
-                let mut output = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = stdout.read_to_string(&mut output);
-                }
-                if !status.success() {
-                    anyhow::bail!("{description} failed with status {status}");
-                }
-                return Ok(output.trim().to_string());
+            let mut output = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                let _ = stdout.read_to_string(&mut output);
             }
-            None => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!("{description} timed out after {}s", timeout.as_secs());
-                }
-                thread::sleep(Duration::from_millis(50));
+            if !status.success() {
+                anyhow::bail!("{description} failed with status {status}");
             }
+            return Ok(output.trim().to_string());
         }
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("{description} timed out after {}s", timeout.as_secs());
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }

@@ -61,8 +61,7 @@ fn app_exists(name: &str) -> bool {
     Command::new("open")
         .args(["-Ra", name])
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 fn write_launch_agent() -> Result<()> {

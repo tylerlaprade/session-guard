@@ -22,6 +22,35 @@ pub fn pid_is_alive(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+pub fn boot_identifier() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buffer = [0_u8; 128];
+        let mut length = buffer.len();
+        if unsafe {
+            libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &raw mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return None;
+        }
+        String::from_utf8(buffer.get(..length)?.to_vec())
+            .ok()
+            .map(|value| value.trim_end_matches('\0').to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|value| value.trim().to_string())
+    }
+}
+
 pub fn process_command(pid: i32) -> Result<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -72,7 +101,7 @@ fn normalize_identity(raw: &str) -> String {
 /// One `ps` pass over every process, replacing per-PID spawns wherever many
 /// sessions are checked at once. The registry's exclusive file lock is held
 /// across those checks; per-PID `ps` calls there stall hook-driven
-/// register/deregister commands, and codex kills its SessionEnd hook after
+/// register/deregister commands, and codex kills its `SessionEnd` hook after
 /// one second.
 pub struct ProcessSnapshot {
     /// pid -> (start identity, lowercased command name)
@@ -146,7 +175,6 @@ impl ProcessSnapshot {
 impl ProcessSnapshot {
     /// Start time of the oldest running process of `executable`: the
     /// terminal instance itself, with its per-surface helpers being younger.
-    /// A later value on a later snapshot means the terminal was relaunched.
     pub fn instance_started_at(&self, executable: &str) -> Option<chrono::NaiveDateTime> {
         self.processes
             .values()
@@ -197,18 +225,16 @@ pub fn list_processes() -> Result<Vec<ProcInfo>> {
         let Some(pid_end) = line.find(char::is_whitespace) else {
             continue;
         };
-        let pid = match line[..pid_end].parse::<i32>() {
-            Ok(pid) => pid,
-            Err(_) => continue,
+        let Ok(pid) = line[..pid_end].parse::<i32>() else {
+            continue;
         };
 
         let rest = line[pid_end..].trim_start();
         let Some(ppid_end) = rest.find(char::is_whitespace) else {
             continue;
         };
-        let ppid = match rest[..ppid_end].parse::<i32>() {
-            Ok(ppid) => ppid,
-            Err(_) => continue,
+        let Ok(ppid) = rest[..ppid_end].parse::<i32>() else {
+            continue;
         };
 
         processes.push(ProcInfo {
@@ -222,9 +248,9 @@ pub fn list_processes() -> Result<Vec<ProcInfo>> {
 }
 
 pub fn command_exists(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|path| is_executable(path.join(name))))
-        .unwrap_or(false)
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|path| is_executable(path.join(name)))
+    })
 }
 
 fn is_executable(path: impl AsRef<std::path::Path>) -> bool {
@@ -237,8 +263,7 @@ fn is_executable(path: impl AsRef<std::path::Path>) -> bool {
     {
         use std::os::unix::fs::PermissionsExt;
         path.metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
     }
 
     #[cfg(not(unix))]
@@ -248,7 +273,7 @@ fn is_executable(path: impl AsRef<std::path::Path>) -> bool {
 }
 
 pub fn app_is_running(app_name: &str) -> bool {
-    let script = format!("application {:?} is running", app_name);
+    let script = format!("application {app_name:?} is running");
     Command::new("osascript")
         .args(["-e", &script])
         .output()
@@ -266,8 +291,7 @@ pub fn cli_process_is_running(process_name: &str) -> bool {
     Command::new("pgrep")
         .args(["-x", process_name])
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(test)]

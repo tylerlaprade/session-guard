@@ -254,7 +254,9 @@ pub fn reconcile_from_scan() -> Result<usize> {
                 .find(|session| session.session_id == scanned_session.session_id)
             {
                 existing.pid = scanned_session.pid;
-                existing.pid_started_at = scanned_session.pid_started_at.clone();
+                existing
+                    .pid_started_at
+                    .clone_from(&scanned_session.pid_started_at);
                 existing.mark_active();
             } else {
                 sessions.push(scanned_session);
@@ -313,14 +315,22 @@ const TERMINAL_RELAUNCH_SETTLE_SECS: i64 = 5;
 pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let path = paths::sessions_file()?;
     let _ = sessions::repair_if_corrupt(&path)?;
-    let fallback_sessions = transcripts::discover_recent_sessions().unwrap_or_default();
+    let fallback_sessions = if sessions::read_sessions(&path)?.is_empty() {
+        transcripts::discover_recent_sessions().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let now = chrono::Utc::now();
     // The previous epoch's final observation, read before this epoch starts
     // writing its own heartbeats.
-    let previous_heartbeat = match mode {
+    let heartbeat = match mode {
         RestoreMode::Startup => read_daemon_heartbeat(),
         RestoreMode::Manual | RestoreMode::All => None,
     };
+    let previous_heartbeat = heartbeat.as_ref().map(|value| value.timestamp);
+    let rebooted = heartbeat
+        .as_ref()
+        .is_some_and(|value| value.boot_changed(process::boot_identifier().as_deref()));
     // One ps pass for every liveness check below: per-PID ps calls under the
     // exclusive sessions lock stall hook-driven register/deregister (codex
     // kills its SessionEnd hook after one second).
@@ -377,6 +387,15 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 continue;
             }
 
+            if scan::is_unused_spare(session.tool, &session.session_id) {
+                log_line(&format!(
+                    "skipped unused spare: {} {}",
+                    session.tool, session.session_id
+                ))?;
+                alive_kept.push(session);
+                continue;
+            }
+
             if !session.directory.is_dir() {
                 summary.pruned_missing_dirs += 1;
                 continue;
@@ -384,11 +403,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
 
             session.mark_recoverable();
 
-            // Already recoverable on disk ⇒ a previous epoch's monitor saw
-            // this session die — an observed close, not one that fell with
-            // the epoch. A daemon upgrade/restart must not resurrect it.
-            // Manual restore still offers it.
-            if mode == RestoreMode::Startup && was_recoverable {
+            if mode == RestoreMode::Startup && was_recoverable && !rebooted {
                 alive_kept.push(session);
                 continue;
             }
@@ -406,8 +421,8 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             }
 
             let anchor = match mode {
-                RestoreMode::Startup => session.last_seen_at,
-                RestoreMode::Manual | RestoreMode::All => death_time,
+                RestoreMode::Startup if !was_recoverable => session.last_seen_at,
+                RestoreMode::Startup | RestoreMode::Manual | RestoreMode::All => death_time,
             };
             if outside_death_cluster(anchor, cluster_cutoff, previous_heartbeat) {
                 // Older recoverable pile (earlier intentional closes, etc.)
@@ -419,7 +434,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
         }
 
         // Hold only non-opening sessions while tabs are opened outside the lock.
-        *sessions = alive_kept.clone();
+        sessions.clone_from(&alive_kept);
         Ok((summary, alive_kept, to_open))
     })?;
 
@@ -439,6 +454,10 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             .open_tab(&session.directory, &command)
         {
             Ok(()) => {
+                log_line(&format!(
+                    "opened restore tab: {} {}",
+                    session.tool, session.session_id
+                ))?;
                 summary.record_restore(session.tool);
                 session.source = Some(RESTORED_SOURCE.to_string());
                 session.last_seen_at = now;
@@ -556,43 +575,34 @@ fn remember(last_sessions_path: &std::path::Path, session: &SessionRecord) -> Re
     Ok(())
 }
 
-// The terminal coming back after a teardown is the moment the user wants the
-// tabs back (2026-09-03: Ghostty crashed at 11:20:51, was relaunched at
-// 11:20:55, and the restore waited on a hand-typed command a minute later).
-// A relaunch shows as a new earliest start time among the terminal's
-// processes, or as none-then-some; the daemon's first observation is neither.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum TerminalWatch {
-    #[default]
-    Unobserved,
-    Observed(Option<chrono::NaiveDateTime>),
+struct TerminalWatch {
+    observed_at: Option<chrono::NaiveDateTime>,
+    current: Option<chrono::NaiveDateTime>,
+    pending: Option<chrono::NaiveDateTime>,
 }
 
 impl TerminalWatch {
-    /// The start time of a terminal instance that appeared since the previous
-    /// observation and has been up long enough to script. A younger instance
-    /// stays unrecorded so the next observation still sees the relaunch.
     fn relaunched(
         &mut self,
         current: Option<chrono::NaiveDateTime>,
         now: chrono::NaiveDateTime,
     ) -> Option<chrono::NaiveDateTime> {
-        let Self::Observed(previous) = *self else {
-            *self = Self::Observed(current);
+        let Some(observed_at) = self.observed_at.replace(now) else {
+            self.current = current;
             return None;
         };
-        if previous == current {
-            return None;
+        if self.current != current {
+            self.current = current;
+            self.pending = current.filter(|started| {
+                started.and_utc().timestamp() >= observed_at.and_utc().timestamp()
+            });
         }
-        let Some(started) = current else {
-            *self = Self::Observed(None);
-            return None;
-        };
+        let started = self.pending?;
         if (now - started).num_seconds() < TERMINAL_RELAUNCH_SETTLE_SECS {
             return None;
         }
-        *self = Self::Observed(current);
-        Some(started)
+        self.pending.take()
     }
 }
 
@@ -613,9 +623,15 @@ fn terminal_returned_with_victims(
         return Ok(false);
     };
     let since = started_at.and_utc() - chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS);
-    Ok(sessions::read_sessions(&paths::sessions_file()?)?
+    let has_victims = sessions::read_sessions(&paths::sessions_file()?)?
         .iter()
-        .any(|session| !session_shell_is_alive(session, processes) && death_time(session) >= since))
+        .any(|session| !session_shell_is_alive(session, processes) && death_time(session) >= since);
+    if has_victims {
+        log_line(&format!(
+            "terminal relaunch detected: {terminal}, started at {started_at} UTC"
+        ))?;
+    }
+    Ok(has_victims)
 }
 
 pub fn settle_endings(processes: &ProcessSnapshot) -> Result<SettleSummary> {
@@ -660,18 +676,38 @@ pub fn settle_endings(processes: &ProcessSnapshot) -> Result<SettleSummary> {
     })
 }
 
-fn read_daemon_heartbeat() -> Option<chrono::DateTime<chrono::Utc>> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DaemonHeartbeat {
+    timestamp: chrono::DateTime<chrono::Utc>,
+    boot_id: Option<String>,
+}
+
+impl DaemonHeartbeat {
+    fn boot_changed(&self, current: Option<&str>) -> bool {
+        matches!((self.boot_id.as_deref(), current), (Some(previous), Some(current)) if previous != current)
+    }
+}
+
+fn read_daemon_heartbeat() -> Option<DaemonHeartbeat> {
     let path = paths::daemon_heartbeat().ok()?;
     let contents = fs::read_to_string(path).ok()?;
-    chrono::DateTime::parse_from_rfc3339(contents.trim())
-        .ok()
-        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+    serde_json::from_str(&contents).ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc3339(contents.trim())
+            .ok()
+            .map(|timestamp| DaemonHeartbeat {
+                timestamp: timestamp.with_timezone(&chrono::Utc),
+                boot_id: None,
+            })
+    })
 }
 
 fn write_daemon_heartbeat() -> Result<()> {
     fs::write(
         paths::daemon_heartbeat()?,
-        format!("{}\n", chrono::Utc::now().to_rfc3339()),
+        serde_json::to_vec(&DaemonHeartbeat {
+            timestamp: chrono::Utc::now(),
+            boot_id: process::boot_identifier(),
+        })?,
     )
     .context("failed to write daemon heartbeat")
 }
@@ -951,6 +987,22 @@ mod tests {
     }
 
     #[test]
+    fn a_reboot_is_distinct_from_a_daemon_restart() {
+        let heartbeat = DaemonHeartbeat {
+            timestamp: Utc::now(),
+            boot_id: Some("previous-boot".to_string()),
+        };
+        assert!(heartbeat.boot_changed(Some("new-boot")));
+        assert!(!heartbeat.boot_changed(Some("previous-boot")));
+        assert!(!heartbeat.boot_changed(None));
+        let legacy = DaemonHeartbeat {
+            timestamp: Utc::now(),
+            boot_id: None,
+        };
+        assert!(!legacy.boot_changed(Some("new-boot")));
+    }
+
+    #[test]
     fn startup_clusters_admit_idle_sessions_frozen_at_the_dead_monitors_tick() {
         // The 2026-08-25 incident: the daemon died at 11:24:14 while Grok Stop
         // hooks kept heartbeating until 11:52. Idle Claude/Codex sessions froze
@@ -1106,32 +1158,59 @@ mod tests {
     }
 
     #[test]
+    fn terminal_watch_does_not_treat_an_existing_survivor_as_a_relaunch() {
+        let now = Utc::now().naive_utc();
+        let old = now - Duration::hours(2);
+        let survivor = now - Duration::hours(1);
+        let mut watch = TerminalWatch::default();
+        assert_eq!(watch.relaunched(Some(old), now), None);
+        assert_eq!(
+            watch.relaunched(Some(survivor), now + Duration::seconds(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_watch_does_not_treat_a_missing_snapshot_as_a_relaunch() {
+        let now = Utc::now().naive_utc();
+        let old = now - Duration::hours(2);
+        let mut watch = TerminalWatch::default();
+        assert_eq!(watch.relaunched(Some(old), now), None);
+        assert_eq!(watch.relaunched(None, now + Duration::seconds(5)), None);
+        assert_eq!(
+            watch.relaunched(Some(old), now + Duration::seconds(10)),
+            None
+        );
+    }
+
+    #[test]
     fn terminal_watch_reports_a_relaunch_once_the_new_instance_can_be_scripted() {
         let now = Utc::now().naive_utc();
         let old = now - Duration::hours(2);
-        let fresh = now - Duration::seconds(TERMINAL_RELAUNCH_SETTLE_SECS - 1);
-        let settled = now - Duration::seconds(TERMINAL_RELAUNCH_SETTLE_SECS);
+        let fresh = now + Duration::seconds(1);
         let mut watch = TerminalWatch::default();
 
-        // First observation and steady state are not relaunches.
         assert_eq!(watch.relaunched(Some(old), now), None);
         assert_eq!(watch.relaunched(Some(old), now), None);
-        // A younger instance is a relaunch, reported once it has settled.
-        assert_eq!(watch.relaunched(Some(fresh), now), None);
-        assert_eq!(watch.relaunched(Some(settled), now), Some(settled));
-        assert_eq!(watch.relaunched(Some(settled), now), None);
+        assert_eq!(watch.relaunched(Some(fresh), fresh), None);
+        let settled_at = fresh + Duration::seconds(TERMINAL_RELAUNCH_SETTLE_SECS);
+        assert_eq!(watch.relaunched(Some(fresh), settled_at), Some(fresh));
+        assert_eq!(watch.relaunched(Some(fresh), settled_at), None);
     }
 
     #[test]
     fn terminal_watch_treats_none_then_some_as_a_relaunch() {
         let now = Utc::now().naive_utc();
-        let back = now - Duration::minutes(1);
+        let back = now + Duration::seconds(1);
         let mut watch = TerminalWatch::default();
 
         assert_eq!(watch.relaunched(Some(back - Duration::hours(1)), now), None);
         assert_eq!(watch.relaunched(None, now), None);
         assert_eq!(watch.relaunched(None, now), None);
-        assert_eq!(watch.relaunched(Some(back), now), Some(back));
+        assert_eq!(
+            watch.relaunched(Some(back), back + Duration::seconds(5)),
+            Some(back)
+        );
     }
 
     #[test]
@@ -1140,8 +1219,8 @@ mod tests {
         let mut watch = TerminalWatch::default();
         assert_eq!(watch.relaunched(None, now), None);
         assert_eq!(
-            watch.relaunched(Some(now - Duration::minutes(1)), now),
-            Some(now - Duration::minutes(1))
+            watch.relaunched(Some(now), now + Duration::seconds(5)),
+            Some(now)
         );
     }
 

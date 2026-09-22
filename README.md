@@ -92,8 +92,11 @@ becomes recoverable, dated at its SessionEnd. Tabless (scan-tracked) sessions
 retire on SessionEnd directly, since a graceful end is the only cleanup they
 get.
 
-The daemon writes a heartbeat timestamp (`daemon-heartbeat`) after every
-monitor pass. At startup restore, a dead session still marked active counts
+The daemon writes a heartbeat with the operating system's boot identifier
+(`daemon-heartbeat`) after every monitor pass. A changed boot identifier
+allows recent shutdown victims to restore even if the old daemon had already
+marked them recoverable. Restarting only the daemon does not do this.
+At startup restore, a dead session still marked active counts
 as a crash victim when its `last_seen` sits near either the newest recorded
 activity or that final heartbeat. The second anchor matters because jetsam
 usually kills the daemon before the tools: busy sessions keep advancing
@@ -125,7 +128,12 @@ sessions still marked active on disk (no monitor witnessed them die) whose
 `last_seen_at` falls within 2 minutes of the newest heartbeat already in the
 file (and whose tool *and* shell are dead). That brings back work that died
 with the previous daemon epoch without reopening observed closes when the
-daemon is merely restarted for an upgrade. **Manual** `session-guard restore`
+daemon is merely restarted for an upgrade. After a system reboot, recent
+observed deaths are also eligible using their recorded death time.
+Claude workers explicitly marked `dispatch.source = "spare"` in Claude's
+native daemon roster are excluded from discovery and restoration. Dispatched
+background workers remain eligible, regardless of their conversation contents.
+**Manual** `session-guard restore`
 reopens the newest cluster of deaths: every both-dead session whose death
 (the monitor's mark, else its SessionEnd, else its last heartbeat) falls
 within 2 minutes of the newest such death, whether or not the monitor already
@@ -135,8 +143,9 @@ marked the victims by the time you ask. Older recoverable piles stay put;
 
 The daemon also runs that same restore on its own when the configured
 terminal comes back: every five seconds it notes the start time of the
-oldest terminal process, and a newer start time (or none, then one) after a
-teardown that left dead tabs means the terminal relaunched. It waits five
+oldest terminal process. A changed instance must have started since the
+previous observation to count as a relaunch. An older surviving instance
+or a missed snapshot does not trigger restoration. It waits five
 seconds after the relaunch before scripting it, and it does nothing when no
 tab died within two minutes of the new instance's start — reopening the
 terminal is not a reason to reopen an old pile.

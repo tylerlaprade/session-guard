@@ -29,6 +29,9 @@ pub fn discover_sessions(processes: &[ProcInfo]) -> Result<Vec<SessionRecord>> {
             let Some(session_id) = session_id_from_process(process) else {
                 continue;
             };
+            if is_unused_spare(tool, &session_id) {
+                continue;
+            }
             let Some((directory, transcript_path)) =
                 resolve_session(tool, &session_id).unwrap_or_default()
             else {
@@ -53,6 +56,45 @@ pub fn discover_sessions(processes: &[ProcInfo]) -> Result<Vec<SessionRecord>> {
     }
 
     Ok(records)
+}
+
+pub fn is_unused_spare(tool: Tool, session_id: &str) -> bool {
+    tool.spec()
+        .is_unused_spare
+        .is_some_and(|check| paths::tool_home(tool).is_ok_and(|home| check(&home, session_id)))
+}
+
+pub(crate) fn claude_is_unused_spare(home: &std::path::Path, session_id: &str) -> bool {
+    if is_uuid(session_id)
+        && let Ok(file) =
+            std::fs::File::open(home.join("jobs").join(&session_id[..8]).join("state.json"))
+        && let Ok(job) = serde_json::from_reader::<_, serde_json::Value>(file)
+        && job.get("sessionId").and_then(serde_json::Value::as_str) == Some(session_id)
+        && job
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(home.join("daemon/roster.json")) else {
+        return false;
+    };
+    let Ok(roster) = serde_json::from_reader::<_, serde_json::Value>(file) else {
+        return false;
+    };
+    roster
+        .get("workers")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|workers| {
+            workers.values().any(|worker| {
+                worker.get("sessionId").and_then(serde_json::Value::as_str) == Some(session_id)
+                    && worker
+                        .pointer("/dispatch/source")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("spare")
+            })
+        })
 }
 
 fn resolve_session(tool: Tool, session_id: &str) -> Result<Option<(PathBuf, PathBuf)>> {
@@ -152,6 +194,58 @@ mod tests {
     use super::*;
 
     const SESSION_ID: &str = "7a248d2c-865f-4829-af1b-2bee5f0c2b48";
+
+    #[test]
+    fn only_an_explicit_unused_spare_is_excluded() {
+        let home = tempfile::tempdir().unwrap();
+        let daemon = home.path().join("daemon");
+        std::fs::create_dir(&daemon).unwrap();
+        for source in ["spare", "slash", "fleet", "shell", "respawn"] {
+            let roster = serde_json::json!({"workers": {"worker": {
+                "sessionId": SESSION_ID,
+                "dispatch": {"source": source},
+                "ptySock": "/tmp/spare/worker.sock"
+            }}});
+            std::fs::write(daemon.join("roster.json"), roster.to_string()).unwrap();
+            assert_eq!(
+                claude_is_unused_spare(home.path(), SESSION_ID),
+                source == "spare"
+            );
+            assert!(!claude_is_unused_spare(home.path(), "different-session"));
+        }
+    }
+
+    #[test]
+    fn missing_or_unknown_native_status_does_not_discard_a_session() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!claude_is_unused_spare(home.path(), SESSION_ID));
+        std::fs::create_dir(home.path().join("daemon")).unwrap();
+        std::fs::write(home.path().join("daemon/roster.json"), "{").unwrap();
+        assert!(!claude_is_unused_spare(home.path(), SESSION_ID));
+    }
+
+    #[test]
+    fn a_spare_promoted_into_a_native_job_is_preserved() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("daemon")).unwrap();
+        std::fs::write(
+            home.path().join("daemon/roster.json"),
+            serde_json::json!({"workers": {"worker": {
+                "sessionId": SESSION_ID, "dispatch": {"source": "spare"}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(claude_is_unused_spare(home.path(), SESSION_ID));
+        let job = home.path().join("jobs").join(&SESSION_ID[..8]);
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::write(
+            job.join("state.json"),
+            serde_json::json!({"sessionId": SESSION_ID, "state": "running"}).to_string(),
+        )
+        .unwrap();
+        assert!(!claude_is_unused_spare(home.path(), SESSION_ID));
+    }
 
     fn proc(command: &str) -> ProcInfo {
         ProcInfo {

@@ -279,6 +279,7 @@ pub struct Harness {
     pub integration: Integration,
     /// Recovers a live session id from a process that never fired a hook.
     pub session_id_from_process: Option<fn(&ProcInfo) -> Option<String>>,
+    pub is_unused_spare: Option<fn(&Path, &str) -> bool>,
     /// Environment variable a live session exports carrying its own id.
     pub session_id_env: Option<&'static str>,
     /// Recognizes the harness's own process. Defaults to matching `binary`
@@ -317,6 +318,7 @@ pub static HARNESSES: &[Harness] = &[
         session_id_env: Some("CLAUDE_CODE_SESSION_ID"),
         identifies_process: Some(crate::scan::is_claude_session_process),
         session_id_from_process: Some(crate::scan::claude_session_id_from_process),
+        is_unused_spare: Some(crate::scan::claude_is_unused_spare),
         install_note: None,
     },
     Harness {
@@ -353,6 +355,7 @@ pub static HARNESSES: &[Harness] = &[
         session_id_env: Some("CODEX_THREAD_ID"),
         identifies_process: None,
         session_id_from_process: None,
+        is_unused_spare: None,
         install_note: Some(
             "Codex asks once to trust new or changed hooks on the next interactive launch; they do not run until approved.",
         ),
@@ -387,6 +390,7 @@ pub static HARNESSES: &[Harness] = &[
         session_id_env: Some("GROK_SESSION_ID"),
         identifies_process: None,
         session_id_from_process: None,
+        is_unused_spare: None,
         install_note: None,
     },
     Harness {
@@ -414,6 +418,7 @@ pub static HARNESSES: &[Harness] = &[
         session_id_env: None,
         identifies_process: None,
         session_id_from_process: None,
+        is_unused_spare: None,
         install_note: None,
     },
 ];

@@ -25,6 +25,7 @@ pub fn discover_recent_sessions() -> Result<Vec<SessionRecord>> {
             Discovery::Opaque => {}
         }
     }
+    sessions.retain(|session| !crate::scan::is_unused_spare(session.tool, &session.session_id));
     Ok(sessions)
 }
 

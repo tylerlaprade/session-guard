@@ -178,7 +178,7 @@ fn install_toml_hooks(
     deregister: &str,
 ) -> Result<HookChange> {
     let mut root = read_toml_config(path)?;
-    let mut changed = remove_toml_hook_commands(&mut root, old_hook_commands())?;
+    let mut changed = remove_toml_hook_commands(&mut root, old_hook_commands());
 
     for event in events {
         changed |= ensure_toml_hook(
@@ -202,7 +202,7 @@ fn remove_toml_hooks(path: &Path) -> Result<HookChange> {
     }
 
     let mut root = read_toml_config(path)?;
-    let changed = remove_toml_hook_commands(&mut root, &all_hook_commands())?;
+    let changed = remove_toml_hook_commands(&mut root, &all_hook_commands());
 
     if changed {
         write_toml_config(path, &root)?;
@@ -292,9 +292,7 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<bool> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
 }
 
 fn read_json_config(path: &Path) -> Result<JsonValue> {
@@ -405,15 +403,13 @@ fn json_event_has_command(event_hooks: &[JsonValue], command: &str) -> bool {
         group
             .get("hooks")
             .and_then(JsonValue::as_array)
-            .map(|hooks| {
+            .is_some_and(|hooks| {
                 hooks.iter().any(|hook| {
                     hook.get("command")
                         .and_then(JsonValue::as_str)
-                        .map(|existing| existing == command)
-                        .unwrap_or(false)
+                        .is_some_and(|existing| existing == command)
                 })
             })
-            .unwrap_or(false)
     })
 }
 
@@ -437,8 +433,7 @@ fn remove_json_hook_commands(root: &mut JsonValue, commands: &[&str]) -> bool {
             inner_hooks.retain(|hook| {
                 hook.get("command")
                     .and_then(JsonValue::as_str)
-                    .map(|command| !commands.contains(&command))
-                    .unwrap_or(true)
+                    .is_none_or(|command| !commands.contains(&command))
             });
             changed |= inner_hooks.len() != before;
         }
@@ -448,19 +443,14 @@ fn remove_json_hook_commands(root: &mut JsonValue, commands: &[&str]) -> bool {
             group
                 .get("hooks")
                 .and_then(JsonValue::as_array)
-                .map(|hooks| !hooks.is_empty())
-                .unwrap_or(true)
+                .is_none_or(|hooks| !hooks.is_empty())
         });
         changed |= event_hooks.len() != before;
     }
 
     let empty_events: Vec<String> = hooks
         .iter()
-        .filter(|(_, value)| {
-            value
-                .as_array()
-                .is_some_and(|event_hooks| event_hooks.is_empty())
-        })
+        .filter(|(_, value)| value.as_array().is_some_and(std::vec::Vec::is_empty))
         .map(|(event, _)| event.clone())
         .collect();
     for event in empty_events {
@@ -563,21 +553,19 @@ fn toml_event_has_command(event_hooks: &[TomlValue], command: &str) -> bool {
         group
             .get("hooks")
             .and_then(TomlValue::as_array)
-            .map(|hooks| {
+            .is_some_and(|hooks| {
                 hooks.iter().any(|hook| {
                     hook.get("command")
                         .and_then(TomlValue::as_str)
-                        .map(|existing| existing == command)
-                        .unwrap_or(false)
+                        .is_some_and(|existing| existing == command)
                 })
             })
-            .unwrap_or(false)
     })
 }
 
-fn remove_toml_hook_commands(root: &mut TomlValue, commands: &[&str]) -> Result<bool> {
+fn remove_toml_hook_commands(root: &mut TomlValue, commands: &[&str]) -> bool {
     let Some(hooks) = root.get_mut("hooks").and_then(TomlValue::as_table_mut) else {
-        return Ok(false);
+        return false;
     };
 
     let mut changed = false;
@@ -595,8 +583,7 @@ fn remove_toml_hook_commands(root: &mut TomlValue, commands: &[&str]) -> Result<
             inner_hooks.retain(|hook| {
                 hook.get("command")
                     .and_then(TomlValue::as_str)
-                    .map(|command| !commands.contains(&command))
-                    .unwrap_or(true)
+                    .is_none_or(|command| !commands.contains(&command))
             });
             changed |= inner_hooks.len() != before;
         }
@@ -606,19 +593,14 @@ fn remove_toml_hook_commands(root: &mut TomlValue, commands: &[&str]) -> Result<
             group
                 .get("hooks")
                 .and_then(TomlValue::as_array)
-                .map(|hooks| !hooks.is_empty())
-                .unwrap_or(true)
+                .is_none_or(|hooks| !hooks.is_empty())
         });
         changed |= event_hooks.len() != before;
     }
 
     let empty_events: Vec<String> = hooks
         .iter()
-        .filter(|(_, value)| {
-            value
-                .as_array()
-                .is_some_and(|event_hooks| event_hooks.is_empty())
-        })
+        .filter(|(_, value)| value.as_array().is_some_and(std::vec::Vec::is_empty))
         .map(|(event, _)| event.clone())
         .collect();
     for event in empty_events {
@@ -626,7 +608,7 @@ fn remove_toml_hook_commands(root: &mut TomlValue, commands: &[&str]) -> Result<
         changed = true;
     }
 
-    Ok(changed)
+    changed
 }
 
 fn toml_table_mut<'a>(

@@ -122,6 +122,7 @@ pub enum TerminalKind {
 }
 
 impl TerminalKind {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ghostty => "ghostty",
@@ -237,7 +238,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Daemon => commands::daemon::run(),
-        Command::CargoTarget { command } => cargo_targets::run(command),
+        Command::CargoTarget { command } => cargo_targets::run(&command),
         Command::Install { terminal } => commands::install::run(terminal),
         Command::InstallHooks => commands::install_hooks::run(),
         Command::Uninstall { purge } => commands::uninstall::run(purge),

@@ -156,8 +156,7 @@ impl SessionRecord {
 
     pub fn recoverable_expired(&self) -> bool {
         self.recoverable_until
-            .map(|until| until < Utc::now())
-            .unwrap_or(false)
+            .is_some_and(|until| until < Utc::now())
     }
 }
 

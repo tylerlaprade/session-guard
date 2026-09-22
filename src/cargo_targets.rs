@@ -116,7 +116,7 @@ impl CacheRemovalPlan {
     }
 }
 
-pub fn run(command: Vec<OsString>) -> Result<()> {
+pub fn run(command: &[OsString]) -> Result<()> {
     let owner = resolve_owner()?;
     let (target_dir, _lease) = acquire_owned_target(&paths::cargo_targets_dir()?, &owner)?;
 
@@ -346,7 +346,7 @@ fn update_owned_target(owner_dir: &Path, owner: &ResolvedOwner) -> Result<PathBu
         owner_session_id: owner.owner_session_id.clone(),
         tool: owner.tool,
         owner_process: owner.process.clone(),
-        created_at: existing.map(|marker| marker.created_at).unwrap_or(now),
+        created_at: existing.map_or(now, |marker| marker.created_at),
         last_used_at: now,
     };
     write_marker(&marker_path, &marker)?;
@@ -562,8 +562,7 @@ fn read_valid_marker(path: &Path, tool: Tool, session_id: &str) -> Option<OwnedT
 
 fn is_real_directory(path: &Path) -> bool {
     fs::symlink_metadata(path)
-        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-        .unwrap_or(false)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
 }
 
 fn validate_session_id(session_id: &str) -> Result<()> {
