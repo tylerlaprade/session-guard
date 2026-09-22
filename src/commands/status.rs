@@ -49,7 +49,11 @@ pub fn run() -> Result<()> {
             "{:<12} {:<8} {:<11} {:<36} {:>7} {:<17} {:<17} {:>8}",
             truncate(&session.session_id, 12),
             session.tool,
-            state_text(session.state),
+            if session.restore_pending {
+                "pending"
+            } else {
+                state_text(session.state)
+            },
             truncate(&session.directory.display().to_string(), 36),
             session
                 .pid

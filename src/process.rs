@@ -111,7 +111,7 @@ pub struct ProcessSnapshot {
 impl ProcessSnapshot {
     pub fn capture() -> Result<Self> {
         let output = Command::new("ps")
-            .args(["-axww", "-o", "pid=,lstart=,comm="])
+            .args(["-axww", "-o", "pid=,lstart=,stat=,comm="])
             .env("LC_ALL", "C")
             .env("TZ", "UTC")
             .output()
@@ -130,6 +130,12 @@ impl ProcessSnapshot {
             // lstart is always five fields: "Wed Jul  2 09:03:01 2026".
             let start: Vec<&str> = parts.by_ref().take(5).collect();
             if start.len() < 5 {
+                continue;
+            }
+            let Some(state) = parts.next() else {
+                continue;
+            };
+            if state.starts_with('Z') {
                 continue;
             }
             let comm = parts.collect::<Vec<_>>().join(" ").to_ascii_lowercase();

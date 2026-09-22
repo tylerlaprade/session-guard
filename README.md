@@ -16,7 +16,7 @@ Supported terminal values:
 
 | Value | Restore behavior |
 | --- | --- |
-| `ghostty` | Opens tabs in Ghostty via its native AppleScript scripting dictionary (`new tab with configuration`). No keystroke automation, so no Accessibility permission is needed. A wedged Ghostty can return a tab id yet never start the surface process (a permanent "ghost" tab, seen under memory pressure); restore polls the new surface's working directory — reported once the shell starts, via Ghostty's default shell integration — and counts a tab that never starts as a failed restore, so the session keeps no restore cooldown and stays retryable. |
+| `ghostty` | Opens tabs in Ghostty via its native AppleScript scripting dictionary (`new tab with configuration`). No keystroke automation, so no Accessibility permission is needed. Restoration waits for the surface to start and for its launcher to register a live owner. Failed launches remain pending. |
 | `iterm2` | Opens tabs in the current iTerm2 window. |
 | `terminal` | Uses Terminal.app `do script`. |
 | `kitty` | Uses `kitty @ launch --type=tab`. |
@@ -92,67 +92,40 @@ becomes recoverable, dated at its SessionEnd. Tabless (scan-tracked) sessions
 retire on SessionEnd directly, since a graceful end is the only cleanup they
 get.
 
-The daemon writes a heartbeat with the operating system's boot identifier
-(`daemon-heartbeat`) after every monitor pass. A changed boot identifier
-allows recent shutdown victims to restore even if the old daemon had already
-marked them recoverable. Restarting only the daemon does not do this.
-At startup restore, a dead session still marked active counts
-as a crash victim when its `last_seen` sits near either the newest recorded
-activity or that final heartbeat. The second anchor matters because jetsam
-usually kills the daemon before the tools: busy sessions keep advancing
-`last_seen` through their Stop hooks after the monitor dies, while idle
-sessions stay frozen at the monitor's last tick and would otherwise be
-misread as old closes.
+The daemon records the operating system's boot identifier in its heartbeat.
+A reboot restores confirmed pending interruptions, including sessions whose
+death the old daemon already observed. Restarting only the daemon does not
+reopen those sessions.
 
-The daemon does not treat a dead tool PID as proof that a session should be
-forgotten. Jetsam (memory pressure) and WindowServer crashes often kill the
-tool and shell while the daemon keeps running; that must not erase the
-registry entry. "Alive" means the exact recorded process: when a record
-carries a process start time, a recycled PID — even one now running the same
-tool — counts as dead. During normal monitoring:
+Liveness comes from the recorded process IDs and their start identities, not
+conversation activity. A session left idle for three days is still alive.
+When a tracked session is interrupted, its record becomes `pending`; there
+is no two-minute death cluster, activity-age cutoff, or expiry for a confirmed
+pending recovery.
 
-| Tool PID | Shell PID | Meaning | Action |
-| --- | --- | --- | --- |
-| alive | alive | Session is running in its tab | Keep active |
-| alive | dead | Tool outlived the tab (e.g. headless worker) | Mark recoverable |
-| dead | alive | Tool died while the tab still exists | Mark recoverable |
-| dead | dead | Both gone (close, jetsam, or crash) | Mark recoverable |
-| unknown | unknown | PID data unavailable | Keep recoverable |
+Restored tabs run through `session-guard launch`. That foreground controller
+registers its process identity before starting the provider in the user's
+interactive shell, preserving shell wrappers. It remains alive for the command's
+lifetime. Provider hooks can update the tool PID afterward, but restoration and
+liveness do not depend on another hook or user prompt. A restore is confirmed
+only after a fresh live owner is registered; an open tab alone is insufficient.
 
-Sessions leave the registry only via explicit deregister (`SessionEnd` hooks)
-or after the 7-day recoverable expiry. If the shell PID is still alive,
-restore never opens a new tab (the existing terminal tab is enough).
+Registry updates replace complete, synced snapshots under a stable lock.
+Pending records remain on disk throughout launch. A failed launch retains its
+recovery record and reports the failure.
 
-**Startup restore** reopens only unobserved deaths in the crash cluster:
-sessions still marked active on disk (no monitor witnessed them die) whose
-`last_seen_at` falls within 2 minutes of the newest heartbeat already in the
-file (and whose tool *and* shell are dead). That brings back work that died
-with the previous daemon epoch without reopening observed closes when the
-daemon is merely restarted for an upgrade. After a system reboot, recent
-observed deaths are also eligible using their recorded death time.
+The daemon restores pending sessions when the terminal returns. An existing
+surviving terminal process or a missed process snapshot does not count as a
+relaunch. The short startup delay is only for terminal readiness.
+
 Claude workers explicitly marked `dispatch.source = "spare"` in Claude's
-native daemon roster are excluded from discovery and restoration. Dispatched
-background workers remain eligible, regardless of their conversation contents.
-**Manual** `session-guard restore`
-reopens the newest cluster of deaths: every both-dead session whose death
-(the monitor's mark, else its SessionEnd, else its last heartbeat) falls
-within 2 minutes of the newest such death, whether or not the monitor already
-marked it recoverable — the daemon usually outlives a terminal quit and has
-marked the victims by the time you ask. Older recoverable piles stay put;
-`session-guard restore --all` reopens every both-dead recoverable session.
+native roster are excluded unless promoted to a native job. Useful detached
+workers remain eligible. No conversation-content check is used.
 
-The daemon also runs that same restore on its own when the configured
-terminal comes back: every five seconds it notes the start time of the
-oldest terminal process. A changed instance must have started since the
-previous observation to count as a relaunch. An older surviving instance
-or a missed snapshot does not trigger restoration. It waits five
-seconds after the relaunch before scripting it, and it does nothing when no
-tab died within two minutes of the new instance's start — reopening the
-terminal is not a reason to reopen an old pile.
-
-Restore runs before process scan so surviving headless workers cannot rewrite
-heartbeats. After a successful tab open the record stays recoverable until
-hooks re-register it live; a 30-minute cooldown prevents duplicate tabs.
+Older recovery records whose original tab ownership is no longer known remain
+available through `session-guard restore --all`. They are not guessed to be
+open tabs, and their existing seven-day retention policy is unchanged. Normal
+`session-guard restore` restores confirmed pending interruptions.
 
 If `active-sessions.json` is missing or had to be moved aside as corrupt,
 restore can rebuild recent recoverable entries from transcript/session files:

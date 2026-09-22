@@ -6,6 +6,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_RECOVERABLE_DAYS: i64 = 7;
@@ -63,6 +64,8 @@ pub struct SessionRecord {
     pub ending_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub restore_pending: bool,
 }
 
 impl SessionRecord {
@@ -99,6 +102,7 @@ impl SessionRecord {
             recoverable_until: None,
             ending_at: None,
             source,
+            restore_pending: false,
         }
     }
 
@@ -126,6 +130,7 @@ impl SessionRecord {
             recoverable_until: Some(timestamp + Duration::days(DEFAULT_RECOVERABLE_DAYS)),
             ending_at: None,
             source: Some("transcript-fallback".to_string()),
+            restore_pending: false,
         }
     }
 
@@ -135,6 +140,9 @@ impl SessionRecord {
     }
 
     pub fn mark_recoverable(&mut self) {
+        if self.state != SessionState::Recoverable {
+            self.restore_pending = true;
+        }
         let dead_at = self.ending_at.unwrap_or_else(Utc::now);
         self.state = SessionState::Recoverable;
         self.dead_at.get_or_insert(dead_at);
@@ -143,20 +151,22 @@ impl SessionRecord {
     }
 
     pub fn mark_active(&mut self) {
+        self.restore_pending = false;
         self.state = SessionState::Active;
         self.dead_at = None;
         self.recoverable_until = None;
         self.ending_at = None;
         self.last_seen_at = Utc::now();
-        // Clear restore-cooldown tag so a later crash can re-open this session.
         if self.source.as_deref() == Some("restored") {
             self.source = None;
         }
     }
 
     pub fn recoverable_expired(&self) -> bool {
-        self.recoverable_until
-            .is_some_and(|until| until < Utc::now())
+        !self.restore_pending
+            && self
+                .recoverable_until
+                .is_some_and(|until| until < Utc::now())
     }
 }
 
@@ -167,7 +177,20 @@ pub fn ensure_store(path: &Path) -> Result<()> {
     }
 
     if !path.exists() {
-        fs::write(path, b"[]\n").with_context(|| format!("failed to create {}", path.display()))?;
+        let lock = store_lock(path)?;
+        lock.lock_exclusive()?;
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(mut file) => file.write_all(b"[]\n")?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", path.display()));
+            }
+        }
     }
 
     Ok(())
@@ -175,19 +198,10 @@ pub fn ensure_store(path: &Path) -> Result<()> {
 
 pub fn read_sessions(path: &Path) -> Result<Vec<SessionRecord>> {
     ensure_store(path)?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-
-    file.lock_shared()
+    let lock = store_lock(path)?;
+    lock.lock_shared()
         .with_context(|| format!("failed to lock {}", path.display()))?;
-    let result = read_from_file(&mut file);
-    let _ = file.unlock();
-    result
+    read_from_file(&mut File::open(path)?)
 }
 
 pub fn with_sessions_mut<T>(
@@ -195,26 +209,29 @@ pub fn with_sessions_mut<T>(
     update: impl FnOnce(&mut Vec<SessionRecord>) -> Result<T>,
 ) -> Result<T> {
     ensure_store(path)?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-
-    file.lock_exclusive()
+    let lock = store_lock(path)?;
+    lock.lock_exclusive()
         .with_context(|| format!("failed to lock {}", path.display()))?;
-    let mut sessions = read_from_file(&mut file)?;
+    let mut sessions = read_from_file(&mut File::open(path)?)?;
     let original = serde_json::to_vec(&sessions)?;
     let result = update(&mut sessions);
 
     if result.is_ok() && serde_json::to_vec(&sessions)? != original {
-        write_to_file(&mut file, &sessions)?;
+        write_store(path, &sessions)?;
     }
 
-    let _ = file.unlock();
     result
+}
+
+fn store_lock(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path.with_extension("lock"))
+        .context("failed to open session registry lock")
 }
 
 fn read_from_file(file: &mut File) -> Result<Vec<SessionRecord>> {
@@ -229,13 +246,25 @@ fn read_from_file(file: &mut File) -> Result<Vec<SessionRecord>> {
     serde_json::from_str(&contents).context("failed to parse active sessions")
 }
 
-fn write_to_file(file: &mut File, sessions: &[SessionRecord]) -> Result<()> {
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    serde_json::to_writer_pretty(&mut *file, sessions)?;
-    file.write_all(b"\n")?;
-    file.sync_data()?;
-    Ok(())
+fn write_store(path: &Path, sessions: &[SessionRecord]) -> Result<()> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        serde_json::to_writer_pretty(&mut file, sessions)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn register(path: &Path, record: SessionRecord) -> Result<()> {
@@ -249,20 +278,13 @@ pub fn register(path: &Path, record: SessionRecord) -> Result<()> {
 pub fn repair_if_corrupt(path: &Path) -> Result<Option<PathBuf>> {
     ensure_store(path)?;
 
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    file.lock_exclusive()
+    let lock = store_lock(path)?;
+    lock.lock_exclusive()
         .with_context(|| format!("failed to lock {}", path.display()))?;
-
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
 
     if contents.trim().is_empty() || serde_json::from_str::<Vec<SessionRecord>>(&contents).is_ok() {
-        let _ = file.unlock();
         return Ok(None);
     }
 
@@ -273,8 +295,7 @@ pub fn repair_if_corrupt(path: &Path) -> Result<Option<PathBuf>> {
             backup.display()
         )
     })?;
-    fs::write(path, b"[]\n").with_context(|| format!("failed to recreate {}", path.display()))?;
-    let _ = file.unlock();
+    write_store(path, &[])?;
     Ok(Some(backup))
 }
 
@@ -288,6 +309,61 @@ pub fn deregister(path: &Path, session_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirmed_interruptions_do_not_expire_or_depend_on_activity_time() {
+        let mut record = SessionRecord::new(
+            crate::tool("codex"),
+            "idle".to_string(),
+            None,
+            None,
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+        );
+        record.last_seen_at = Utc::now() - Duration::days(3);
+        record.mark_recoverable();
+        assert!(record.restore_pending);
+        record.recoverable_until = Some(Utc::now() - Duration::days(1));
+        assert!(!record.recoverable_expired());
+        record.mark_active();
+        assert!(!record.restore_pending);
+        assert!(record.dead_at.is_none());
+    }
+
+    #[test]
+    fn registry_updates_replace_complete_snapshots_and_preserve_concurrent_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("active-sessions.json");
+        ensure_store(&path).unwrap();
+        let mut before = File::open(&path).unwrap();
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    register(
+                        path,
+                        SessionRecord::new(
+                            crate::tool("codex"),
+                            format!("session-{index}"),
+                            None,
+                            None,
+                            PathBuf::from("/tmp"),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        let mut original = String::new();
+        before.read_to_string(&mut original).unwrap();
+        assert_eq!(original, "[]\n");
+        assert_eq!(read_sessions(&path).unwrap().len(), 8);
+    }
 
     #[test]
     fn register_replaces_existing_session_id() {

@@ -115,9 +115,6 @@ pub fn run() -> Result<()> {
     write_pid_file()?;
     log_line("daemon started")?;
 
-    // Restore *before* scan. Scan calls mark_active() on still-running tools
-    // (including headless Claude workers), which rewrites last_seen_at to
-    // "now" and would push crash-window sessions outside any startup window.
     let shutdown = Arc::new(AtomicBool::new(false));
     let restore_requested = Arc::new(AtomicBool::new(false));
     let restore_all_requested = Arc::new(AtomicBool::new(false));
@@ -267,39 +264,7 @@ pub fn reconcile_from_scan() -> Result<usize> {
     })
 }
 
-// Dual PID death is ambiguous (intentional close vs jetsam/WindowServer), so
-// monitor never deletes on PID death alone — only deregister or 7-day expiry.
-//
-// Restore policy:
-// - Never open a new tab if the recorded shell is still alive (tab still open).
-// - Manual restore: the newest cluster of deaths — every both-dead session
-//   whose death (dead_at, else its SessionEnd, else last_seen) falls within
-//   2 minutes of the newest such death. Observed-recoverable records count,
-//   because the daemon usually survives a terminal quit and has marked the
-//   victims by the time the user asks. Older recoverable piles stay put
-//   (2026-09-03: a Ghostty crash killed 5 tabs; the manual restore reopened
-//   those plus 20 stale Codex/Grok records from the previous week).
-// - Manual restore --all: every both-dead recoverable session.
-// - Startup restore: only unobserved deaths in the crash cluster — sessions
-//   still marked active on disk (no epoch's monitor saw them die) whose
-//   last_seen falls within 2 minutes of the newest last_seen already in the
-//   file, OR within 2 minutes of the previous epoch's final monitor
-//   heartbeat. The second cluster exists because jetsam usually kills the
-//   daemon before the tools: hook-driven Stop heartbeats keep advancing the
-//   newest last_seen for busy sessions after the monitor dies, while idle
-//   sessions stay frozen at the monitor's last tick. Anchoring only on the
-//   newest last_seen then misreads those idle crash victims as an older
-//   recoverable pile (the 2026-08-25 incident: only the two Grok tabs still
-//   chatting near the end were reopened). Together the clusters still avoid
-//   reopening intentional closes when the daemon is merely restarted for an
-//   upgrade.
-// - Restore runs before process scan so survivors cannot rewrite heartbeats.
-// - After open_tab succeeds, keep the record (source="restored") with a
-//   cooldown so a second restore does not spam duplicate tabs.
-
-const LIVENESS_CLUSTER_WINDOW_SECS: i64 = 120;
-const RESTORE_COOLDOWN_SECS: i64 = 30 * 60;
-const RESTORED_SOURCE: &str = "restored";
+const RESTORE_RECEIPT_TIMEOUT: Duration = Duration::from_secs(15);
 // A terminal quitting gracefully closes tabs one by one and can still be
 // running when a tab's SessionEnd fires; a crashed one is gone before the hooks
 // run and may already be back (2026-09-03: Ghostty died at :51, the hooks
@@ -320,14 +285,12 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     } else {
         Vec::new()
     };
-    let now = chrono::Utc::now();
     // The previous epoch's final observation, read before this epoch starts
     // writing its own heartbeats.
     let heartbeat = match mode {
         RestoreMode::Startup => read_daemon_heartbeat(),
         RestoreMode::Manual | RestoreMode::All => None,
     };
-    let previous_heartbeat = heartbeat.as_ref().map(|value| value.timestamp);
     let rebooted = heartbeat
         .as_ref()
         .is_some_and(|value| value.boot_changed(process::boot_identifier().as_deref()));
@@ -339,7 +302,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     let last_sessions_path = paths::last_sessions_file()?;
 
     // Phase 1: decide who to restore under the sessions lock (no AppleScript).
-    let (mut summary, alive_kept, to_open) = sessions::with_sessions_mut(&path, |sessions| {
+    let (mut summary, to_open) = sessions::with_sessions_mut(&path, |sessions| {
         let mut summary = RestoreSummary::default();
         if sessions.is_empty() && !fallback_sessions.is_empty() {
             summary.fallback_sessions = fallback_sessions.len();
@@ -348,26 +311,11 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
 
         let unique = deduplicate_sessions(std::mem::take(sessions), &mut summary, &processes);
 
-        // Cluster anchors use on-disk timestamps only (before mark_active /
-        // mark_recoverable rewrite them).
-        let window = chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS);
-        let cluster_cutoff = match mode {
-            RestoreMode::Startup => unique.iter().map(|s| s.last_seen_at).max(),
-            RestoreMode::Manual => unique
-                .iter()
-                .filter(|s| !session_shell_is_alive(s, &processes))
-                .map(death_time)
-                .max(),
-            RestoreMode::All => None,
-        }
-        .map(|newest| newest - window);
-
         let mut alive_kept = Vec::new();
         let mut to_open = Vec::new();
 
         for mut session in unique {
             let was_recoverable = session.state == SessionState::Recoverable;
-            let death_time = death_time(&session);
 
             if session.state == SessionState::Ending
                 && ending_verdict(
@@ -415,17 +363,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 continue;
             }
 
-            if recently_restored(&session, now) {
-                alive_kept.push(session);
-                continue;
-            }
-
-            let anchor = match mode {
-                RestoreMode::Startup if !was_recoverable => session.last_seen_at,
-                RestoreMode::Startup | RestoreMode::Manual | RestoreMode::All => death_time,
-            };
-            if outside_death_cluster(anchor, cluster_cutoff, previous_heartbeat) {
-                // Older recoverable pile (earlier intentional closes, etc.)
+            if mode != RestoreMode::All && !session.restore_pending {
                 alive_kept.push(session);
                 continue;
             }
@@ -433,34 +371,38 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             to_open.push(session);
         }
 
-        // Hold only non-opening sessions while tabs are opened outside the lock.
-        sessions.clone_from(&alive_kept);
-        Ok((summary, alive_kept, to_open))
+        *sessions = alive_kept
+            .into_iter()
+            .chain(to_open.iter().cloned())
+            .collect();
+        Ok((summary, to_open))
     })?;
 
     // Phase 2: open tabs without holding the exclusive sessions lock.
     let mut adapter = None;
-    let mut opened = Vec::new();
-    for mut session in to_open {
+    for session in to_open {
         if adapter.is_none() {
             let kind = configured_terminal()?;
             adapter = Some(adapter_for(kind));
         }
 
-        let command = resume_command(&session);
+        let command = format!(
+            "{} launch --session-id {}",
+            shell_quote(&std::env::current_exe()?.to_string_lossy()),
+            shell_quote(&session.session_id)
+        );
         match adapter
             .as_ref()
             .unwrap()
             .open_tab(&session.directory, &command)
+            .and_then(|()| wait_for_restore_owner(&path, &session.session_id))
         {
             Ok(()) => {
                 log_line(&format!(
-                    "opened restore tab: {} {}",
+                    "confirmed restored owner: {} {}",
                     session.tool, session.session_id
                 ))?;
                 summary.record_restore(session.tool);
-                session.source = Some(RESTORED_SOURCE.to_string());
-                session.last_seen_at = now;
             }
             Err(error) => {
                 summary.failed += 1;
@@ -471,62 +413,28 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 ));
             }
         }
-        opened.push(session);
         thread::sleep(Duration::from_millis(350));
     }
-
-    // Phase 3: write restored/failed records back (merge with anything hooks added).
-    sessions::with_sessions_mut(&path, |sessions| {
-        let mut by_id: HashMap<String, SessionRecord> = HashMap::new();
-        for session in alive_kept
-            .into_iter()
-            .chain(opened)
-            .chain(sessions.drain(..))
-        {
-            by_id
-                .entry(session.session_id.clone())
-                .and_modify(|existing| {
-                    if should_replace(existing, &session, &processes) {
-                        *existing = session.clone();
-                    }
-                })
-                .or_insert(session);
-        }
-        *sessions = by_id.into_values().collect();
-        Ok(())
-    })?;
 
     Ok(summary)
 }
 
-// A dead session is a crash victim when it belongs to either cluster: near the
-// newest death or on-disk last_seen (sessions whose hooks kept heartbeating up
-// to the catastrophe), or — at startup — near the previous epoch's final
-// monitor heartbeat (idle sessions the dead daemon was refreshing).
-fn outside_death_cluster(
-    anchor: chrono::DateTime<chrono::Utc>,
-    cluster_cutoff: Option<chrono::DateTime<chrono::Utc>>,
-    previous_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
-) -> bool {
-    let Some(cutoff) = cluster_cutoff else {
-        return false;
-    };
-    if anchor >= cutoff {
-        return false;
+fn wait_for_restore_owner(path: &std::path::Path, session_id: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + RESTORE_RECEIPT_TIMEOUT;
+    loop {
+        let processes = ProcessSnapshot::capture()?;
+        if sessions::read_sessions(path)?.iter().any(|session| {
+            session.session_id == session_id
+                && session.state == SessionState::Active
+                && session_is_alive(session, &processes)
+        }) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("restored tab did not register a live owner for {session_id}");
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-    let Some(heartbeat) = previous_heartbeat else {
-        return true;
-    };
-    (heartbeat - anchor).num_seconds().abs() > LIVENESS_CLUSTER_WINDOW_SECS
-}
-
-// The best on-disk estimate of when a session's tab died: the monitor's mark,
-// else the SessionEnd the hook reported, else the last heartbeat.
-fn death_time(session: &SessionRecord) -> chrono::DateTime<chrono::Utc> {
-    session
-        .dead_at
-        .or(session.ending_at)
-        .unwrap_or(session.last_seen_at)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -622,16 +530,21 @@ fn terminal_returned_with_victims(
     ) else {
         return Ok(false);
     };
-    let since = started_at.and_utc() - chrono::Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS);
     let has_victims = sessions::read_sessions(&paths::sessions_file()?)?
         .iter()
-        .any(|session| !session_shell_is_alive(session, processes) && death_time(session) >= since);
+        .any(|session| needs_terminal_restore(session, processes));
     if has_victims {
         log_line(&format!(
             "terminal relaunch detected: {terminal}, started at {started_at} UTC"
         ))?;
     }
     Ok(has_victims)
+}
+
+fn needs_terminal_restore(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
+    (session.restore_pending || session.state != SessionState::Recoverable)
+        && !session_is_alive(session, processes)
+        && !session_shell_is_alive(session, processes)
 }
 
 pub fn settle_endings(processes: &ProcessSnapshot) -> Result<SettleSummary> {
@@ -710,15 +623,6 @@ fn write_daemon_heartbeat() -> Result<()> {
         })?,
     )
     .context("failed to write daemon heartbeat")
-}
-
-fn recently_restored(session: &SessionRecord, now: chrono::DateTime<chrono::Utc>) -> bool {
-    if session.source.as_deref() != Some(RESTORED_SOURCE) {
-        return false;
-    }
-    now.signed_duration_since(session.last_seen_at)
-        .num_seconds()
-        < RESTORE_COOLDOWN_SECS
 }
 
 pub fn monitor_once() -> Result<MonitorSummary> {
@@ -827,7 +731,7 @@ fn configured_terminal() -> Result<TerminalKind> {
     contents.parse()
 }
 
-fn session_is_alive(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
+pub(crate) fn session_is_alive(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
     if !session_tool_is_alive(session, processes) {
         return false;
     }
@@ -907,7 +811,7 @@ fn should_replace(
     candidate.last_seen_at > existing.last_seen_at
 }
 
-fn resume_command(session: &SessionRecord) -> String {
+pub(crate) fn resume_command(session: &SessionRecord) -> String {
     session
         .tool
         .spec()
@@ -918,6 +822,20 @@ fn resume_command(session: &SessionRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_return_detects_deaths_before_the_next_monitor_tick() {
+        let processes = ProcessSnapshot::capture().unwrap();
+        let mut session = sample(crate::tool("codex"), "idle");
+        session.pid = None;
+        session.shell_pid = None;
+        session.last_seen_at = Utc::now() - Duration::days(3);
+        assert!(needs_terminal_restore(&session, &processes));
+        session.mark_recoverable();
+        assert!(needs_terminal_restore(&session, &processes));
+        session.restore_pending = false;
+        assert!(!needs_terminal_restore(&session, &processes));
+    }
     use crate::sessions::SessionRecord;
     use chrono::{Duration, Utc};
     use std::path::PathBuf;
@@ -1000,77 +918,6 @@ mod tests {
             boot_id: None,
         };
         assert!(!legacy.boot_changed(Some("new-boot")));
-    }
-
-    #[test]
-    fn startup_clusters_admit_idle_sessions_frozen_at_the_dead_monitors_tick() {
-        // The 2026-08-25 incident: the daemon died at 11:24:14 while Grok Stop
-        // hooks kept heartbeating until 11:52. Idle Claude/Codex sessions froze
-        // at the monitor's last tick and must still count as crash victims.
-        let heartbeat = Utc::now();
-        let newest = heartbeat + Duration::minutes(28);
-        let cutoff = Some(newest - Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS));
-
-        // Idle session refreshed by the monitor's final tick.
-        assert!(!outside_death_cluster(heartbeat, cutoff, Some(heartbeat)));
-        // Busy session that heartbeated up to the catastrophe.
-        assert!(!outside_death_cluster(newest, cutoff, Some(heartbeat)));
-        // Genuinely older pile stays excluded.
-        let old = heartbeat - Duration::hours(3);
-        assert!(outside_death_cluster(old, cutoff, Some(heartbeat)));
-        // A session that heartbeated shortly after the monitor died but well
-        // before the catastrophe is ambiguous; keep excluding it.
-        let between = heartbeat + Duration::minutes(10);
-        assert!(outside_death_cluster(between, cutoff, Some(heartbeat)));
-    }
-
-    #[test]
-    fn startup_clusters_without_heartbeat_fall_back_to_newest_activity() {
-        let newest = Utc::now();
-        let cutoff = Some(newest - Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS));
-        assert!(!outside_death_cluster(newest, cutoff, None));
-        assert!(outside_death_cluster(
-            newest - Duration::minutes(30),
-            cutoff,
-            None
-        ));
-    }
-
-    #[test]
-    fn manual_restore_reopens_only_the_newest_death_cluster() {
-        // The 2026-09-03 incident: a Ghostty quit killed five tabs at 15:20;
-        // thirteen Codex and seven Grok records had died over the previous
-        // week. A manual restore must reopen the five, not the twenty-five.
-        let quit = Utc::now() - Duration::minutes(2);
-        let cutoff = Some(quit - Duration::seconds(LIVENESS_CLUSTER_WINDOW_SECS));
-        assert!(!outside_death_cluster(quit, cutoff, None));
-        // Idle victim last marked alive by the monitor's tick before the quit.
-        assert!(!outside_death_cluster(
-            quit - Duration::seconds(59),
-            cutoff,
-            None
-        ));
-        assert!(outside_death_cluster(
-            quit - Duration::days(3),
-            cutoff,
-            None
-        ));
-    }
-
-    #[test]
-    fn restore_all_has_no_cluster_gate() {
-        let ancient = Utc::now() - Duration::days(6);
-        assert!(!outside_death_cluster(ancient, None, None));
-    }
-
-    #[test]
-    fn death_time_prefers_the_monitor_mark_then_the_session_end() {
-        let mut session = sample(crate::tool("claude"), "abc");
-        assert_eq!(death_time(&session), session.last_seen_at);
-        session.mark_ending();
-        assert_eq!(death_time(&session), session.ending_at.unwrap());
-        session.mark_recoverable();
-        assert_eq!(death_time(&session), session.dead_at.unwrap());
     }
 
     fn own_executable() -> String {
@@ -1222,20 +1069,6 @@ mod tests {
             watch.relaunched(Some(now), now + Duration::seconds(5)),
             Some(now)
         );
-    }
-
-    #[test]
-    fn recently_restored_respects_source_and_cooldown() {
-        let now = Utc::now();
-        let mut session = sample(crate::tool("claude"), "abc");
-        assert!(!recently_restored(&session, now));
-
-        session.source = Some(RESTORED_SOURCE.to_string());
-        session.last_seen_at = now - Duration::seconds(10);
-        assert!(recently_restored(&session, now));
-
-        session.last_seen_at = now - Duration::seconds(RESTORE_COOLDOWN_SECS + 1);
-        assert!(!recently_restored(&session, now));
     }
 
     #[test]

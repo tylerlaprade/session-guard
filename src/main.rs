@@ -107,6 +107,7 @@ impl ValueEnum for Tool {
 
 /// Test-only lookup so cases can name a harness without a registry index.
 #[cfg(test)]
+#[must_use]
 pub fn tool(id: &str) -> Tool {
     Tool::from_id(id).expect("known harness")
 }
@@ -198,6 +199,11 @@ enum Command {
     },
     Status,
     #[command(hide = true)]
+    Launch {
+        #[arg(long)]
+        session_id: String,
+    },
+    #[command(hide = true)]
     LastSession {
         #[arg(long, value_enum)]
         tool: Tool,
@@ -227,7 +233,7 @@ enum Command {
     Restore {
         #[arg(
             long,
-            help = "Reopen every dead recoverable session instead of only the newest cluster of deaths"
+            help = "Include legacy recovery records without a confirmed pending interruption"
         )]
         all: bool,
     },
@@ -243,6 +249,7 @@ fn main() -> Result<()> {
         Command::InstallHooks => commands::install_hooks::run(),
         Command::Uninstall { purge } => commands::uninstall::run(purge),
         Command::Status => commands::status::run(),
+        Command::Launch { session_id } => commands::launch::run(&session_id),
         Command::LastSession { tool, shell_pid } => commands::last_session::run(tool, shell_pid),
         Command::Register {
             tool,

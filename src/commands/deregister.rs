@@ -41,7 +41,7 @@ pub fn run(session_id: Option<String>) -> Result<()> {
 // ending; the daemon settles it once the aftermath is visible
 // (daemon::settle_endings). Tabless (scan-tracked) sessions carry no tab to
 // observe, so a graceful end is the only cleanup they get.
-fn end_from_hook(
+pub(crate) fn end_from_hook(
     sessions_path: &Path,
     last_sessions_path: &Path,
     record: &SessionRecord,

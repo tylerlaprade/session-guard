@@ -800,9 +800,8 @@ command = "{}"
 
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = '{}'
-"#,
-                OLD_CODEX_REGISTER_ENV
+command = '{OLD_CODEX_REGISTER_ENV}'
+"#
             ),
         )
         .unwrap();
