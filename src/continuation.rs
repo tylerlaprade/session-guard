@@ -78,13 +78,7 @@ pub fn record_hook() -> Result<()> {
                 return Ok(());
             }
         }
-        if ancestor != pid
-            || record
-                .transcript_path
-                .as_ref()
-                .zip(event.transcript_path.as_ref())
-                .is_some_and(|(a, b)| a != b)
-        {
+        if ancestor != pid || record.transcript_path != event.transcript_path {
             return Ok(());
         }
         apply_event(record, &event);
@@ -116,6 +110,16 @@ fn apply_event(record: &mut SessionRecord, event: &Event) {
         .as_ref()
         .is_some_and(|id| id != &activity.turn_id)
     {
+        return;
+    }
+    if event.turn_id.is_none()
+        && matches!(
+            event.hook_event_name.as_str(),
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+        )
+    {
+        activity.state = WorkState::Unknown;
+        activity.needs_attention = true;
         return;
     }
     match event.hook_event_name.as_str() {
@@ -296,5 +300,23 @@ mod tests {
             apply_event(&mut record, &event);
             assert_eq!(record.activity.as_ref().unwrap().state, state);
         }
+    }
+
+    #[test]
+    fn uncorrelated_tool_completion_cannot_confirm_work() {
+        let mut record = record("codex");
+        for (name, turn) in [
+            ("UserPromptSubmit", Some("turn")),
+            ("PreToolUse", Some("turn")),
+            ("PostToolUse", None),
+        ] {
+            let event: Event =
+                serde_json::from_value(json!({"session_id":"session", "hook_event_name":name,
+                "turn_id":turn,"tool_use_id":"tool"}))
+                .unwrap();
+            apply_event(&mut record, &event);
+        }
+        assert!(!should_continue(&record));
+        assert_eq!(record.activity.unwrap().state, WorkState::Unknown);
     }
 }
