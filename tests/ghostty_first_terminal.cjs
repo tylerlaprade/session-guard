@@ -45,7 +45,7 @@ function lookup({apps = 1, surfaces = 1, tty = '/dev/ttys123', failure = 0, time
                         paramDescriptorForKeyword: key => key === code('errn')
                             ? {isNil: () => false, int32Value: failure}
                             : isTerminalList
-                                ? {numberOfItems: surfaces, descriptorAtIndex: () => ({surface: true})}
+                                ? {numberOfItems: String(surfaces), descriptorAtIndex: () => ({surface: true})}
                                 : {stringValue: tty}
                     };
                 }
@@ -60,7 +60,7 @@ function lookup({apps = 1, surfaces = 1, tty = '/dev/ttys123', failure = 0, time
             NSRunningApplication: {
                 runningApplicationsWithBundleIdentifier(bundle) {
                     assert.equal(bundle, 'com.mitchellh.ghostty');
-                    return {count: apps, objectAtIndex: () => ({processIdentifier: 42})};
+                    return {count: String(apps), objectAtIndex: () => ({processIdentifier: 42})};
                 }
             }
         }

@@ -32,12 +32,12 @@ const get = (pid, object) => {
 
 this.run = argv => {
     const running = $.NSRunningApplication.runningApplicationsWithBundleIdentifier("com.mitchellh.ghostty");
-    if (running.count !== 1) {return false;}
+    if (Number(running.count) !== 1) {return false;}
     const pid = running.objectAtIndex(0).processIdentifier;
     const surfaces = get(pid, specifier(
         "Gtrm", "indx", descriptor.descriptorWithDescriptorTypeData(code("abso"), descriptor.descriptorWithEnumCode(code("all ")).data), descriptor.nullDescriptor
     ));
-    if (surfaces.numberOfItems !== 1) {return false;}
+    if (Number(surfaces.numberOfItems) !== 1) {return false;}
     const tty = get(pid, specifier(
         "prop", "prop", descriptor.descriptorWithTypeCode(code("Gtty")), surfaces.descriptorAtIndex(1)
     ));
