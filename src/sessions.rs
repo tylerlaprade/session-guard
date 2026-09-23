@@ -277,6 +277,7 @@ pub fn register(path: &Path, mut record: SessionRecord) -> Result<()> {
             previous.session_id == record.session_id
                 && previous.pid == record.pid
                 && previous.pid_started_at == record.pid_started_at
+                && record.source.is_none()
         }) {
             record.activity.clone_from(&previous.activity);
         }
