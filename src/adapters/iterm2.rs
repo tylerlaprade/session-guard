@@ -1,4 +1,4 @@
-use super::{TerminalAdapter, applescript_quote, run_checked, shell_line};
+use super::{TerminalAdapter, run_checked, shell_line};
 use crate::process;
 use anyhow::Result;
 use std::path::Path;
@@ -16,25 +16,8 @@ impl TerminalAdapter for Iterm2 {
         }
 
         let line = shell_line(directory, command);
-        let script = format!(
-            r#"tell application "iTerm2"
-  activate
-  if (count of windows) = 0 then
-    create window with default profile
-    tell current session to write text {}
-  else
-    tell current window
-      create tab with default profile
-      tell current session to write text {}
-    end tell
-  end tell
-end tell"#,
-            applescript_quote(&line),
-            applescript_quote(&line),
-        );
-
         let mut command = Command::new("osascript");
-        command.args(["-e", &script]);
+        command.args(["-e", include_str!("iterm2_open_tab.applescript"), &line]);
         run_checked(command, "opening iTerm2 tab")
     }
 

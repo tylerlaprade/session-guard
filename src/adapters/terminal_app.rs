@@ -1,4 +1,4 @@
-use super::{TerminalAdapter, applescript_quote, run_checked, shell_line};
+use super::{TerminalAdapter, run_checked, shell_line};
 use crate::process;
 use anyhow::Result;
 use std::path::Path;
@@ -9,16 +9,12 @@ pub struct TerminalApp;
 impl TerminalAdapter for TerminalApp {
     fn open_tab(&self, directory: &Path, command: &str) -> Result<()> {
         let line = shell_line(directory, command);
-        let script = format!(
-            r#"tell application "Terminal"
-  activate
-  do script {}
-end tell"#,
-            applescript_quote(&line),
-        );
-
         let mut command = Command::new("osascript");
-        command.args(["-e", &script]);
+        command.args([
+            "-e",
+            include_str!("terminal_app_open_tab.applescript"),
+            &line,
+        ]);
         run_checked(command, "opening Terminal.app tab")
     }
 

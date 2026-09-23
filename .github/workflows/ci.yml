@@ -14,8 +14,16 @@ jobs:
         with:
           node-version: 24
       - run: npm ci --ignore-scripts
+      - run: brew install shellcheck
       - run: npm run lint
       - run: npm test
+      - run: brew install --cask ghostty iterm2
+      - name: Compile AppleScript
+        timeout-minutes: 5
+        run: |
+          for script in src/app_is_running.applescript src/adapters/*.applescript; do
+            osacompile -o "$RUNNER_TEMP/check.scpt" "$script"
+          done
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt --check
       - run: cargo check

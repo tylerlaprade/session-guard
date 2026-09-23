@@ -34,10 +34,6 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub fn applescript_quote(value: &str) -> String {
-    format!("{value:?}")
-}
-
 pub fn shell_line(directory: &Path, command: &str) -> String {
     format!(
         "cd {} && exec {}",

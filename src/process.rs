@@ -279,9 +279,8 @@ fn is_executable(path: impl AsRef<std::path::Path>) -> bool {
 }
 
 pub fn app_is_running(app_name: &str) -> bool {
-    let script = format!("application {app_name:?} is running");
     Command::new("osascript")
-        .args(["-e", &script])
+        .args(["-e", include_str!("app_is_running.applescript"), app_name])
         .output()
         .ok()
         .and_then(|output| {

@@ -2,7 +2,7 @@
   "name": "session-guard-development",
   "private": true,
   "scripts": {
-    "lint": "eslint src/adapters/ghostty_first_terminal.js --max-warnings=0",
+    "lint": "eslint src/adapters/ghostty_first_terminal.js src/opencode_plugin.js --max-warnings=0 && shellcheck src/grok_register.sh",
     "test": "node --test tests/ghostty_first_terminal.cjs"
   },
   "devDependencies": { "@eslint/js": "10.0.1", "eslint": "10.11.0" }

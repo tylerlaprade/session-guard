@@ -35,103 +35,14 @@ pub(crate) const CODEX_DEREGISTER: &str = "session-guard deregister";
 // passes those as flags because stdin JSON field names have moved.
 pub(crate) const GROK_REGISTER_SCRIPT_NAME: &str = "session-guard-register.sh";
 pub(crate) const GROK_HOOKS_FILE_NAME: &str = "session-guard.json";
-pub(crate) const GROK_REGISTER_SCRIPT: &str = r#"#!/bin/sh
-tool_pid="$PPID"
-# Headless runs (-p/--single/--prompt-file/--prompt-json) fire these hooks
-# too, but they print and exit — they never hold a terminal tab, so never
-# register them. Grok exposes no headless marker in the hook payload or env;
-# the process argv is the only signal. (A prompt whose text contains these
-# flags with surrounding spaces is misread as headless and merely goes
-# untracked.)
-# /bin/ps, stdin closed: a PATH `ps` wrapper must not run, and a piped hook
-# payload must not stall ps.
-cmd="$(/bin/ps -o command= -p "$tool_pid" </dev/null 2>/dev/null)"
-case " $cmd " in
-  *" -p "*|*" --single "*|*" --single="*|*" --prompt-file "*|*" --prompt-file="*|*" --prompt-json "*|*" --prompt-json="*)
-    exit 0
-    ;;
-esac
-# Grok 1.0.13+ injects GROK_SESSION_ID and GROK_WORKSPACE_ROOT on every hook.
-# Pass them as flags so register does not depend on stdin JSON field names
-# (cwd vs workspaceRoot). Older Grok still works: missing flags fall back
-# to stdin.
-shell_pid="${SESSION_GUARD_SHELL_PID:-}"
-[ -n "$shell_pid" ] || shell_pid="$(/bin/ps -o ppid= -p "$tool_pid" </dev/null 2>/dev/null | tr -d ' ')"
-set -- session-guard register --tool grok --pid "$tool_pid"
-[ -n "$shell_pid" ] && set -- "$@" --shell-pid "$shell_pid"
-[ -n "$GROK_SESSION_ID" ] && set -- "$@" --session-id "$GROK_SESSION_ID"
-directory="${GROK_WORKSPACE_ROOT:-$CLAUDE_PROJECT_DIR}"
-[ -n "$directory" ] && set -- "$@" --directory "$directory"
-exec "$@"
-"#;
+pub(crate) const GROK_REGISTER_SCRIPT: &str = include_str!("grok_register.sh");
 pub(crate) const GROK_DEREGISTER: &str = "session-guard deregister";
 // OpenCode has no shell-command hooks; its extension point is a JS plugin
 // module loaded into the opencode process (Bun), discovered from
 // `<config>/plugin/*.js`. The plugin registers over the session event bus
 // and shells out to session-guard with Bun's `$`.
 pub(crate) const OPENCODE_PLUGIN_NAME: &str = "session-guard.js";
-pub(crate) const OPENCODE_PLUGIN: &str = r#"// Installed by `session-guard install`; removed by `session-guard uninstall`.
-// Do not edit: session-guard rewrites this file when its contents change.
-import { existsSync } from "node:fs";
-
-const REGISTER_THROTTLE_MS = 30_000;
-
-// Only interactive TUI sessions live in a terminal tab. Headless modes put a
-// subcommand in argv[2] (run, serve, web, acp, session, db, ...); the TUI is
-// invoked bare, with flags, or with a project path. OpenCode publishes no
-// official mode marker, so argv is the only signal.
-function isInteractiveTui() {
-  const sub = process.argv[2];
-  return !sub || sub.startsWith("-") || existsSync(sub);
-}
-
-export const SessionGuard = async ({ $, directory }) => {
-  if (!isInteractiveTui() || !$) return {};
-
-  const shellPid = process.env.SESSION_GUARD_SHELL_PID || process.ppid;
-  const lastRegistered = new Map();
-
-  const register = async (sessionID, dir) => {
-    const now = Date.now();
-    if (now - (lastRegistered.get(sessionID) ?? 0) < REGISTER_THROTTLE_MS) return;
-    lastRegistered.set(sessionID, now);
-    await $`session-guard register --tool opencode --session-id ${sessionID} --pid ${process.pid} --shell-pid ${shellPid} --directory ${dir}`
-      .quiet()
-      .nothrow();
-  };
-
-  // The stdin (hook) form, not --session-id: the hook path keeps the record
-  // when the tab's shell is already gone (GUI teardown), matching the other
-  // tools' SessionEnd behavior.
-  const deregister = async (sessionID) => {
-    const payload = JSON.stringify({ session_id: sessionID });
-    await $`echo ${payload} | session-guard deregister`.quiet().nothrow();
-  };
-
-  return {
-    event: async ({ event }) => {
-      const { type, properties } = event;
-      if (type === "session.created" || type === "session.updated") {
-        const info = properties.info;
-        if (info.parentID) return; // subagent child, never a tab
-        await register(info.id, info.directory || directory);
-      } else if (type === "session.idle") {
-        // Turn finished: force a fresh heartbeat like the other tools' Stop.
-        lastRegistered.delete(properties.sessionID);
-        await register(properties.sessionID, directory);
-      } else if (type === "session.deleted") {
-        lastRegistered.delete(properties.info.id);
-        await deregister(properties.info.id);
-      }
-    },
-    dispose: async () => {
-      for (const sessionID of lastRegistered.keys()) {
-        await deregister(sessionID);
-      }
-    },
-  };
-};
-"#;
+pub(crate) const OPENCODE_PLUGIN: &str = include_str!("opencode_plugin.js");
 
 /// A path the harness owns, resolved as `$ENV/suffix` when `env` is set and
 /// non-empty, else `$HOME/default/suffix`.
@@ -599,9 +510,9 @@ mod tests {
         }
     }
 
-    /// The payloads are shell and JavaScript held in Rust string literals, so
-    /// a careless edit to the Rust around them can leak into the payload and
-    /// ship a broken hook. Rust syntax inside one is always that mistake.
+    /// The hook commands are shell held in Rust string literals, so a careless
+    /// edit to the Rust around them can leak into the command and ship a
+    /// broken hook. Rust syntax inside one is always that mistake.
     #[test]
     fn payloads_contain_no_rust_syntax() {
         let payloads = [
@@ -609,9 +520,7 @@ mod tests {
             ("CLAUDE_DEREGISTER", super::CLAUDE_DEREGISTER),
             ("CODEX_REGISTER", super::CODEX_REGISTER),
             ("CODEX_DEREGISTER", super::CODEX_DEREGISTER),
-            ("GROK_REGISTER_SCRIPT", super::GROK_REGISTER_SCRIPT),
             ("GROK_DEREGISTER", super::GROK_DEREGISTER),
-            ("OPENCODE_PLUGIN", super::OPENCODE_PLUGIN),
         ];
         for (name, payload) in payloads {
             for marker in ["pub(crate)", "&'static str", "-> Result<"] {
@@ -621,14 +530,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn opencode_plugin_declares_its_throttle() {
-        assert!(
-            super::OPENCODE_PLUGIN.contains("\nconst REGISTER_THROTTLE_MS = 30_000;\n"),
-            "the plugin's throttle declaration must stay valid JavaScript"
-        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{TerminalAdapter, applescript_quote, run_checked};
+use super::{TerminalAdapter, run_checked};
 use crate::process;
 use anyhow::{Context, Result};
 use std::cell::RefCell;
@@ -51,35 +51,21 @@ impl Ghostty {
     }
 }
 
-/// The script opening one restored tab: in `window` while it is open,
-/// otherwise in the front window, or a fresh one when there is none. At
-/// login-time restore Ghostty is often running with no window yet, and
-/// `new tab in front window` fails with -1728 ("Can't get front window") in
-/// that state. It answers with the window's id and the tab's, tab-separated.
-fn restore_tab_script(directory: &str, input: &str, window: &str) -> String {
-    format!(
-        r#"tell application "Ghostty"
-  set cfg to new surface configuration
-  set initial working directory of cfg to {directory}
-  set initial input of cfg to {input}
-  set restoreWindow to missing value
-  repeat with candidate in windows
-    if id of candidate is {window} then set restoreWindow to contents of candidate
-  end repeat
-  if restoreWindow is missing value then
-    if (count of windows) is 0 then
-      set restoreWindow to new window with configuration cfg
-      return (id of restoreWindow) & (character id 9) & (id of selected tab of restoreWindow)
-    end if
-    set restoreWindow to front window
-  end if
-  set newTab to new tab in restoreWindow with configuration cfg
-  return (id of restoreWindow) & (character id 9) & (id of newTab)
-end tell"#,
-        directory = applescript_quote(directory),
-        input = applescript_quote(input),
-        window = applescript_quote(window),
-    )
+/// Opens one restored tab: in `window` while it is open, otherwise in the
+/// front window, or a fresh one when there is none. At login-time restore
+/// Ghostty is often running with no window yet, and `new tab in front window`
+/// fails with -1728 ("Can't get front window") in that state. It answers with
+/// the window's id and the tab's, tab-separated.
+fn restore_tab_command(directory: &str, input: &str, window: &str) -> Command {
+    let mut osa = Command::new("osascript");
+    osa.args([
+        "-e",
+        include_str!("ghostty_restore_tab.applescript"),
+        directory,
+        input,
+        window,
+    ]);
+    osa
 }
 
 impl TerminalAdapter for Ghostty {
@@ -92,13 +78,11 @@ impl TerminalAdapter for Ghostty {
         let dir_str = directory
             .to_str()
             .context("Ghostty restore requires a UTF-8 directory path")?;
-        let script = restore_tab_script(
+        let mut osa = restore_tab_command(
             dir_str,
             &format!("{command}\n"),
             &self.restore_window.borrow().clone().unwrap_or_default(),
         );
-        let mut osa = Command::new("osascript");
-        osa.args(["-e", &script]);
         // Ghostty scripting can hang when the app is busy/recovering; do not
         // block the daemon (or its sessions lock) forever.
         let reply =
@@ -127,22 +111,14 @@ impl TerminalAdapter for Ghostty {
 // poll it and fail the restore when it never populates; the session then
 // stays recoverable and a later restore retries.
 fn wait_for_surface_start(tab_id: &str) -> Result<()> {
-    let script = format!(
-        r#"tell application "Ghostty"
-  repeat with w in windows
-    repeat with t in tabs of w
-      if id of t is {id} then return working directory of focused terminal of t
-    end repeat
-  end repeat
-  return ""
-end tell"#,
-        id = applescript_quote(tab_id),
-    );
-
     let deadline = Instant::now() + SURFACE_START_TIMEOUT;
     loop {
         let mut osa = Command::new("osascript");
-        osa.args(["-e", &script]);
+        osa.args([
+            "-e",
+            include_str!("ghostty_tab_working_directory.applescript"),
+            tab_id,
+        ]);
         if let Ok(working_directory) =
             super::run_capture_timeout(&mut osa, "checking Ghostty surface", SURFACE_START_TIMEOUT)
             && !working_directory.is_empty()
@@ -166,15 +142,16 @@ mod tests {
     #[test]
     fn a_pass_keeps_its_later_tabs_in_its_first_tab_window() {
         let ghostty = Ghostty::default();
-        let first = restore_tab_script("/tmp", "launch\n", "");
-        assert!(first.contains(r#"if id of candidate is "" then"#));
+        let window_argument = |command: &Command| command.get_args().last().unwrap().to_owned();
+        let first = restore_tab_command("/tmp", "launch\n", "");
+        assert_eq!(window_argument(&first), "");
         assert_eq!(
             ghostty.remember_window("tab-group-1\ttab-7").unwrap(),
             "tab-7"
         );
         let remembered = ghostty.restore_window.borrow().clone().unwrap();
-        let second = restore_tab_script("/tmp", "launch\n", &remembered);
-        assert!(second.contains(r#"if id of candidate is "tab-group-1" then"#));
+        let second = restore_tab_command("/tmp", "launch\n", &remembered);
+        assert_eq!(window_argument(&second), "tab-group-1");
         assert!(ghostty.remember_window("tab-7").is_err());
         assert!(ghostty.remember_window("\ttab-7").is_err());
     }

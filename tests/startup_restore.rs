@@ -67,7 +67,7 @@ fn run_startup(boot_id: &str, tool: &str, spare: bool, pending: bool) -> (String
     let script = bin.join("osascript");
     fs::write(&script, r#"#!/usr/bin/env python3
 import os, pathlib, subprocess, sys
-script = sys.argv[-1]
+script = sys.argv[sys.argv.index("-e") + 1]
 if "is running" in script:
     print("true")
 elif "working directory of focused terminal" in script:
