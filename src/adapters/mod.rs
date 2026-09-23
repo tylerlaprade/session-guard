@@ -17,7 +17,7 @@ pub trait TerminalAdapter {
 
 pub fn adapter_for(kind: TerminalKind) -> Box<dyn TerminalAdapter> {
     match kind {
-        TerminalKind::Ghostty => Box::new(ghostty::Ghostty),
+        TerminalKind::Ghostty => Box::new(ghostty::Ghostty::default()),
         TerminalKind::Iterm2 => Box::new(iterm2::Iterm2),
         TerminalKind::Terminal => Box::new(terminal_app::TerminalApp),
         TerminalKind::Kitty => Box::new(kitty::Kitty),

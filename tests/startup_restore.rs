@@ -77,7 +77,7 @@ else:
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
     pathlib.Path(os.environ["HOME"], "launcher.pid").write_text(str(child.pid))
-    print("test-tab")
+    print("test-window\ttest-tab")
 "#).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     let provider = bin.join(tool);

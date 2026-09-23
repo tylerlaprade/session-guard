@@ -16,7 +16,7 @@ Supported terminal values:
 
 | Value | Restore behavior |
 | --- | --- |
-| `ghostty` | Opens tabs in Ghostty via its native AppleScript scripting dictionary (`new tab with configuration`). No keystroke automation, so no Accessibility permission is needed. Restoration waits for the surface to start and for its launcher to register a live owner. Failed launches remain pending. |
+| `ghostty` | Opens tabs in Ghostty via its native AppleScript scripting dictionary (`new tab with configuration`). No keystroke automation, so no Accessibility permission is needed. Restoration waits for the surface to start and for its launcher to register a live owner. Failed launches remain pending. One restore pass keeps its tabs in one window, even when another window comes to the front mid-restore. |
 | `iterm2` | Opens tabs in the current iTerm2 window. |
 | `terminal` | Uses Terminal.app `do script`. |
 | `kitty` | Uses `kitty @ launch --type=tab`. |
