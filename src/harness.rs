@@ -160,9 +160,11 @@ impl ToolPath {
 pub enum HookAction {
     Register,
     Deregister,
+    Activity,
 }
 
 /// One lifecycle hook the harness should fire.
+#[derive(Clone)]
 pub struct HookEvent {
     pub event: &'static str,
     pub matcher: Option<&'static str>,
@@ -207,6 +209,82 @@ pub const GROK_HOOKS: &[HookEvent] = &[
         event: "SessionEnd",
         matcher: None,
         action: Deregister,
+    },
+];
+
+pub const CODEX_ACTIVITY_HOOKS: &[HookEvent] = &[
+    HookEvent {
+        event: "UserPromptSubmit",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "PreToolUse",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "PostToolUse",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "PermissionRequest",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "Stop",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "Interrupt",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+];
+
+pub const GROK_ACTIVITY_HOOKS: &[HookEvent] = &[
+    HookEvent {
+        event: "UserPromptSubmit",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "PreToolUse",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "PostToolUse",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "PostToolUseFailure",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "Stop",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "StopFailure",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "StopCancelled",
+        matcher: None,
+        action: HookAction::Activity,
+    },
+    HookEvent {
+        event: "Notification",
+        matcher: None,
+        action: HookAction::Activity,
     },
 ];
 
@@ -264,6 +342,8 @@ pub enum Discovery {
 }
 
 pub struct Harness {
+    pub activity_hooks: &'static [HookEvent],
+    pub was_working: Option<fn(&crate::sessions::SessionRecord) -> bool>,
     /// Wire name: the `--tool` value, and how sessions are stored on disk.
     pub id: &'static str,
     /// Name for human-facing output.
@@ -292,6 +372,8 @@ pub struct Harness {
 pub static HARNESSES: &[Harness] = &[
     Harness {
         id: "claude",
+        activity_hooks: &[],
+        was_working: Some(crate::continuation::claude_was_working),
         display_name: "Claude Code",
         binary: "claude",
         home: ToolPath {
@@ -323,6 +405,8 @@ pub static HARNESSES: &[Harness] = &[
     },
     Harness {
         id: "codex",
+        activity_hooks: CODEX_ACTIVITY_HOOKS,
+        was_working: Some(crate::continuation::hook_was_working),
         display_name: "Codex",
         binary: "codex",
         home: ToolPath {
@@ -362,6 +446,8 @@ pub static HARNESSES: &[Harness] = &[
     },
     Harness {
         id: "grok",
+        activity_hooks: GROK_ACTIVITY_HOOKS,
+        was_working: Some(crate::continuation::hook_was_working),
         display_name: "Grok",
         binary: "grok",
         home: ToolPath {
@@ -395,6 +481,8 @@ pub static HARNESSES: &[Harness] = &[
     },
     Harness {
         id: "opencode",
+        activity_hooks: &[],
+        was_working: None,
         display_name: "OpenCode",
         binary: "opencode",
         // OpenCode splits config (~/.config/opencode) from state; the state

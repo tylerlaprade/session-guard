@@ -141,7 +141,37 @@ targets the running Ghostty PID without permission to reconnect or relaunch it.
 
 When session-guard itself launches Ghostty, it disables the default empty window
 for that launch only. The first restored session creates the first window.
-Neither path submits a continuation prompt to the agent.
+Both paths use the same working-only continuation policy below.
+
+### Continuing interrupted work
+
+Claude, Codex, and Grok restores append the ordinary prompt `continue` only
+when an interrupted session has confirmed working status. Idle, stopped,
+waiting, unknown, and legacy recovery records reopen without a prompt.
+OpenCode currently reopens without automatic continuation.
+
+Claude's native `sessions/<pid>.json` supplies its status. The session ID, PID,
+and process start identity must match the interrupted owner, the frontend must
+be an interactive CLI, and the status must be `busy` without a waiting reason.
+A missing, removed, unreadable, or unfamiliar native record means no continuation.
+
+Codex and Grok use observation-only lifecycle hooks, keyed by turn ID and exact
+process owner. A prompt submission starts as unknown because another hook can
+reject it. An observed tool start/completion pair confirms work; outstanding
+tools remain waiting. Approval and notification events suppress continuation
+for the rest of that turn. Stop, failure, and explicit interrupt events settle
+it, and late events from another turn cannot revive it. No prompt, response,
+tool argument, or notification message text is classified.
+
+The launcher consumes the old activity before starting the restored process.
+A failed launch can be retried, but does not reuse the same continuation decision.
+New activity requires new native status or lifecycle evidence. Background-task
+loss is not automatically continued in this version.
+
+Run `session-guard install-hooks` after upgrading. Already-running tools may
+need a new session to load added hooks. Codex asks to trust new hooks; without
+that trust, conversation restoration still works but automatic continuation
+has no hook evidence and remains disabled.
 
 The daemon restores pending sessions when the terminal returns. An existing
 surviving terminal process or a missed process snapshot does not count as a
@@ -181,6 +211,8 @@ harness it is holding, so supporting another one means adding an entry to
 
 ```rust
 Harness {
+    activity_hooks: &[],
+    was_working: None,
     id: "amp",                       // the --tool value, and the on-disk name
     display_name: "Amp",
     binary: "amp",                   // must be in PATH before hooks install

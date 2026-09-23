@@ -51,14 +51,13 @@ pub fn run() -> Result<()> {
         if unsafe { libc::tcgetpgrp(0) } != unsafe { libc::getpgrp() } || input_waiting(0)? {
             return Ok(None);
         }
-        launch::claim(session, owner, &started);
-        Ok(Some(session.clone()))
+        Ok(Some(launch::claim(session, owner, &started)))
     })?;
     drop(restore_lock);
     if let Some(record) = record {
         daemon::log_line(&format!(
             "reusing fresh terminal {tty}: {} {}",
-            record.tool, record.session_id
+            record.record.tool, record.record.session_id
         ))?;
         launch::run_claimed(&record)?;
     }

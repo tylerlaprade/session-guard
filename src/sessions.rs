@@ -66,6 +66,8 @@ pub struct SessionRecord {
     pub source: Option<String>,
     #[serde(default)]
     pub restore_pending: bool,
+    #[serde(default)]
+    pub activity: Option<crate::continuation::Activity>,
 }
 
 impl SessionRecord {
@@ -103,6 +105,7 @@ impl SessionRecord {
             ending_at: None,
             source,
             restore_pending: false,
+            activity: None,
         }
     }
 
@@ -131,6 +134,7 @@ impl SessionRecord {
             ending_at: None,
             source: Some("transcript-fallback".to_string()),
             restore_pending: false,
+            activity: None,
         }
     }
 
@@ -267,8 +271,15 @@ fn write_store(path: &Path, sessions: &[SessionRecord]) -> Result<()> {
     result
 }
 
-pub fn register(path: &Path, record: SessionRecord) -> Result<()> {
+pub fn register(path: &Path, mut record: SessionRecord) -> Result<()> {
     with_sessions_mut(path, |sessions| {
+        if let Some(previous) = sessions.iter().find(|previous| {
+            previous.session_id == record.session_id
+                && previous.pid == record.pid
+                && previous.pid_started_at == record.pid_started_at
+        }) {
+            record.activity.clone_from(&previous.activity);
+        }
         sessions.retain(|session| session.session_id != record.session_id);
         sessions.push(record);
         Ok(())

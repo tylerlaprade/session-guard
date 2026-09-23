@@ -1,6 +1,7 @@
 mod adapters;
 mod cargo_targets;
 mod commands;
+mod continuation;
 mod harness;
 mod hooks;
 mod last_sessions;
@@ -199,6 +200,8 @@ enum Command {
     },
     Status,
     #[command(hide = true)]
+    Activity,
+    #[command(hide = true)]
     ShellStart,
     #[command(hide = true)]
     Launch {
@@ -251,6 +254,7 @@ fn main() -> Result<()> {
         Command::InstallHooks => commands::install_hooks::run(),
         Command::Uninstall { purge } => commands::uninstall::run(purge),
         Command::Status => commands::status::run(),
+        Command::Activity => continuation::record_hook(),
         Command::ShellStart => commands::shell_start::run(),
         Command::Launch { session_id } => commands::launch::run(&session_id),
         Command::LastSession { tool, shell_pid } => commands::last_session::run(tool, shell_pid),

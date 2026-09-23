@@ -6,6 +6,11 @@ use anyhow::{Context, Result, bail};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 
+pub(crate) struct LaunchRequest {
+    pub record: SessionRecord,
+    pub continue_work: bool,
+}
+
 pub fn run(session_id: &str) -> Result<()> {
     let path = paths::sessions_file()?;
     let owner = i32::try_from(std::process::id())?;
@@ -19,29 +24,42 @@ pub fn run(session_id: &str) -> Result<()> {
         if daemon::session_is_alive(session, &processes) {
             bail!("session {session_id} already has a live owner");
         }
-        claim(session, owner, &owner_started);
-        Ok(session.clone())
+        Ok(claim(session, owner, &owner_started))
     })?;
     run_claimed(&record)
 }
 
-pub(crate) fn claim(session: &mut SessionRecord, owner: i32, started: &str) {
+pub(crate) fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchRequest {
+    let continue_work = crate::continuation::should_continue(session);
     session.pid = Some(owner);
     session.shell_pid = Some(owner);
     session.pid_started_at = Some(started.to_string());
     session.shell_pid_started_at = Some(started.to_string());
     session.mark_active();
     session.source = Some("restore-launch".to_string());
+    session.activity = None;
+    LaunchRequest {
+        record: session.clone(),
+        continue_work,
+    }
 }
 
-pub(crate) fn run_claimed(record: &SessionRecord) -> Result<()> {
+pub(crate) fn run_claimed(request: &LaunchRequest) -> Result<()> {
+    let record = &request.record;
     let owner = std::process::id();
     daemon::log_line(&format!(
         "restore owner registered: {} {} pid={owner}",
         record.tool, record.session_id
     ))?;
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-    let command = daemon::resume_command(record);
+    let mut command = daemon::resume_command(record);
+    if request.continue_work {
+        command.push_str(" 'continue'");
+        daemon::log_line(&format!(
+            "continuing interrupted work: {} {}",
+            record.tool, record.session_id
+        ))?;
+    }
     let result = Command::new(shell)
         .args(["-ic", &command])
         .current_dir(&record.directory)

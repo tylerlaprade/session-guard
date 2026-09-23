@@ -44,7 +44,14 @@ pub fn install(tool: Tool) -> Result<HookChange> {
             events,
             register,
             deregister,
-        } => install_toml_hooks(&path.resolve()?, events, register, deregister),
+        } => {
+            let events: Vec<_> = events
+                .iter()
+                .chain(tool.spec().activity_hooks)
+                .cloned()
+                .collect();
+            install_toml_hooks(&path.resolve()?, &events, register, deregister)
+        }
         Integration::ScriptDir {
             path,
             events,
@@ -54,7 +61,11 @@ pub fn install(tool: Tool) -> Result<HookChange> {
             deregister,
         } => install_script_dir(
             &path.resolve()?,
-            events,
+            &events
+                .iter()
+                .chain(tool.spec().activity_hooks)
+                .cloned()
+                .collect::<Vec<_>>(),
             script_name,
             script,
             manifest_name,
@@ -96,7 +107,16 @@ fn install_at(tool: Tool, path: &Path) -> Result<HookChange> {
             register,
             deregister,
             ..
-        } => install_toml_hooks(path, events, register, deregister),
+        } => install_toml_hooks(
+            path,
+            &events
+                .iter()
+                .chain(tool.spec().activity_hooks)
+                .cloned()
+                .collect::<Vec<_>>(),
+            register,
+            deregister,
+        ),
         Integration::ScriptDir {
             events,
             script_name,
@@ -104,7 +124,18 @@ fn install_at(tool: Tool, path: &Path) -> Result<HookChange> {
             manifest_name,
             deregister,
             ..
-        } => install_script_dir(path, events, script_name, script, manifest_name, deregister),
+        } => install_script_dir(
+            path,
+            &events
+                .iter()
+                .chain(tool.spec().activity_hooks)
+                .cloned()
+                .collect::<Vec<_>>(),
+            script_name,
+            script,
+            manifest_name,
+            deregister,
+        ),
         Integration::PluginFile { name, source, .. } => install_plugin_file(path, name, source),
     }
 }
@@ -128,6 +159,7 @@ fn hook_command<'a>(event: &HookEvent, register: &'a str, deregister: &'a str) -
     match event.action {
         HookAction::Register => register,
         HookAction::Deregister => deregister,
+        HookAction::Activity => "session-guard activity",
     }
 }
 
@@ -355,6 +387,7 @@ fn all_hook_commands() -> Vec<&'static str> {
         })
         .collect();
     commands.extend_from_slice(old_hook_commands());
+    commands.push("session-guard activity");
     commands.sort_unstable();
     commands.dedup();
     commands
@@ -751,7 +784,12 @@ mod tests {
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
         let stop = root["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1);
+        assert_eq!(stop.len(), 2);
+        assert!(toml_event_has_command(stop, "session-guard activity"));
+        assert!(toml_event_has_command(
+            root["hooks"]["Interrupt"].as_array().unwrap(),
+            "session-guard activity"
+        ));
         let end = root["hooks"]["SessionEnd"].as_array().unwrap();
         assert!(toml_event_has_command(end, CODEX_DEREGISTER));
         let contents = fs::read_to_string(path).unwrap();
