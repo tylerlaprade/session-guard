@@ -230,6 +230,8 @@ pub enum Integration {
         name: &'static str,
         source: &'static str,
     },
+    /// No hooks: the daemon's process scan records the session.
+    ProcessScan,
 }
 
 /// How the crash-recovery scan finds sessions the hooks never recorded.
@@ -446,8 +448,36 @@ impl Harness {
     }
 }
 
+/// Terminal editors, restored by replaying the command they were launched
+/// with. Kept out of `HARNESSES`, which lists agent CLIs: those own the Cargo
+/// builds beneath them and take hooks, and an editor does neither.
+pub static EDITOR: Harness = Harness {
+    id: "editor",
+    activity_hooks: &[],
+    was_working: None,
+    observe_activity: None,
+    display_name: "editor",
+    binary: "hx",
+    home: ToolPath {
+        env: None,
+        default: &[],
+        suffix: &[],
+    },
+    resume: "{command}",
+    discovery: Discovery::Opaque,
+    integration: Integration::ProcessScan,
+    session_id_env: None,
+    identifies_process: Some(crate::scan::is_editor_process),
+    session_id_from_process: None,
+    is_unused_spare: None,
+    install_note: None,
+};
+
 pub fn find(id: &str) -> Option<&'static Harness> {
-    HARNESSES.iter().find(|harness| harness.id == id)
+    HARNESSES
+        .iter()
+        .chain(std::iter::once(&EDITOR))
+        .find(|harness| harness.id == id)
 }
 
 /// Harness names for help and error text, e.g. "Claude Code, Codex, or Grok".
@@ -494,7 +524,7 @@ mod tests {
                 Integration::JsonSettings { events, .. }
                 | Integration::TomlConfig { events, .. }
                 | Integration::ScriptDir { events, .. } => events,
-                Integration::PluginFile { .. } => continue,
+                Integration::PluginFile { .. } | Integration::ProcessScan => continue,
             };
             assert!(
                 !events.is_empty(),
@@ -513,6 +543,7 @@ mod tests {
                 | Integration::TomlConfig { path, .. }
                 | Integration::ScriptDir { path, .. }
                 | Integration::PluginFile { path, .. } => path,
+                Integration::ProcessScan => continue,
             };
             assert!(path.resolve().is_ok(), "{} integration path", harness.id);
         }

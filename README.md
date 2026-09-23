@@ -1,7 +1,8 @@
 # session-guard
 
 `session-guard` tracks active Claude Code, Codex CLI, Grok, and OpenCode
-sessions and restores them after a macOS crash or reboot.
+sessions, along with Helix, Vim, and Neovim editors opened at a shell prompt,
+and restores them after a macOS crash or reboot.
 
 Licensed under [GPL-3.0-only](LICENSE).
 
@@ -103,6 +104,13 @@ When a tracked session is interrupted, its record becomes `pending`; there
 is no two-minute death cluster, activity-age cutoff, or expiry for a confirmed
 pending recovery.
 
+A tab can also die without a SessionEnd reaching session-guard, when a tool is
+killed along with its tab or its hook fails. The daemon judges those deaths by the same
+aftermath as a SessionEnd once the ten-second grace has passed. If the tool's
+shell or the terminal instance that owned the tab is still running, the user
+ended it: the record stops waiting for a relaunch and stays recoverable
+through `restore --all` until it expires.
+
 Restored tabs run through `session-guard launch`. That foreground controller
 registers its process identity before starting the provider in the user's
 interactive shell, preserving shell wrappers. It remains alive for the command's
@@ -150,10 +158,13 @@ when an interrupted session has confirmed working status. Idle, stopped,
 waiting, unknown, and legacy recovery records reopen without a prompt.
 OpenCode currently reopens without automatic continuation.
 
-Claude's native `sessions/<pid>.json` supplies its status. The session ID, PID,
-and process start identity must match the interrupted owner, the frontend must
-be an interactive CLI, and the status must be `busy` without a waiting reason.
-A missing, removed, unreadable, or unfamiliar native record means no continuation.
+Claude's native `sessions/<pid>.json` supplies its status. Claude deletes that
+file as it exits, before its SessionEnd hook runs, so the daemon records the
+status of each live Claude session every five seconds and the restore reads
+that record. The session ID, PID, and process start identity must match the
+interrupted owner, the frontend must be an interactive CLI, and the status must
+be `busy` without a waiting reason. A missing, unreadable, or unfamiliar native
+record reads as idle, so it means no continuation.
 
 Codex and Grok use observation-only lifecycle hooks, keyed by turn ID and exact
 process owner. A prompt submission starts as unknown because another hook can
@@ -178,6 +189,26 @@ has no hook evidence and remains disabled.
 The daemon restores pending sessions when the terminal returns. An existing
 surviving terminal process or a missed process snapshot does not count as a
 relaunch. The short startup delay is only for terminal readiness.
+
+### Tab order
+
+Once a minute the daemon reads Ghostty's tab order through its scripting
+dictionary and records each live session's window and tab by its shell's tty.
+A restore reopens tabs in that order, and a reused first tab takes the session
+that was first. Tabs from several windows reopen in one window, in window
+order. Sessions never seen in a tab follow in their existing order.
+
+### Editors
+
+Helix (`hx`), Vim, `vi`, and Neovim run with no hooks, so the daemon's
+once-a-minute process scan records them instead. It keeps an editor only when
+its parent is a shell and neither it nor any ancestor is a tracked session, so
+`git commit` editors, an agent's editor, and an editor that a restore itself
+relaunched are skipped. The record holds the editor's exact argument vector
+and working directory from the kernel, and a restore replays that command.
+This reopens the files the editor was launched with, not buffers opened
+afterward, and never unsaved changes. Quitting the editor, or closing its tab
+while the terminal stays up, drops the record.
 
 Claude workers explicitly marked `dispatch.source = "spare"` in Claude's
 native roster are excluded unless promoted to a native job. Useful detached

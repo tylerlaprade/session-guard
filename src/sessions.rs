@@ -68,6 +68,14 @@ pub struct SessionRecord {
     pub restore_pending: bool,
     #[serde(default)]
     pub activity: Option<crate::continuation::Activity>,
+    // The exact argv to replay, for a session that is its process (an editor)
+    // rather than a resumable id.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    // (window, tab) in the terminal's own order when last observed, so tabs
+    // reopen in the order they had.
+    #[serde(default)]
+    pub tab_position: Option<(u32, u32)>,
 }
 
 impl SessionRecord {
@@ -106,6 +114,8 @@ impl SessionRecord {
             source,
             restore_pending: false,
             activity: None,
+            command: None,
+            tab_position: None,
         }
     }
 
@@ -135,6 +145,8 @@ impl SessionRecord {
             source: Some("transcript-fallback".to_string()),
             restore_pending: false,
             activity: None,
+            command: None,
+            tab_position: None,
         }
     }
 
@@ -280,6 +292,12 @@ pub fn register(path: &Path, mut record: SessionRecord) -> Result<()> {
                 && record.source.is_none()
         }) {
             record.activity.clone_from(&previous.activity);
+        }
+        if let Some(previous) = sessions
+            .iter()
+            .find(|previous| previous.session_id == record.session_id)
+        {
+            record.tab_position = record.tab_position.or(previous.tab_position);
         }
         sessions.retain(|session| session.session_id != record.session_id);
         sessions.push(record);

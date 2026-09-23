@@ -74,6 +74,7 @@ pub fn install(tool: Tool) -> Result<HookChange> {
         Integration::PluginFile { path, name, source } => {
             install_plugin_file(&path.resolve()?, name, source)
         }
+        Integration::ProcessScan => Ok(HookChange { changed: false }),
     }
 }
 
@@ -88,6 +89,7 @@ pub fn remove(tool: Tool) -> Result<HookChange> {
             ..
         } => remove_files(&path.resolve()?, &[manifest_name, script_name]),
         Integration::PluginFile { path, name, .. } => remove_files(&path.resolve()?, &[name]),
+        Integration::ProcessScan => Ok(HookChange { changed: false }),
     }
 }
 
@@ -137,6 +139,7 @@ fn install_at(tool: Tool, path: &Path) -> Result<HookChange> {
             deregister,
         ),
         Integration::PluginFile { name, source, .. } => install_plugin_file(path, name, source),
+        Integration::ProcessScan => Ok(HookChange { changed: false }),
     }
 }
 
@@ -151,6 +154,7 @@ fn remove_at(tool: Tool, path: &Path) -> Result<HookChange> {
             ..
         } => remove_files(path, &[manifest_name, script_name]),
         Integration::PluginFile { name, .. } => remove_files(path, &[name]),
+        Integration::ProcessScan => Ok(HookChange { changed: false }),
     }
 }
 
@@ -383,7 +387,7 @@ fn all_hook_commands() -> Vec<&'static str> {
                 ..
             } => vec![*register, *deregister],
             Integration::ScriptDir { deregister, .. } => vec![*deregister],
-            Integration::PluginFile { .. } => Vec::new(),
+            Integration::PluginFile { .. } | Integration::ProcessScan => Vec::new(),
         })
         .collect();
     commands.extend_from_slice(old_hook_commands());

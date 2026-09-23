@@ -1,5 +1,6 @@
 use crate::adapters::{adapter_for, shell_quote};
 use crate::cargo_targets;
+use crate::harness::Integration;
 use crate::last_sessions::{self, LastSessionRecord};
 use crate::paths;
 use crate::process::{self, ProcessSnapshot};
@@ -46,7 +47,7 @@ impl RestoreSummary {
 
     pub fn message(&self) -> String {
         use std::fmt::Write as _;
-        let per_tool: Vec<String> = Tool::all()
+        let mut per_tool: Vec<String> = Tool::all()
             .map(|tool| {
                 format!(
                     "{} {}",
@@ -55,6 +56,11 @@ impl RestoreSummary {
                 )
             })
             .collect();
+        match self.restored.get(&Tool::editor()).copied() {
+            Some(1) => per_tool.push("1 editor".to_string()),
+            Some(editors) if editors > 1 => per_tool.push(format!("{editors} editors")),
+            _ => {}
+        }
         let mut message = format!(
             "Restored {} sessions ({}). Pruned {} (directory gone).",
             self.restored_total(),
@@ -169,7 +175,7 @@ pub fn run() -> Result<()> {
                 let released = release_closed_tabs(&processes)?;
                 if released > 0 {
                     log_line(&format!(
-                        "released {released} sessions whose tabs closed under a running terminal"
+                        "released {released} sessions that ended under a running terminal"
                     ))?;
                 }
                 let summary = settle_endings(&processes)?;
@@ -199,6 +205,9 @@ pub fn run() -> Result<()> {
             }
 
             let summary = monitor_once()?;
+            if let Ok(processes) = ProcessSnapshot::capture() {
+                record_tab_positions(&processes)?;
+            }
             if summary.marked_recoverable > 0 {
                 log_line(&format!(
                     "monitor marked {} sessions recoverable",
@@ -247,9 +256,16 @@ fn run_cargo_target_cleanup() -> Result<()> {
 pub fn reconcile_from_scan() -> Result<usize> {
     let path = paths::sessions_file()?;
     let _ = sessions::repair_if_corrupt(&path)?;
-    let scanned = process::list_processes()
-        .and_then(|processes| scan::discover_sessions(&processes))
-        .unwrap_or_default();
+    let processes = process::list_processes().unwrap_or_default();
+    let mut scanned = scan::discover_sessions(&processes).unwrap_or_default();
+    if let Ok(snapshot) = ProcessSnapshot::capture() {
+        let tracked: HashSet<i32> = sessions::read_sessions(&path)?
+            .iter()
+            .filter(|session| session_tool_is_alive(session, &snapshot))
+            .filter_map(|session| session.pid)
+            .collect();
+        scanned.extend(scan::discover_editors(&processes, &tracked));
+    }
 
     sessions::with_sessions_mut(&path, |sessions| {
         let mut added = 0;
@@ -381,6 +397,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             to_open.push(session);
         }
 
+        to_open.sort_by_key(tab_order);
         *sessions = alive_kept
             .into_iter()
             .chain(to_open.iter().cloned())
@@ -614,11 +631,56 @@ fn release_closed_tabs(processes: &ProcessSnapshot) -> Result<usize> {
     }
     sessions::with_sessions_mut(&path, |sessions| {
         let mut released = 0;
-        for session in sessions.iter_mut().filter(|session| releasable(session)) {
-            session.restore_pending = false;
+        sessions.retain_mut(|session| {
+            if !releasable(session) {
+                return true;
+            }
             released += 1;
-        }
+            session.restore_pending = false;
+            !matches!(session.tool.spec().integration, Integration::ProcessScan)
+        });
         Ok(released)
+    })
+}
+
+// The terminal's tab order, recorded on each live session so a restore can
+// reopen its tabs in the order they had.
+fn record_tab_positions(processes: &ProcessSnapshot) -> Result<()> {
+    let Ok(terminal) = configured_terminal() else {
+        return Ok(());
+    };
+    if processes
+        .instance_started_at(terminal.process_name())
+        .is_none()
+    {
+        return Ok(());
+    }
+    let Ok(positions) = adapter_for(terminal).tab_positions() else {
+        return Ok(());
+    };
+    let by_tty: HashMap<String, (u32, u32)> = positions
+        .into_iter()
+        .map(|(position, tty)| (tty, position))
+        .collect();
+    let observed = |session: &SessionRecord| {
+        (session.state == SessionState::Active && session_is_alive(session, processes))
+            .then(|| processes.tty(session.shell_pid?))
+            .flatten()
+            .and_then(|tty| by_tty.get(tty).copied())
+    };
+    let path = paths::sessions_file()?;
+    if !sessions::read_sessions(&path)?.iter().any(|session| {
+        observed(session).is_some_and(|position| session.tab_position != Some(position))
+    }) {
+        return Ok(());
+    }
+    sessions::with_sessions_mut(&path, |sessions| {
+        for session in sessions.iter_mut() {
+            if let Some(position) = observed(session) {
+                session.tab_position = Some(position);
+            }
+        }
+        Ok(())
     })
 }
 
@@ -859,11 +921,24 @@ fn should_replace(
 }
 
 pub(crate) fn resume_command(session: &SessionRecord) -> String {
+    let command: Vec<String> = session
+        .command
+        .iter()
+        .flatten()
+        .map(|argument| shell_quote(argument))
+        .collect();
     session
         .tool
         .spec()
         .resume
         .replace("{session_id}", &shell_quote(&session.session_id))
+        .replace("{command}", &command.join(" "))
+}
+
+/// Where a session's tab sat among the terminal's tabs; sessions never
+/// observed in a tab follow the rest in their existing order.
+pub(crate) fn tab_order(session: &SessionRecord) -> (u32, u32) {
+    session.tab_position.unwrap_or((u32::MAX, u32::MAX))
 }
 
 #[cfg(test)]
@@ -898,6 +973,46 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn an_editor_resumes_by_replaying_its_exact_command() {
+        let mut session = sample(Tool::editor(), "hx-1-2");
+        session.command = Some(vec!["hx".into(), "my notes.txt".into(), "it's.md".into()]);
+        assert_eq!(
+            resume_command(&session),
+            r"'hx' 'my notes.txt' 'it'\''s.md'"
+        );
+    }
+
+    #[test]
+    fn tabs_reopen_in_their_recorded_order_with_unplaced_ones_last() {
+        let mut sessions: Vec<SessionRecord> = [
+            ("unplaced-a", None),
+            ("second-window", Some((2, 1))),
+            ("tab-3", Some((1, 3))),
+            ("unplaced-b", None),
+            ("tab-1", Some((1, 1))),
+        ]
+        .into_iter()
+        .map(|(id, position)| {
+            let mut session = sample(crate::tool("claude"), id);
+            session.tab_position = position;
+            session
+        })
+        .collect();
+        sessions.sort_by_key(tab_order);
+        let order: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "tab-1",
+                "tab-3",
+                "second-window",
+                "unplaced-a",
+                "unplaced-b"
+            ]
+        );
     }
 
     #[test]
@@ -1152,6 +1267,16 @@ mod tests {
             watch.relaunched(Some(now), now + Duration::seconds(5)),
             Some(now)
         );
+    }
+
+    #[test]
+    fn restore_summary_names_editors_only_when_it_restored_some() {
+        let mut summary = RestoreSummary::default();
+        assert!(!summary.message().contains("editor"));
+        summary.record_restore(Tool::editor());
+        assert!(summary.message().contains(", 1 editor)"));
+        summary.record_restore(Tool::editor());
+        assert!(summary.message().contains(", 2 editors)"));
     }
 
     #[test]

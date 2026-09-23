@@ -42,9 +42,11 @@ pub fn run() -> Result<()> {
     let started = process::process_start_identity(owner)?;
     let record = sessions::with_sessions_mut(&path, |sessions| {
         let processes = ProcessSnapshot::capture()?;
-        let Some(session) = sessions
+        let Some((_, session)) = sessions
             .iter_mut()
-            .find(|session| eligible(session, &processes))
+            .enumerate()
+            .filter(|(_, session)| eligible(session, &processes))
+            .min_by_key(|(index, session)| (daemon::tab_order(session), *index))
         else {
             return Ok(None);
         };

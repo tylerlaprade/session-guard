@@ -100,6 +100,29 @@ impl TerminalAdapter for Ghostty {
         command.args(["-a", "Ghostty", "--args", "--initial-window=false"]);
         run_checked(command, "launching Ghostty")
     }
+
+    fn tab_positions(&self) -> Result<Vec<((u32, u32), String)>> {
+        let mut osa = Command::new("osascript");
+        osa.args(["-e", include_str!("ghostty_tab_order.applescript")]);
+        let reply = super::run_capture_timeout(
+            &mut osa,
+            "reading Ghostty tab order",
+            Duration::from_secs(2),
+        )?;
+        Ok(parse_tab_positions(&reply))
+    }
+}
+
+fn parse_tab_positions(reply: &str) -> Vec<((u32, u32), String)> {
+    reply
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let window = fields.next()?.parse().ok()?;
+            let tab = fields.next()?.parse().ok()?;
+            Some(((window, tab), fields.next()?.to_string()))
+        })
+        .collect()
 }
 
 // Ghostty can accept the scripting request and return a tab id, yet fail to
@@ -136,6 +159,20 @@ fn wait_for_surface_start(tab_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_positions_pair_each_tty_with_its_window_and_tab() {
+        assert_eq!(
+            parse_tab_positions(
+                "1\t1\t/dev/ttys000\n1\t2\t/dev/ttys003\n2\t1\t/dev/ttys009\nnoise"
+            ),
+            vec![
+                ((1, 1), "/dev/ttys000".to_string()),
+                ((1, 2), "/dev/ttys003".to_string()),
+                ((2, 1), "/dev/ttys009".to_string()),
+            ]
+        );
+    }
 
     /// A pass's first tab goes wherever Ghostty puts it; the rest go into
     /// the window that first tab landed in, by that window's id.

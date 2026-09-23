@@ -51,6 +51,99 @@ pub fn boot_identifier() -> Option<String> {
     }
 }
 
+/// The exact argument vector a process was started with, from the kernel:
+/// `ps` joins arguments with spaces, which cannot be replayed faithfully.
+#[cfg(target_os = "macos")]
+pub fn process_arguments(pid: i32) -> Option<Vec<String>> {
+    let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut length = 0;
+    if unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    let mut buffer = vec![0_u8; length];
+    if unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    buffer.truncate(length);
+    parse_process_arguments(&buffer)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_arguments(pid: i32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    raw.strip_suffix(&[0])
+        .unwrap_or(&raw)
+        .split(|byte| *byte == 0)
+        .map(|argument| String::from_utf8(argument.to_vec()).ok())
+        .collect()
+}
+
+/// `KERN_PROCARGS2` lays out argc, the executable path, NUL padding, and then
+/// argc NUL-terminated arguments followed by the environment.
+fn parse_process_arguments(buffer: &[u8]) -> Option<Vec<String>> {
+    let argc = usize::try_from(i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = buffer.get(4..)?;
+    let executable_end = rest.iter().position(|byte| *byte == 0)?;
+    let arguments_start = executable_end
+        + rest
+            .get(executable_end..)?
+            .iter()
+            .position(|byte| *byte != 0)?;
+    let arguments: Vec<String> = rest
+        .get(arguments_start..)?
+        .split(|byte| *byte == 0)
+        .take(argc)
+        .map(|argument| String::from_utf8(argument.to_vec()).ok())
+        .collect::<Option<_>>()?;
+    (arguments.len() == argc).then_some(arguments)
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_directory(pid: i32) -> Option<std::path::PathBuf> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>()).ok()?;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let path = unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+    Some(std::path::PathBuf::from(path.to_str().ok()?)).filter(|path| path.is_absolute())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_directory(pid: i32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
 pub fn process_command(pid: i32) -> Result<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -106,12 +199,14 @@ fn normalize_identity(raw: &str) -> String {
 pub struct ProcessSnapshot {
     /// pid -> (start identity, lowercased command name)
     processes: std::collections::HashMap<i32, (String, String)>,
+    /// pid -> controlling terminal device, for processes that have one.
+    ttys: std::collections::HashMap<i32, String>,
 }
 
 impl ProcessSnapshot {
     pub fn capture() -> Result<Self> {
         let output = Command::new("ps")
-            .args(["-axww", "-o", "pid=,lstart=,stat=,comm="])
+            .args(["-axww", "-o", "pid=,lstart=,stat=,tty=,comm="])
             .env("LC_ALL", "C")
             .env("TZ", "UTC")
             .output()
@@ -122,6 +217,7 @@ impl ProcessSnapshot {
         }
 
         let mut processes = std::collections::HashMap::new();
+        let mut ttys = std::collections::HashMap::new();
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let mut parts = line.split_whitespace();
             let Some(pid) = parts.next().and_then(|pid| pid.parse::<i32>().ok()) else {
@@ -138,11 +234,21 @@ impl ProcessSnapshot {
             if state.starts_with('Z') {
                 continue;
             }
+            let Some(tty) = parts.next() else {
+                continue;
+            };
+            if tty != "??" {
+                ttys.insert(pid, format!("/dev/{tty}"));
+            }
             let comm = parts.collect::<Vec<_>>().join(" ").to_ascii_lowercase();
             processes.insert(pid, (start.join(" "), comm));
         }
 
-        Ok(Self { processes })
+        Ok(Self { processes, ttys })
+    }
+
+    pub fn tty(&self, pid: i32) -> Option<&str> {
+        self.ttys.get(&pid).map(String::as_str)
     }
 
     pub fn is_alive(&self, pid: i32) -> bool {
@@ -301,6 +407,30 @@ pub fn cli_process_is_running(process_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arguments_keep_spaces_and_empty_strings_apart() {
+        let mut buffer = 3_i32.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(b"/usr/local/bin/hx\0\0\0hx\0my notes.txt\0\0PATH=/bin\0");
+        assert_eq!(
+            parse_process_arguments(&buffer),
+            Some(vec!["hx".into(), "my notes.txt".into(), String::new()])
+        );
+        assert_eq!(parse_process_arguments(&buffer[..10]), None);
+    }
+
+    #[test]
+    fn a_live_process_reports_its_own_arguments_and_directory() {
+        let pid = std::process::id() as i32;
+        assert_eq!(
+            process_arguments(pid),
+            Some(std::env::args().collect::<Vec<_>>())
+        );
+        assert_eq!(
+            process_directory(pid),
+            Some(std::env::current_dir().unwrap())
+        );
+    }
+
     use super::*;
 
     #[test]

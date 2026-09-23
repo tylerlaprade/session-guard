@@ -41,6 +41,11 @@ impl Tool {
     pub fn from_id(id: &str) -> Option<Self> {
         harness::find(id).map(Tool)
     }
+
+    #[must_use]
+    pub fn editor() -> Self {
+        Tool(&harness::EDITOR)
+    }
 }
 
 /// Ids are unique across the registry, so they decide identity.

@@ -13,6 +13,11 @@ pub trait TerminalAdapter {
     fn open_tab(&self, directory: &Path, command: &str) -> Result<()>;
     fn is_running(&self) -> bool;
     fn launch(&self) -> Result<()>;
+    /// Every terminal's tty with its (window, tab) position, for a terminal
+    /// whose scripting exposes its tab order.
+    fn tab_positions(&self) -> Result<Vec<((u32, u32), String)>> {
+        Ok(Vec::new())
+    }
 }
 
 pub fn adapter_for(kind: TerminalKind) -> Box<dyn TerminalAdapter> {

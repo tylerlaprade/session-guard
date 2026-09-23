@@ -58,6 +58,84 @@ pub fn discover_sessions(processes: &[ProcInfo]) -> Result<Vec<SessionRecord>> {
     Ok(records)
 }
 
+const EDITORS: &[&str] = &["hx", "helix", "vi", "vim", "nvim"];
+const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "nu"];
+
+fn executable_name(process: &ProcInfo) -> &str {
+    let executable = process
+        .command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    executable
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('-')
+}
+
+pub(crate) fn is_editor_process(process: &ProcInfo) -> bool {
+    EDITORS.contains(&executable_name(process))
+}
+
+/// Editors typed at a tab's shell prompt, each recorded with the exact
+/// command that reopens it. An editor under anything but a shell (`git
+/// commit`, an agent's editor key) was not the user's own launch, and one
+/// beneath a tracked session is already restored as part of it, including an
+/// editor that a restore relaunched.
+pub fn discover_editors(
+    processes: &[ProcInfo],
+    tracked: &std::collections::HashSet<i32>,
+) -> Vec<SessionRecord> {
+    let by_pid: std::collections::HashMap<i32, &ProcInfo> = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect();
+    let within_tracked = |process: &ProcInfo| {
+        let mut pid = process.pid;
+        for _ in 0..by_pid.len() {
+            if tracked.contains(&pid) {
+                return true;
+            }
+            match by_pid.get(&pid) {
+                Some(current) if current.ppid > 1 => pid = current.ppid,
+                _ => return false,
+            }
+        }
+        false
+    };
+    processes
+        .iter()
+        .filter(|process| is_editor_process(process))
+        .filter(|process| {
+            by_pid
+                .get(&process.ppid)
+                .is_some_and(|parent| SHELLS.contains(&executable_name(parent)))
+        })
+        .filter(|process| !within_tracked(process))
+        .filter_map(|process| {
+            let command = crate::process::process_arguments(process.pid)?;
+            let directory = crate::process::process_directory(process.pid)?;
+            let started = crate::process::process_start_identity(process.pid).ok()?;
+            let started = crate::process::parse_identity(&started)?
+                .and_utc()
+                .timestamp();
+            let mut record = SessionRecord::new(
+                Tool::editor(),
+                format!("{}-{}-{started}", executable_name(process), process.pid),
+                Some(process.pid),
+                Some(process.ppid),
+                directory,
+                None,
+                None,
+                Some("scan".to_string()),
+            );
+            record.command = Some(command);
+            Some(record)
+        })
+        .collect()
+}
+
 pub fn is_unused_spare(tool: Tool, session_id: &str) -> bool {
     tool.spec()
         .is_unused_spare
@@ -245,6 +323,77 @@ mod tests {
         )
         .unwrap();
         assert!(!claude_is_unused_spare(home.path(), SESSION_ID));
+    }
+
+    fn editor_under(parent: &str) -> Vec<ProcInfo> {
+        vec![
+            ProcInfo {
+                pid: 900_001,
+                ppid: 900_000,
+                command: parent.to_string(),
+            },
+            ProcInfo {
+                pid: 900_000,
+                ppid: 1,
+                command: "/Applications/Ghostty.app/Contents/MacOS/ghostty".to_string(),
+            },
+            ProcInfo {
+                pid: std::process::id() as i32,
+                ppid: 900_001,
+                command: "hx notes.txt".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn an_editor_typed_at_a_shell_is_recorded_with_its_exact_command() {
+        let records = discover_editors(&editor_under("-zsh"), &std::collections::HashSet::new());
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.tool, Tool::editor());
+        assert_eq!(record.shell_pid, Some(900_001));
+        assert_eq!(record.directory, std::env::current_dir().unwrap());
+        assert_eq!(
+            record.command.as_deref(),
+            Some(std::env::args().collect::<Vec<_>>().as_slice())
+        );
+        assert!(
+            record
+                .session_id
+                .starts_with(&format!("hx-{}-", std::process::id()))
+        );
+    }
+
+    #[test]
+    fn an_editor_not_launched_by_the_user_at_a_shell_is_ignored() {
+        let untracked = std::collections::HashSet::new();
+        assert!(discover_editors(&editor_under("git commit"), &untracked).is_empty());
+        assert!(discover_editors(&editor_under("/opt/homebrew/bin/nvim"), &untracked).is_empty());
+        for tracked in [900_000, 900_001, std::process::id() as i32] {
+            assert!(
+                discover_editors(
+                    &editor_under("-zsh"),
+                    &std::collections::HashSet::from([tracked])
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn editors_are_named_by_their_executable() {
+        for command in [
+            "hx",
+            "/opt/homebrew/bin/nvim --clean a.txt",
+            "vim",
+            "vi -R x",
+            "helix",
+        ] {
+            assert!(is_editor_process(&proc(command)), "{command}");
+        }
+        for command in ["-zsh", "hxd file", "/usr/bin/vimtutor", "claude"] {
+            assert!(!is_editor_process(&proc(command)), "{command}");
+        }
     }
 
     fn proc(command: &str) -> ProcInfo {
