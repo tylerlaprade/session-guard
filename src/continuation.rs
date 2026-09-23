@@ -217,7 +217,7 @@ pub fn codex_was_working(record: &SessionRecord) -> bool {
         if event["type"] == "event_msg" {
             match payload["type"].as_str() {
                 Some("task_started") => {
-                    active_turn = payload["turn_id"].as_str().map(str::to_string)
+                    active_turn = payload["turn_id"].as_str().map(str::to_string);
                 }
                 Some("task_complete" | "turn_aborted" | "error") => active_turn = None,
                 _ => {}
