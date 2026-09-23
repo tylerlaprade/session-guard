@@ -255,6 +255,10 @@ pub enum Discovery {
 pub struct Harness {
     pub activity_hooks: &'static [HookEvent],
     pub was_working: Option<fn(&crate::sessions::SessionRecord) -> bool>,
+    /// Reads a live session's work state for the daemon to record, for a
+    /// harness whose state is gone once its process exits.
+    pub observe_activity:
+        Option<fn(&crate::sessions::SessionRecord) -> Option<crate::continuation::Activity>>,
     /// Wire name: the `--tool` value, and how sessions are stored on disk.
     pub id: &'static str,
     /// Name for human-facing output.
@@ -284,7 +288,8 @@ pub static HARNESSES: &[Harness] = &[
     Harness {
         id: "claude",
         activity_hooks: &[],
-        was_working: Some(crate::continuation::claude_was_working),
+        was_working: Some(crate::continuation::activity_was_working),
+        observe_activity: Some(crate::continuation::claude_activity),
         display_name: "Claude Code",
         binary: "claude",
         home: ToolPath {
@@ -318,6 +323,7 @@ pub static HARNESSES: &[Harness] = &[
         id: "codex",
         activity_hooks: CODEX_ACTIVITY_HOOKS,
         was_working: Some(crate::continuation::codex_was_working),
+        observe_activity: None,
         display_name: "Codex",
         binary: "codex",
         home: ToolPath {
@@ -358,7 +364,8 @@ pub static HARNESSES: &[Harness] = &[
     Harness {
         id: "grok",
         activity_hooks: GROK_ACTIVITY_HOOKS,
-        was_working: Some(crate::continuation::hook_was_working),
+        was_working: Some(crate::continuation::activity_was_working),
+        observe_activity: None,
         display_name: "Grok",
         binary: "grok",
         home: ToolPath {
@@ -394,6 +401,7 @@ pub static HARNESSES: &[Harness] = &[
         id: "opencode",
         activity_hooks: &[],
         was_working: None,
+        observe_activity: None,
         display_name: "OpenCode",
         binary: "opencode",
         // OpenCode splits config (~/.config/opencode) from state; the state

@@ -165,6 +165,13 @@ pub fn run() -> Result<()> {
         if seconds_until_settle == 0 {
             seconds_until_settle = SESSION_END_SETTLE_INTERVAL_SECS;
             if let Ok(processes) = ProcessSnapshot::capture() {
+                crate::continuation::observe(&processes)?;
+                let released = release_closed_tabs(&processes)?;
+                if released > 0 {
+                    log_line(&format!(
+                        "released {released} sessions whose tabs closed under a running terminal"
+                    ))?;
+                }
                 let summary = settle_endings(&processes)?;
                 if summary.retired > 0 || summary.marked_recoverable > 0 {
                     log_line(&format!(
@@ -592,6 +599,43 @@ pub fn settle_endings(processes: &ProcessSnapshot) -> Result<SettleSummary> {
     })
 }
 
+// A tab can die without a SessionEnd reaching session-guard, which leaves its
+// record waiting for the next terminal relaunch. Once the aftermath shows the
+// tab closed under a terminal that stayed up, it was not a victim of the
+// terminal going down: it stays recoverable but no longer reopens on its own.
+fn release_closed_tabs(processes: &ProcessSnapshot) -> Result<usize> {
+    let path = paths::sessions_file()?;
+    let now = chrono::Utc::now();
+    let terminal = configured_terminal().ok().map(TerminalKind::process_name);
+    let releasable =
+        |session: &SessionRecord| closed_under_running_terminal(session, processes, terminal, now);
+    if !sessions::read_sessions(&path)?.iter().any(releasable) {
+        return Ok(0);
+    }
+    sessions::with_sessions_mut(&path, |sessions| {
+        let mut released = 0;
+        for session in sessions.iter_mut().filter(|session| releasable(session)) {
+            session.restore_pending = false;
+            released += 1;
+        }
+        Ok(released)
+    })
+}
+
+fn closed_under_running_terminal(
+    session: &SessionRecord,
+    processes: &ProcessSnapshot,
+    terminal_executable: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    session.state == SessionState::Recoverable
+        && session.restore_pending
+        && session
+            .dead_at
+            .is_some_and(|dead_at| (now - dead_at).num_seconds() >= SESSION_END_GRACE_SECS)
+        && ending_verdict(session, processes, terminal_executable) == EndingVerdict::Retire
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DaemonHeartbeat {
     timestamp: chrono::DateTime<chrono::Utc>,
@@ -989,6 +1033,42 @@ mod tests {
             ending_verdict(&session, &processes, Some(&own_executable())),
             EndingVerdict::Recoverable
         );
+    }
+
+    #[test]
+    fn a_tab_closed_under_a_running_terminal_stops_waiting_for_a_relaunch() {
+        let processes = ProcessSnapshot::capture().unwrap();
+        let terminal = own_executable();
+        let mut session = ended_session(i32::MAX, "Fri Jan 1 00:00:00 2100");
+        session.mark_recoverable();
+        let died = session.dead_at.unwrap();
+        let settled = died + chrono::Duration::seconds(SESSION_END_GRACE_SECS);
+        assert!(!closed_under_running_terminal(
+            &session,
+            &processes,
+            Some(&terminal),
+            died
+        ));
+        assert!(closed_under_running_terminal(
+            &session,
+            &processes,
+            Some(&terminal),
+            settled
+        ));
+        assert!(!closed_under_running_terminal(
+            &session,
+            &processes,
+            Some("no-such-terminal-xyz"),
+            settled
+        ));
+        let mut relaunched = ended_session(i32::MAX, "Wed Jan 1 00:00:00 2020");
+        relaunched.mark_recoverable();
+        assert!(!closed_under_running_terminal(
+            &relaunched,
+            &processes,
+            Some(&terminal),
+            settled
+        ));
     }
 
     #[test]

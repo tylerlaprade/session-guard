@@ -4,6 +4,7 @@ use crate::paths;
 use crate::sessions::{self, SessionRecord};
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
@@ -148,9 +149,42 @@ fn read_hook_input() -> Result<Option<HookInput>> {
         return Ok(None);
     }
 
-    serde_json::from_str(&contents)
+    parse_hook_payload(&contents)
         .with_context(|| format!("failed to parse hook stdin as JSON: {contents}"))
         .map(Some)
+}
+
+/// Grok sends every field under both Claude's `snake_case` key and its own
+/// `camelCase` key, and serde rejects a key together with its alias as a
+/// duplicate, so the `camelCase` twin of a `snake_case` key is dropped first.
+pub(crate) fn parse_hook_payload<T: DeserializeOwned>(contents: &str) -> serde_json::Result<T> {
+    let mut payload: serde_json::Value = serde_json::from_str(contents)?;
+    if let Some(fields) = payload.as_object_mut() {
+        let twins: Vec<String> = fields
+            .keys()
+            .filter(|key| {
+                let snake = snake_case(key);
+                snake != **key && fields.contains_key(&snake)
+            })
+            .cloned()
+            .collect();
+        for twin in twins {
+            fields.remove(&twin);
+        }
+    }
+    serde_json::from_value(payload)
+}
+
+fn snake_case(key: &str) -> String {
+    key.chars().fold(String::new(), |mut snake, character| {
+        if character.is_ascii_uppercase() {
+            snake.push('_');
+            snake.push(character.to_ascii_lowercase());
+        } else {
+            snake.push(character);
+        }
+        snake
+    })
 }
 
 #[cfg(test)]
@@ -212,6 +246,19 @@ mod tests {
         assert_eq!(
             input.workspace_root.as_deref(),
             Some(Path::new("/tmp/root"))
+        );
+    }
+
+    #[test]
+    fn grok_hook_json_accepts_both_spellings_of_a_field() {
+        let input: HookInput = parse_hook_payload(
+            r#"{"hookEventName":"session_end","sessionId":"abc","cwd":"/tmp/cwd","workspaceRoot":"/tmp/root","transcriptPath":"/tmp/t.jsonl","hook_event_name":"SessionEnd","session_id":"abc","transcript_path":"/tmp/t.jsonl"}"#,
+        )
+        .unwrap();
+        assert_eq!(input.session_id.as_deref(), Some("abc"));
+        assert_eq!(
+            input.transcript_path.as_deref(),
+            Some(Path::new("/tmp/t.jsonl"))
         );
     }
 }

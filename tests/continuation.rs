@@ -13,7 +13,6 @@ fn only_confirmed_working_restores_receive_one_continuation_prompt() {
             let home = tempfile::tempdir().unwrap();
             let root = home.path();
             fs::create_dir_all(root.join(".config/session-guard")).unwrap();
-            fs::create_dir_all(root.join(".claude/sessions")).unwrap();
             fs::create_dir(root.join("bin")).unwrap();
             let store = root.join(".config/session-guard/active-sessions.json");
             let rollout = root.join("rollout.jsonl");
@@ -34,10 +33,6 @@ fn only_confirmed_working_restores_receive_one_continuation_prompt() {
                 "activity":{"state":state,"turn_id":"turn-1","owner_pid":2_147_483_647,
                     "owner_started_at":STARTED,"pending_tools":[],"needs_attention":false}
             }]).to_string()).unwrap();
-            fs::write(root.join(".claude/sessions/2147483647.json"), json!({
-                "sessionId":ID,"pid":2_147_483_647,"procStart":STARTED,
-                "kind":"interactive","entrypoint":"cli","status":if state=="working" {"busy"} else {state}
-            }).to_string()).unwrap();
             let executable = root.join("bin").join(tool);
             fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 17\n").unwrap();
             fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();

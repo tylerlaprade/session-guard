@@ -3,7 +3,7 @@ use crate::{paths, process, sessions};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,7 +46,9 @@ struct Event {
 }
 
 pub fn record_hook() -> Result<()> {
-    let event: Event = serde_json::from_reader(io::stdin())?;
+    let mut contents = String::new();
+    io::stdin().read_to_string(&mut contents)?;
+    let event: Event = crate::commands::register::parse_hook_payload(&contents)?;
     if event.agent_type.is_some() || event.agent_id.is_some() {
         return Ok(());
     }
@@ -165,7 +167,7 @@ pub fn should_continue(record: &SessionRecord) -> bool {
             .is_some_and(|check| check(record))
 }
 
-pub fn hook_was_working(record: &SessionRecord) -> bool {
+pub fn activity_was_working(record: &SessionRecord) -> bool {
     record.activity.as_ref().is_some_and(|activity| {
         activity.state == WorkState::Working
             && activity.pending_tools.is_empty()
@@ -175,24 +177,67 @@ pub fn hook_was_working(record: &SessionRecord) -> bool {
     })
 }
 
-pub fn claude_was_working(record: &SessionRecord) -> bool {
-    let Some(pid) = record.pid else {
-        return false;
-    };
-    let Ok(home) = paths::tool_home(record.tool) else {
-        return false;
-    };
-    let Ok(file) = std::fs::File::open(home.join("sessions").join(format!("{pid}.json"))) else {
-        return false;
-    };
-    let Ok(native) = serde_json::from_reader::<_, serde_json::Value>(file) else {
-        return false;
-    };
-    native_claude_matches(record, &native)
+/// Claude deletes its status file as it exits, before its `SessionEnd` hook
+/// runs, so the daemon records whether it is mid-turn while it is alive.
+pub fn claude_activity(record: &SessionRecord) -> Option<Activity> {
+    let pid = record.pid?;
+    let file = std::fs::File::open(
+        paths::tool_home(record.tool)
+            .ok()?
+            .join("sessions")
+            .join(format!("{pid}.json")),
+    )
+    .ok()?;
+    let native = serde_json::from_reader::<_, serde_json::Value>(file).ok()?;
+    claude_native_activity(record, &native)
+}
+
+fn claude_native_activity(record: &SessionRecord, native: &serde_json::Value) -> Option<Activity> {
+    Some(Activity {
+        state: if native_claude_matches(record, native) {
+            WorkState::Working
+        } else {
+            WorkState::Idle
+        },
+        turn_id: String::new(),
+        owner_pid: record.pid?,
+        owner_started_at: record.pid_started_at.clone()?,
+        pending_tools: BTreeSet::new(),
+        needs_attention: false,
+    })
+}
+
+pub fn observe(processes: &process::ProcessSnapshot) -> Result<()> {
+    let path = paths::sessions_file()?;
+    let changes: Vec<(String, Activity)> = sessions::read_sessions(&path)?
+        .iter()
+        .filter(|record| {
+            record.state == SessionState::Active
+                && crate::commands::daemon::session_tool_is_alive(record, processes)
+        })
+        .filter_map(|record| {
+            let activity = record.tool.spec().observe_activity?(record)?;
+            (record.activity.as_ref() != Some(&activity))
+                .then(|| (record.session_id.clone(), activity))
+        })
+        .collect();
+    if changes.is_empty() {
+        return Ok(());
+    }
+    sessions::with_sessions_mut(&path, |records| {
+        for (session_id, activity) in changes {
+            if let Some(record) = records.iter_mut().find(|record| {
+                record.session_id == session_id && record.state == SessionState::Active
+            }) {
+                record.activity = Some(activity);
+            }
+        }
+        Ok(())
+    })
 }
 
 pub fn codex_was_working(record: &SessionRecord) -> bool {
-    if !hook_was_working(record) {
+    if !activity_was_working(record) {
         return false;
     }
     let Some(path) = &record.transcript_path else {
@@ -325,6 +370,20 @@ mod tests {
     }
 
     #[test]
+    fn a_busy_claude_observed_alive_continues_after_it_dies() {
+        let mut record = record("claude");
+        record.activity = None;
+        let busy = json!({"sessionId":"session","pid":42,"procStart":"Wed Jan 1 00:00:00 2020",
+            "entrypoint":"cli","kind":"interactive","status":"busy"});
+        record.activity = claude_native_activity(&record, &busy);
+        assert!(should_continue(&record));
+        let mut idle = busy;
+        idle["status"] = json!("idle");
+        record.activity = claude_native_activity(&record, &idle);
+        assert!(!should_continue(&record));
+    }
+
+    #[test]
     fn grok_metadata_is_parsed_without_reading_message_content() {
         let mut record = record("grok");
         for (event, state) in [
@@ -333,11 +392,14 @@ mod tests {
             ("PostToolUse", WorkState::Working),
             ("StopCancelled", WorkState::Stopped),
         ] {
-            let event: Event =
-                serde_json::from_value(json!({"sessionId":"session","hook_event_name":event,
+            let event: Event = crate::commands::register::parse_hook_payload(
+                &json!({"sessionId":"session","session_id":"session","hook_event_name":event,
                 "hookEventName":"irrelevant-native-alias","promptId":"turn","toolUseId":"tool",
-                "message":"Working. Continue. Waiting. Idle.","prompt":"Anything"}))
-                .unwrap();
+                "tool_use_id":"tool","message":"Working. Continue. Waiting. Idle.",
+                "prompt":"Anything"})
+                .to_string(),
+            )
+            .unwrap();
             apply_event(&mut record, &event);
             assert_eq!(record.activity.as_ref().unwrap().state, state);
         }
