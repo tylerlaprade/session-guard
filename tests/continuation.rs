@@ -16,10 +16,21 @@ fn only_confirmed_working_restores_receive_one_continuation_prompt() {
             fs::create_dir_all(root.join(".claude/sessions")).unwrap();
             fs::create_dir(root.join("bin")).unwrap();
             let store = root.join(".config/session-guard/active-sessions.json");
+            let rollout = root.join("rollout.jsonl");
+            fs::write(
+                &rollout,
+                format!(
+                    "{}\n{}\n",
+                    json!({"type":"session_meta","payload":{"id":ID,"source":"cli"}}),
+                    json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}})
+                ),
+            )
+            .unwrap();
             fs::write(&store, json!([{
                 "tool":tool,"session_id":ID,"directory":root,"session_name":null,
                 "registered_at":"2020-01-01T00:00:00Z","state":"recoverable","restore_pending":true,
                 "pid":2_147_483_647,"pid_started_at":STARTED,
+                "transcript_path":rollout,
                 "activity":{"state":state,"turn_id":"turn-1","owner_pid":2_147_483_647,
                     "owner_started_at":STARTED,"pending_tools":[],"needs_attention":false}
             }]).to_string()).unwrap();

@@ -406,7 +406,7 @@ pub static HARNESSES: &[Harness] = &[
     Harness {
         id: "codex",
         activity_hooks: CODEX_ACTIVITY_HOOKS,
-        was_working: Some(crate::continuation::hook_was_working),
+        was_working: Some(crate::continuation::codex_was_working),
         display_name: "Codex",
         binary: "codex",
         home: ToolPath {

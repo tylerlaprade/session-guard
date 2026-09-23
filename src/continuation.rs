@@ -3,7 +3,7 @@ use crate::{paths, process, sessions};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::io;
+use std::io::{self, BufRead};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -191,6 +191,47 @@ pub fn claude_was_working(record: &SessionRecord) -> bool {
     native_claude_matches(record, &native)
 }
 
+pub fn codex_was_working(record: &SessionRecord) -> bool {
+    if !hook_was_working(record) {
+        return false;
+    }
+    let Some(path) = &record.transcript_path else {
+        return false;
+    };
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut own_cli = false;
+    let mut active_turn = None;
+    for line in io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return false;
+        };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            return false;
+        };
+        let payload = &event["payload"];
+        if event["type"] == "session_meta" && payload["id"] == record.session_id {
+            own_cli = payload["source"] == "cli";
+        }
+        if event["type"] == "event_msg" {
+            match payload["type"].as_str() {
+                Some("task_started") => {
+                    active_turn = payload["turn_id"].as_str().map(str::to_string)
+                }
+                Some("task_complete" | "turn_aborted" | "error") => active_turn = None,
+                _ => {}
+            }
+        }
+    }
+    own_cli
+        && active_turn.as_deref()
+            == record
+                .activity
+                .as_ref()
+                .map(|activity| activity.turn_id.as_str())
+}
+
 fn native_claude_matches(record: &SessionRecord, native: &serde_json::Value) -> bool {
     let started = record
         .pid_started_at
@@ -263,7 +304,7 @@ mod tests {
 
     #[test]
     fn stale_owners_and_legacy_records_never_continue() {
-        let mut record = record("codex");
+        let mut record = record("grok");
         record.activity = Some(Activity {
             state: WorkState::Working,
             turn_id: "turn".into(),
@@ -318,5 +359,43 @@ mod tests {
         }
         assert!(!should_continue(&record));
         assert_eq!(record.activity.unwrap().state, WorkState::Unknown);
+    }
+
+    #[test]
+    fn native_codex_terminal_events_override_stale_working_hooks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        let mut record = record("codex");
+        record.transcript_path = Some(path.clone());
+        record.activity = Some(Activity {
+            state: WorkState::Working,
+            turn_id: "turn".into(),
+            owner_pid: 42,
+            owner_started_at: record.pid_started_at.clone().unwrap(),
+            pending_tools: BTreeSet::new(),
+            needs_attention: false,
+        });
+        let prefix = format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"session","source":"cli"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn"}})
+        );
+        std::fs::write(&path, &prefix).unwrap();
+        assert!(should_continue(&record));
+        for event in ["task_complete", "turn_aborted", "error"] {
+            std::fs::write(
+                &path,
+                format!(
+                    "{prefix}{}\n",
+                    json!({"type":"event_msg","payload":{"type":event,"turn_id":"turn"}})
+                ),
+            )
+            .unwrap();
+            assert!(!should_continue(&record), "{event}");
+        }
+        std::fs::write(&path, format!("{prefix}{{")).unwrap();
+        assert!(!should_continue(&record));
+        std::fs::write(&path, prefix.replace("\"cli\"", "\"exec\"")).unwrap();
+        assert!(!should_continue(&record));
     }
 }

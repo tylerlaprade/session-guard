@@ -162,6 +162,8 @@ tools remain waiting. Approval and notification events suppress continuation
 for the rest of that turn. Stop, failure, and explicit interrupt events settle
 it, and late events from another turn cannot revive it. No prompt, response,
 tool argument, or notification message text is classified.
+Codex also requires a matching native `task_started` event without a later
+completion, abort, or error event. These are lifecycle attributes, not message text.
 
 The launcher consumes the old activity before starting the restored process.
 A failed launch can be retried, but does not reuse the same continuation decision.
