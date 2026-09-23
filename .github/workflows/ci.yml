@@ -18,6 +18,7 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: brew install --cask ghostty iterm2
+      - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Ghostty.app /Applications/iTerm.app
       - name: Compile AppleScript
         timeout-minutes: 5
         run: |
