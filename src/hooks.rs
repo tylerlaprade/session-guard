@@ -78,6 +78,27 @@ pub fn install(tool: Tool) -> Result<HookChange> {
     }
 }
 
+/// Whether session-guard's hooks are already in place for this harness, so a
+/// newer build can bring them up to date without adding hooks to a tool the
+/// user never installed them for.
+pub fn installed(tool: Tool) -> Result<bool> {
+    let contains_deregister = |path: &Path| {
+        fs::read_to_string(path).is_ok_and(|text| text.contains("session-guard deregister"))
+    };
+    Ok(match &tool.spec().integration {
+        Integration::JsonSettings { path, .. } | Integration::TomlConfig { path, .. } => {
+            contains_deregister(&path.resolve()?)
+        }
+        Integration::ScriptDir {
+            path,
+            manifest_name,
+            ..
+        } => contains_deregister(&path.resolve()?.join(manifest_name)),
+        Integration::PluginFile { path, name, .. } => path.resolve()?.join(name).is_file(),
+        Integration::ProcessScan => false,
+    })
+}
+
 pub fn remove(tool: Tool) -> Result<HookChange> {
     match &tool.spec().integration {
         Integration::JsonSettings { path, .. } => remove_json_hooks(&path.resolve()?),

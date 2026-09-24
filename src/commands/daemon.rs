@@ -121,6 +121,7 @@ pub fn run() -> Result<()> {
 
     write_pid_file()?;
     log_line("daemon started")?;
+    update_installed_hooks()?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let restore_requested = Arc::new(AtomicBool::new(false));
@@ -249,6 +250,27 @@ fn run_cargo_target_cleanup() -> Result<()> {
             }
         }
         Err(error) => log_line(&format!("Cargo target cleanup failed: {error:#}"))?,
+    }
+    Ok(())
+}
+
+// A newer build brings its own hooks; the daemon starts after every install,
+// so it updates the hooks already in place instead of waiting for a manual
+// `install-hooks`. A harness whose hooks cannot be updated keeps the old ones.
+fn update_installed_hooks() -> Result<()> {
+    for tool in Tool::all() {
+        match crate::hooks::installed(tool)
+            .and_then(|installed| installed.then(|| crate::hooks::install(tool)).transpose())
+        {
+            Ok(Some(change)) if change.changed => {
+                log_line(&format!("updated {} hooks", tool.spec().display_name))?;
+            }
+            Ok(_) => {}
+            Err(error) => log_line(&format!(
+                "could not update {} hooks: {error:#}",
+                tool.spec().display_name
+            ))?,
+        }
     }
     Ok(())
 }
@@ -440,7 +462,6 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 ));
             }
         }
-        thread::sleep(Duration::from_millis(350));
     }
 
     Ok(summary)

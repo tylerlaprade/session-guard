@@ -17,7 +17,7 @@ Supported terminal values:
 
 | Value | Restore behavior |
 | --- | --- |
-| `ghostty` | Opens tabs in Ghostty via its native AppleScript scripting dictionary (`new tab with configuration`). No keystroke automation, so no Accessibility permission is needed. Restoration waits for the surface to start and for its launcher to register a live owner. Failed launches remain pending. One restore pass keeps its tabs in one window, even when another window comes to the front mid-restore. |
+| `ghostty` | Opens tabs in Ghostty via its native AppleScript scripting dictionary (`new tab with configuration`). No keystroke automation, so no Accessibility permission is needed. Restoration waits for the tab's launcher to register a live owner, which a tab whose surface never starts cannot do. Failed launches remain pending. One restore pass keeps its tabs in one window, even when another window comes to the front mid-restore. |
 | `iterm2` | Opens tabs in the current iTerm2 window. |
 | `terminal` | Uses Terminal.app `do script`. |
 | `kitty` | Uses `kitty @ launch --type=tab`. |
@@ -181,7 +181,9 @@ A failed launch can be retried, but does not reuse the same continuation decisio
 New activity requires new native status or lifecycle evidence. Background-task
 loss is not automatically continued in this version.
 
-Run `session-guard install-hooks` after upgrading. Already-running tools may
+The daemon updates the hooks already installed each time it starts, so
+reinstalling the binary and restarting the daemon brings them up to date;
+`session-guard install-hooks` does the same by hand. Already-running tools may
 need a new session to load added hooks. Codex asks to trust new hooks; without
 that trust, conversation restoration still works but automatic continuation
 has no hook evidence and remains disabled.

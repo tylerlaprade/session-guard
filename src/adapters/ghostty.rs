@@ -5,12 +5,10 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-// A wedged Ghostty can take the whole window this long; the surface poll
-// below also waits this long for a slow shell under memory pressure.
-const SURFACE_START_TIMEOUT: Duration = Duration::from_secs(15);
-const SURFACE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+// A wedged Ghostty can take the whole window this long.
+const OPEN_TAB_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One restore pass's tabs stay together. The first goes into the front
 /// window, or a new one when none is open, and the rest follow it by the
@@ -39,15 +37,14 @@ pub(crate) fn is_only_terminal(tty: &str) -> Result<bool> {
 }
 
 impl Ghostty {
-    /// Keep the window a restore script reported for the pass's next tab,
-    /// and return the tab it opened.
-    fn remember_window(&self, reply: &str) -> Result<String> {
-        let (window_id, tab_id) = reply
+    /// Keep the window a restore script reported for the pass's next tab.
+    fn remember_window(&self, reply: &str) -> Result<()> {
+        let (window_id, _) = reply
             .split_once('\t')
             .filter(|(window_id, tab_id)| !window_id.is_empty() && !tab_id.is_empty())
             .context("Ghostty returned no window and tab id")?;
         *self.restore_window.borrow_mut() = Some(window_id.to_string());
-        Ok(tab_id.to_string())
+        Ok(())
     }
 }
 
@@ -84,11 +81,11 @@ impl TerminalAdapter for Ghostty {
             &self.restore_window.borrow().clone().unwrap_or_default(),
         );
         // Ghostty scripting can hang when the app is busy/recovering; do not
-        // block the daemon (or its sessions lock) forever.
-        let reply =
-            super::run_capture_timeout(&mut osa, "opening Ghostty tab", SURFACE_START_TIMEOUT)?;
-        let tab_id = self.remember_window(&reply)?;
-        wait_for_surface_start(&tab_id)
+        // block the daemon (or its sessions lock) forever. A tab whose surface
+        // never starts cannot register the restored session's owner, so the
+        // restore's owner check fails it and the session stays recoverable.
+        let reply = super::run_capture_timeout(&mut osa, "opening Ghostty tab", OPEN_TAB_TIMEOUT)?;
+        self.remember_window(&reply)
     }
 
     fn is_running(&self) -> bool {
@@ -125,37 +122,6 @@ fn parse_tab_positions(reply: &str) -> Vec<((u32, u32), String)> {
         .collect()
 }
 
-// Ghostty can accept the scripting request and return a tab id, yet fail to
-// start the surface process — observed under memory pressure as
-// "error initializing surface err=error.OutOfMemory", leaving a permanent
-// ghost tab. Counting that as restored burns the restore cooldown on a tab
-// that does not exist. The surface's working directory stays empty until its
-// shell starts and reports pwd (Ghostty's default shell integration), so
-// poll it and fail the restore when it never populates; the session then
-// stays recoverable and a later restore retries.
-fn wait_for_surface_start(tab_id: &str) -> Result<()> {
-    let deadline = Instant::now() + SURFACE_START_TIMEOUT;
-    loop {
-        let mut osa = Command::new("osascript");
-        osa.args([
-            "-e",
-            include_str!("ghostty_tab_working_directory.applescript"),
-            tab_id,
-        ]);
-        if let Ok(working_directory) =
-            super::run_capture_timeout(&mut osa, "checking Ghostty surface", SURFACE_START_TIMEOUT)
-            && !working_directory.is_empty()
-        {
-            return Ok(());
-        }
-
-        if Instant::now() >= deadline {
-            anyhow::bail!("Ghostty tab {tab_id} never started its terminal (ghost surface)");
-        }
-        thread::sleep(SURFACE_POLL_INTERVAL);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,10 +148,7 @@ mod tests {
         let window_argument = |command: &Command| command.get_args().last().unwrap().to_owned();
         let first = restore_tab_command("/tmp", "launch\n", "");
         assert_eq!(window_argument(&first), "");
-        assert_eq!(
-            ghostty.remember_window("tab-group-1\ttab-7").unwrap(),
-            "tab-7"
-        );
+        ghostty.remember_window("tab-group-1\ttab-7").unwrap();
         let remembered = ghostty.restore_window.borrow().clone().unwrap();
         let second = restore_tab_command("/tmp", "launch\n", &remembered);
         assert_eq!(window_argument(&second), "tab-group-1");
