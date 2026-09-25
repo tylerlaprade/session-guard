@@ -84,14 +84,17 @@ A SessionEnd hook says the session id is finished, not why: tools fire it for
 an in-tab end (quit, `/clear`, `/resume` switching away), for a tab closed
 with the tool inside (Cmd-W), and while the terminal itself is quitting or
 dying — and the tab's shell can be alive or dead at that instant in every one
-of those cases. So the hook only marks the record `ending`. About ten seconds
-later the daemon settles it: the tool or shell still running, or the terminal
-instance that owned the tab still up, means the user ended it and the record
-retires to `last-sessions.json`; a dead tab under a terminal that is gone (or
-was relaunched after the shell started) means a teardown and the record
-becomes recoverable, dated at its SessionEnd. Tabless (scan-tracked) sessions
-retire on SessionEnd directly, since a graceful end is the only cleanup they
-get.
+of those cases. So the hook only marks the record `ending`, and the terminal
+decides. A quitting or crashing terminal is gone within about a second of its
+tabs' SessionEnds, so the daemon checks two seconds after the SessionEnd: the
+terminal instance that owned the tab still up means the user ended it and the
+record retires to `last-sessions.json`, even if the terminal crashes a few
+seconds later. A terminal that is gone (or was relaunched after the shell
+started) means a teardown, and the record becomes recoverable, dated at its
+SessionEnd, even while the dying tab's shell or tool is still exiting. Without
+a configured terminal, a running tool or shell means the user ended it.
+Tabless (scan-tracked) sessions retire on SessionEnd directly, since a
+graceful end is the only cleanup they get.
 
 The daemon records the operating system's boot identifier in its heartbeat.
 A reboot restores confirmed pending interruptions, including sessions whose
@@ -105,11 +108,11 @@ is no two-minute death cluster, activity-age cutoff, or expiry for a confirmed
 pending recovery.
 
 A tab can also die without a SessionEnd reaching session-guard, when a tool is
-killed along with its tab or its hook fails. The daemon judges those deaths by the same
-aftermath as a SessionEnd once the ten-second grace has passed. If the tool's
-shell or the terminal instance that owned the tab is still running, the user
-ended it: the record stops waiting for a relaunch and stays recoverable
-through `restore --all` until it expires.
+killed along with its tab or its hook fails. The daemon notices those deaths
+within five seconds and judges them the same way as a SessionEnd, two seconds
+after it notices. If the terminal instance that owned the tab is still running,
+the user ended it: the record stops waiting for a relaunch and stays
+recoverable through `restore --all` until it expires.
 
 Restored tabs run through `session-guard launch`. That foreground controller
 registers its process identity before starting the provider in the user's
@@ -188,9 +191,13 @@ need a new session to load added hooks. Codex asks to trust new hooks; without
 that trust, conversation restoration still works but automatic continuation
 has no hook evidence and remains disabled.
 
-The daemon restores pending sessions when the terminal returns. An existing
-surviving terminal process or a missed process snapshot does not count as a
-relaunch. The short startup delay is only for terminal readiness.
+The daemon restores pending sessions when the terminal returns. A relaunch is
+a terminal instance the daemon has never seen, so an existing surviving
+terminal process or a missed process snapshot does not count. Tabs of the
+previous instance can take several seconds to die after it does, so the
+returned terminal keeps restoring them as they die, trying each once. Tabs it
+opened itself are never treated as victims. The short startup delay is only
+for terminal readiness.
 
 ### Tab order
 

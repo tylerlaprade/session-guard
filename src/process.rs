@@ -285,14 +285,17 @@ impl ProcessSnapshot {
 }
 
 impl ProcessSnapshot {
-    /// Start time of the oldest running process of `executable`: the
+    /// Start times of the running processes of `executable`. The oldest is the
     /// terminal instance itself, with its per-surface helpers being younger.
-    pub fn instance_started_at(&self, executable: &str) -> Option<chrono::NaiveDateTime> {
+    pub fn instance_starts(
+        &self,
+        executable: &str,
+    ) -> std::collections::BTreeSet<chrono::NaiveDateTime> {
         self.processes
             .values()
             .filter(|(_, comm)| comm.rsplit('/').next() == Some(executable))
             .filter_map(|(start, _)| parse_identity(start))
-            .min()
+            .collect()
     }
 }
 

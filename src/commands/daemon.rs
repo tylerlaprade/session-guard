@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use signal_hook::consts::signal::{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::flag;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -169,31 +169,40 @@ pub fn run() -> Result<()> {
         }
 
         seconds_until_settle -= 1;
-        if seconds_until_settle == 0 {
+        let settle_tick = seconds_until_settle == 0;
+        if settle_tick {
             seconds_until_settle = SESSION_END_SETTLE_INTERVAL_SECS;
-            if let Ok(processes) = ProcessSnapshot::capture() {
+        }
+        if (settle_tick || endings_due()?)
+            && let Ok(processes) = ProcessSnapshot::capture()
+        {
+            if settle_tick {
                 crate::continuation::observe(&processes)?;
+                let marked = mark_dead_sessions(&processes)?;
+                if marked > 0 {
+                    log_line(&format!("marked {marked} sessions recoverable"))?;
+                }
                 let released = release_closed_tabs(&processes)?;
                 if released > 0 {
                     log_line(&format!(
                         "released {released} sessions that ended under a running terminal"
                     ))?;
                 }
-                let summary = settle_endings(&processes)?;
-                if summary.retired > 0 || summary.marked_recoverable > 0 {
-                    log_line(&format!(
-                        "settled {} ended sessions: {} retired, {} recoverable",
-                        summary.retired + summary.marked_recoverable,
-                        summary.retired,
-                        summary.marked_recoverable
-                    ))?;
-                }
-                if terminal_returned_with_victims(&mut terminal_watch, &processes)? {
-                    let summary = restore_once(RestoreMode::Manual)?;
-                    log_line(&format!("terminal returned: {}", summary.message()))?;
-                    for error in &summary.errors {
-                        log_line(error)?;
-                    }
+            }
+            let summary = settle_endings(&processes)?;
+            if summary.retired > 0 || summary.marked_recoverable > 0 {
+                log_line(&format!(
+                    "settled {} ended sessions: {} retired, {} recoverable",
+                    summary.retired + summary.marked_recoverable,
+                    summary.retired,
+                    summary.marked_recoverable
+                ))?;
+            }
+            if settle_tick && terminal_returned_with_victims(&mut terminal_watch, &processes)? {
+                let summary = restore_once(RestoreMode::Manual)?;
+                log_line(&format!("terminal returned: {}", summary.message()))?;
+                for error in &summary.errors {
+                    log_line(error)?;
                 }
             }
         }
@@ -311,13 +320,14 @@ pub fn reconcile_from_scan() -> Result<usize> {
 }
 
 const RESTORE_RECEIPT_TIMEOUT: Duration = Duration::from_secs(15);
-// A terminal quitting gracefully closes tabs one by one and can still be
-// running when a tab's SessionEnd fires; a crashed one is gone before the hooks
-// run and may already be back (2026-09-03: Ghostty died at :51, the hooks
-// fired at :52, its relaunch started at :55). The aftermath is judged only
-// after this grace, and only a terminal older than the shell counts as its
-// owner.
-const SESSION_END_GRACE_SECS: i64 = 10;
+// A terminal that is quitting or crashing is gone within about a second of its
+// tabs' SessionEnds (2026-09-03: Ghostty died at :51, the hooks fired at :52,
+// its relaunch started at :55). A terminal still running this long after a
+// tab ended outlived that tab, so the tab was closed on purpose even when the
+// terminal crashes moments later (2026-09-25: a Cmd-W at :36, then Ghostty
+// died at :40 and a ten-second grace reopened the closed tab). Only a
+// terminal older than the shell counts as its owner.
+const SESSION_END_GRACE_SECS: i64 = 2;
 const SESSION_END_SETTLE_INTERVAL_SECS: u32 = 5;
 // AppleScript into a terminal that is still launching fails or opens ghost
 // tabs, so a returned terminal is given this long before its tabs come back.
@@ -346,6 +356,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     // exclusive sessions lock stall hook-driven register/deregister (codex
     // kills its SessionEnd hook after one second).
     let processes = ProcessSnapshot::capture()?;
+    let now = chrono::Utc::now();
     let terminal = configured_terminal().ok();
     let last_sessions_path = paths::last_sessions_file()?;
 
@@ -365,16 +376,21 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
         for mut session in unique {
             let was_recoverable = session.state == SessionState::Recoverable;
 
-            if session.state == SessionState::Ending
-                && ending_verdict(
+            if session.state == SessionState::Ending {
+                if !ending_settled(&session, now) {
+                    alive_kept.push(session);
+                    continue;
+                }
+                if ending_verdict(
                     &session,
                     &processes,
                     terminal.map(TerminalKind::process_name),
                 ) == EndingVerdict::Retire
-            {
-                remember(&last_sessions_path, &session)?;
-                summary.retired += 1;
-                continue;
+                {
+                    remember(&last_sessions_path, &session)?;
+                    summary.retired += 1;
+                    continue;
+                }
             }
 
             if session_is_alive(&session, &processes) {
@@ -492,25 +508,28 @@ pub(crate) enum EndingVerdict {
 }
 
 // A SessionEnd is the tool's word that the session id is done, not whether the
-// user ended it or the terminal fell out from under it. The aftermath tells:
-// the tool or its shell still running means an in-tab end (/exit, /clear,
-// /resume switching away), and a dead tab under a terminal that is still up
-// means the tab was closed on purpose (Cmd-W). A terminal that started after
-// the shell cannot have owned the tab, so a quick relaunch does not count.
-// Without a known terminal, err toward keeping: retirement is irreversible
-// and a recoverable record expires on its own.
+// user ended it or the terminal fell out from under it. The terminal that owned
+// the tab tells: still up after the grace means an in-tab end (/exit, /clear,
+// /resume switching away) or a tab closed on purpose (Cmd-W), and gone means a
+// teardown, even while the dying tab's shell or tool lingers. A terminal that
+// started after the shell cannot have owned the tab, so a quick relaunch does
+// not count. Without a known terminal only the tab itself can tell, and a dead
+// one errs toward keeping: retirement is irreversible and a recoverable record
+// expires on its own.
 pub(crate) fn ending_verdict(
     session: &SessionRecord,
     processes: &ProcessSnapshot,
     terminal_executable: Option<&str>,
 ) -> EndingVerdict {
-    if session_tool_is_alive(session, processes) || session_shell_is_alive(session, processes) {
-        return EndingVerdict::Retire;
-    }
-    let terminal_outlived_the_tab = terminal_executable.is_some_and(|executable| {
-        processes.instance_running_since(executable, session.shell_pid_started_at.as_deref())
-    });
-    if terminal_outlived_the_tab {
+    let ended_by_the_user = match terminal_executable {
+        Some(executable) => {
+            processes.instance_running_since(executable, session.shell_pid_started_at.as_deref())
+        }
+        None => {
+            session_tool_is_alive(session, processes) || session_shell_is_alive(session, processes)
+        }
+    };
+    if ended_by_the_user {
         EndingVerdict::Retire
     } else {
         EndingVerdict::Recoverable
@@ -531,34 +550,81 @@ fn remember(last_sessions_path: &std::path::Path, session: &SessionRecord) -> Re
     Ok(())
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default)]
 struct TerminalWatch {
-    observed_at: Option<chrono::NaiveDateTime>,
+    seen: Option<BTreeSet<chrono::NaiveDateTime>>,
     current: Option<chrono::NaiveDateTime>,
     pending: Option<chrono::NaiveDateTime>,
+    returned: Option<ReturnedTerminal>,
+}
+
+#[derive(Debug)]
+struct ReturnedTerminal {
+    started_at: chrono::NaiveDateTime,
+    attempted: HashSet<String>,
 }
 
 impl TerminalWatch {
+    // A relaunch is an instance this daemon has never seen. Comparing start
+    // times with the daemon's own clock missed one (2026-09-25: the previous
+    // check's clock was read after a slow registry pass, later than the new
+    // instance's start), and a survivor or a snapshot that briefly missed the
+    // terminal has been seen before.
     fn relaunched(
         &mut self,
-        current: Option<chrono::NaiveDateTime>,
+        instances: &BTreeSet<chrono::NaiveDateTime>,
         now: chrono::NaiveDateTime,
     ) -> Option<chrono::NaiveDateTime> {
-        let Some(observed_at) = self.observed_at.replace(now) else {
+        let current = instances.first().copied();
+        let Some(seen) = self.seen.as_mut() else {
+            self.seen = Some(instances.clone());
             self.current = current;
             return None;
         };
+        let fresh = current.filter(|started| !seen.contains(started));
+        seen.extend(instances);
         if self.current != current {
             self.current = current;
-            self.pending = current.filter(|started| {
-                started.and_utc().timestamp() >= observed_at.and_utc().timestamp()
-            });
+            self.pending = fresh;
         }
         let started = self.pending?;
         if (now - started).num_seconds() < TERMINAL_RELAUNCH_SETTLE_SECS {
             return None;
         }
         self.pending.take()
+    }
+
+    // Tabs of the previous instance can take several seconds to die after it
+    // does, so a returned terminal keeps collecting them for as long as it
+    // runs, trying each victim once. Tabs it opened itself are never victims.
+    fn unattempted_victims(
+        &mut self,
+        sessions: &[SessionRecord],
+        processes: &ProcessSnapshot,
+    ) -> bool {
+        let Some(returned) = self
+            .returned
+            .as_mut()
+            .filter(|returned| Some(returned.started_at) == self.current)
+        else {
+            return false;
+        };
+        let victims: Vec<String> = sessions
+            .iter()
+            .filter(|session| {
+                needs_terminal_restore(session, processes)
+                    && session
+                        .shell_pid_started_at
+                        .as_deref()
+                        .and_then(process::parse_identity)
+                        .is_none_or(|shell_started| shell_started < returned.started_at)
+                    && !returned.attempted.contains(&session.session_id)
+            })
+            .map(|session| session.session_id.clone())
+            .collect();
+        let found = !victims.is_empty();
+        returned.attempted.extend(victims);
+        found
     }
 }
 
@@ -572,27 +638,39 @@ fn terminal_returned_with_victims(
         return Ok(false);
     };
     let now = chrono::Utc::now();
-    let Some(started_at) = watch.relaunched(
-        processes.instance_started_at(terminal.process_name()),
+    if let Some(started_at) = watch.relaunched(
+        &processes.instance_starts(terminal.process_name()),
         now.naive_utc(),
-    ) else {
-        return Ok(false);
-    };
-    let has_victims = sessions::read_sessions(&paths::sessions_file()?)?
-        .iter()
-        .any(|session| needs_terminal_restore(session, processes));
-    if has_victims {
+    ) {
         log_line(&format!(
             "terminal relaunch detected: {terminal}, started at {started_at} UTC"
         ))?;
+        watch.returned = Some(ReturnedTerminal {
+            started_at,
+            attempted: HashSet::new(),
+        });
     }
-    Ok(has_victims)
+    if watch.returned.is_none() {
+        return Ok(false);
+    }
+    let sessions = sessions::read_sessions(&paths::sessions_file()?)?;
+    Ok(watch.unattempted_victims(&sessions, processes))
 }
 
+// An ending record is not a victim until settle_endings rules the terminal
+// went down with it.
 pub(crate) fn needs_terminal_restore(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
-    (session.restore_pending || session.state != SessionState::Recoverable)
+    session.state != SessionState::Ending
+        && (session.restore_pending || session.state == SessionState::Active)
         && !session_is_alive(session, processes)
         && !session_shell_is_alive(session, processes)
+}
+
+fn endings_due() -> Result<bool> {
+    let now = chrono::Utc::now();
+    Ok(sessions::read_sessions(&paths::sessions_file()?)?
+        .iter()
+        .any(|session| ending_settled(session, now)))
 }
 
 pub fn settle_endings(processes: &ProcessSnapshot) -> Result<SettleSummary> {
@@ -671,8 +749,8 @@ fn record_tab_positions(processes: &ProcessSnapshot) -> Result<()> {
         return Ok(());
     };
     if processes
-        .instance_started_at(terminal.process_name())
-        .is_none()
+        .instance_starts(terminal.process_name())
+        .is_empty()
     {
         return Ok(());
     }
@@ -763,26 +841,10 @@ pub fn monitor_once() -> Result<MonitorSummary> {
         return Ok(MonitorSummary::default());
     };
     let summary = sessions::with_sessions_mut(&paths::sessions_file()?, |sessions| {
-        let mut summary = MonitorSummary::default();
-        for session in sessions.iter_mut() {
-            // Ending records belong to settle_endings; a still-running tool
-            // must not revive an id its own SessionEnd already closed.
-            if session.state == SessionState::Ending {
-                continue;
-            }
-            if session_is_alive(session, &processes) {
-                session.mark_active();
-                continue;
-            }
-
-            // Tool (and possibly shell) are dead. Jetsam and WindowServer
-            // crashes kill both PIDs while this daemon often keeps running —
-            // never treat that as an intentional close.
-            if session.state == SessionState::Active {
-                session.mark_recoverable();
-                summary.marked_recoverable += 1;
-            }
-        }
+        let mut summary = MonitorSummary {
+            marked_recoverable: mark_dead(sessions, &processes),
+            ..MonitorSummary::default()
+        };
 
         let before = sessions.len();
         sessions.retain(|session| !session.recoverable_expired());
@@ -793,6 +855,42 @@ pub fn monitor_once() -> Result<MonitorSummary> {
     // monitor stopped watching here", never "ps kept failing".
     let _ = write_daemon_heartbeat();
     Ok(summary)
+}
+
+fn mark_dead(sessions: &mut [SessionRecord], processes: &ProcessSnapshot) -> usize {
+    let mut marked = 0;
+    for session in sessions.iter_mut() {
+        // Ending records belong to settle_endings; a still-running tool
+        // must not revive an id its own SessionEnd already closed.
+        if session.state == SessionState::Ending {
+            continue;
+        }
+        if session_is_alive(session, processes) {
+            session.mark_active();
+            continue;
+        }
+
+        // Tool (and possibly shell) are dead. Jetsam and WindowServer
+        // crashes kill both PIDs while this daemon often keeps running —
+        // never treat that as an intentional close.
+        if session.state == SessionState::Active {
+            session.mark_recoverable();
+            marked += 1;
+        }
+    }
+    marked
+}
+
+// A tab that dies without a SessionEnd is judged by when it died, so its death
+// is recorded on the settle tick rather than waiting for the next monitor pass.
+fn mark_dead_sessions(processes: &ProcessSnapshot) -> Result<usize> {
+    let path = paths::sessions_file()?;
+    if !sessions::read_sessions(&path)?.iter().any(|session| {
+        session.state == SessionState::Active && !session_is_alive(session, processes)
+    }) {
+        return Ok(0);
+    }
+    sessions::with_sessions_mut(&path, |sessions| Ok(mark_dead(sessions, processes)))
 }
 
 pub fn running_daemon_pid() -> Result<Option<i32>> {
@@ -1223,15 +1321,19 @@ mod tests {
         ));
     }
 
+    fn instances(starts: &[chrono::NaiveDateTime]) -> BTreeSet<chrono::NaiveDateTime> {
+        starts.iter().copied().collect()
+    }
+
     #[test]
     fn terminal_watch_does_not_treat_an_existing_survivor_as_a_relaunch() {
         let now = Utc::now().naive_utc();
         let old = now - Duration::hours(2);
         let survivor = now - Duration::hours(1);
         let mut watch = TerminalWatch::default();
-        assert_eq!(watch.relaunched(Some(old), now), None);
+        assert_eq!(watch.relaunched(&instances(&[old, survivor]), now), None);
         assert_eq!(
-            watch.relaunched(Some(survivor), now + Duration::seconds(5)),
+            watch.relaunched(&instances(&[survivor]), now + Duration::seconds(5)),
             None
         );
     }
@@ -1241,10 +1343,13 @@ mod tests {
         let now = Utc::now().naive_utc();
         let old = now - Duration::hours(2);
         let mut watch = TerminalWatch::default();
-        assert_eq!(watch.relaunched(Some(old), now), None);
-        assert_eq!(watch.relaunched(None, now + Duration::seconds(5)), None);
+        assert_eq!(watch.relaunched(&instances(&[old]), now), None);
         assert_eq!(
-            watch.relaunched(Some(old), now + Duration::seconds(10)),
+            watch.relaunched(&instances(&[]), now + Duration::seconds(5)),
+            None
+        );
+        assert_eq!(
+            watch.relaunched(&instances(&[old]), now + Duration::seconds(10)),
             None
         );
     }
@@ -1256,12 +1361,15 @@ mod tests {
         let fresh = now + Duration::seconds(1);
         let mut watch = TerminalWatch::default();
 
-        assert_eq!(watch.relaunched(Some(old), now), None);
-        assert_eq!(watch.relaunched(Some(old), now), None);
-        assert_eq!(watch.relaunched(Some(fresh), fresh), None);
+        assert_eq!(watch.relaunched(&instances(&[old]), now), None);
+        assert_eq!(watch.relaunched(&instances(&[old]), now), None);
+        assert_eq!(watch.relaunched(&instances(&[fresh]), fresh), None);
         let settled_at = fresh + Duration::seconds(TERMINAL_RELAUNCH_SETTLE_SECS);
-        assert_eq!(watch.relaunched(Some(fresh), settled_at), Some(fresh));
-        assert_eq!(watch.relaunched(Some(fresh), settled_at), None);
+        assert_eq!(
+            watch.relaunched(&instances(&[fresh]), settled_at),
+            Some(fresh)
+        );
+        assert_eq!(watch.relaunched(&instances(&[fresh]), settled_at), None);
     }
 
     #[test]
@@ -1270,11 +1378,14 @@ mod tests {
         let back = now + Duration::seconds(1);
         let mut watch = TerminalWatch::default();
 
-        assert_eq!(watch.relaunched(Some(back - Duration::hours(1)), now), None);
-        assert_eq!(watch.relaunched(None, now), None);
-        assert_eq!(watch.relaunched(None, now), None);
         assert_eq!(
-            watch.relaunched(Some(back), back + Duration::seconds(5)),
+            watch.relaunched(&instances(&[back - Duration::hours(1)]), now),
+            None
+        );
+        assert_eq!(watch.relaunched(&instances(&[]), now), None);
+        assert_eq!(watch.relaunched(&instances(&[]), now), None);
+        assert_eq!(
+            watch.relaunched(&instances(&[back]), back + Duration::seconds(5)),
             Some(back)
         );
     }
@@ -1283,10 +1394,97 @@ mod tests {
     fn terminal_watch_ignores_a_daemon_that_starts_with_no_terminal() {
         let now = Utc::now().naive_utc();
         let mut watch = TerminalWatch::default();
-        assert_eq!(watch.relaunched(None, now), None);
+        assert_eq!(watch.relaunched(&instances(&[]), now), None);
         assert_eq!(
-            watch.relaunched(Some(now), now + Duration::seconds(5)),
+            watch.relaunched(&instances(&[now]), now + Duration::seconds(5)),
             Some(now)
+        );
+    }
+
+    #[test]
+    fn terminal_watch_reports_a_relaunch_it_last_checked_for_after_the_launch() {
+        // 2026-09-25: Ghostty came back at :48.0, and the previous check read
+        // the clock at :49 after a slow registry pass on a snapshot from :47.
+        let launched = Utc::now().naive_utc();
+        let old = launched - Duration::hours(2);
+        let mut watch = TerminalWatch::default();
+        assert_eq!(
+            watch.relaunched(&instances(&[old]), launched - Duration::seconds(10)),
+            None
+        );
+        assert_eq!(
+            watch.relaunched(&instances(&[]), launched + Duration::seconds(1)),
+            None
+        );
+        assert_eq!(
+            watch.relaunched(&instances(&[launched]), launched + Duration::seconds(6)),
+            Some(launched)
+        );
+    }
+
+    fn identity(time: chrono::NaiveDateTime) -> String {
+        time.format("%a %b %d %H:%M:%S %Y").to_string()
+    }
+
+    #[test]
+    fn a_returned_terminal_restores_previous_tabs_that_die_after_it_returns() {
+        let processes = ProcessSnapshot::capture().unwrap();
+        let returned_at = Utc::now().naive_utc() - Duration::minutes(1);
+        let mut watch = TerminalWatch {
+            current: Some(returned_at),
+            returned: Some(ReturnedTerminal {
+                started_at: returned_at,
+                attempted: HashSet::new(),
+            }),
+            ..TerminalWatch::default()
+        };
+        let mut victim = ended_session(i32::MAX, &identity(returned_at - Duration::hours(1)));
+        let still_dying = victim.clone();
+        assert!(!watch.unattempted_victims(&[still_dying], &processes));
+        victim.mark_recoverable();
+        let mut opened_by_the_new_instance =
+            ended_session(i32::MAX, &identity(returned_at + Duration::seconds(30)));
+        opened_by_the_new_instance.session_id = "new-tab".to_string();
+        opened_by_the_new_instance.mark_recoverable();
+        assert!(!watch.unattempted_victims(
+            std::slice::from_ref(&opened_by_the_new_instance),
+            &processes
+        ));
+        assert!(
+            watch.unattempted_victims(&[victim.clone(), opened_by_the_new_instance], &processes)
+        );
+        assert!(!watch.unattempted_victims(&[victim], &processes));
+    }
+
+    #[test]
+    fn a_tab_closed_moments_before_its_terminal_crashed_is_retired() {
+        // 2026-09-25: Cmd-W at :36, Ghostty died at :40. The terminal was
+        // still up when the grace ran out, so the close was the user's.
+        let processes = ProcessSnapshot::capture().unwrap();
+        let session = ended_session(i32::MAX, "Fri Jan 1 00:00:00 2100");
+        let last_check_before_the_crash = session.ending_at.unwrap() + Duration::seconds(3);
+        assert!(ending_settled(&session, last_check_before_the_crash));
+        assert_eq!(
+            ending_verdict(&session, &processes, Some(&own_executable())),
+            EndingVerdict::Retire
+        );
+    }
+
+    #[test]
+    fn an_undecided_ending_is_not_a_terminal_victim() {
+        let processes = ProcessSnapshot::capture().unwrap();
+        let session = ended_session(i32::MAX, "Wed Jan 1 00:00:00 2020");
+        assert!(!needs_terminal_restore(&session, &processes));
+    }
+
+    #[test]
+    fn ending_verdict_keeps_a_tab_whose_shell_outlives_its_crashed_terminal() {
+        let pid = std::process::id() as i32;
+        let processes = ProcessSnapshot::capture().unwrap();
+        let session = ended_session(pid, &process::process_start_identity(pid).unwrap());
+        assert_eq!(
+            ending_verdict(&session, &processes, Some("no-such-terminal-xyz")),
+            EndingVerdict::Recoverable
         );
     }
 

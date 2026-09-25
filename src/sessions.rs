@@ -58,7 +58,7 @@ pub struct SessionRecord {
     pub recoverable_until: Option<DateTime<Utc>>,
     // When a hook-driven SessionEnd arrived. The daemon settles the record
     // once the aftermath is visible (daemon::settle_endings): retired when the
-    // tab or its terminal outlived the tool, recoverable when the terminal
+    // terminal that owned the tab outlived it, recoverable when the terminal
     // went down with it.
     #[serde(default)]
     pub ending_at: Option<DateTime<Utc>>,
