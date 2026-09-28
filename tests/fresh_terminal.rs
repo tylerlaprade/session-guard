@@ -24,7 +24,14 @@ struct Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
+            let foreground = self
+                .master
+                .as_ref()
+                .map_or(-1, |master| unsafe { libc::tcgetpgrp(master.as_raw_fd()) });
             unsafe {
+                if foreground > 0 {
+                    libc::kill(-foreground, libc::SIGKILL);
+                }
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.kill();
@@ -91,6 +98,7 @@ impl Terminal {
             output: String::new(),
             helpers: Vec::new(),
         };
+        std::os::unix::fs::symlink("/bin/sh", terminal.bin("ghostty")).unwrap();
         std::os::unix::fs::symlink("/bin/sleep", terminal.bin("session-guard-stub")).unwrap();
         let daemon = terminal
             .command("session-guard-stub", &["60"])
@@ -127,6 +135,10 @@ impl Terminal {
     }
 
     fn open_tab(&mut self, queued: &[u8]) {
+        self.open_shell(queued, true);
+    }
+
+    fn open_shell(&mut self, queued: &[u8], under_a_fresh_terminal: bool) {
         let (mut master, mut slave) = (-1, -1);
         assert_eq!(
             unsafe {
@@ -149,9 +161,16 @@ impl Terminal {
             -1
         );
         master.write_all(queued).unwrap();
-        let mut command = Command::new("/bin/zsh");
+        let mut command = if under_a_fresh_terminal {
+            let mut terminal = Command::new(self.bin("ghostty"));
+            terminal.args(["-c", "/bin/zsh -dil; :"]);
+            terminal
+        } else {
+            let mut shell = Command::new("/bin/zsh");
+            shell.arg("-dil");
+            shell
+        };
         command
-            .arg("-dil")
             .env("HOME", self.home.path())
             .env("ZDOTDIR", self.home.path())
             .env("SHELL", "/bin/zsh")
@@ -284,4 +303,13 @@ fn a_declined_offer_gives_the_shell_its_prompt() {
     assert!(!terminal.output.contains("RESUMED:"));
     assert!(!offer_file.exists());
     assert_eq!(terminal.records()[0]["state"], "recoverable");
+}
+
+#[test]
+fn a_shell_without_a_freshly_started_ghostty_makes_no_offer() {
+    let mut terminal = Terminal::prepare();
+    terminal.open_shell(b"", false);
+    terminal.until("FRESH_PROMPT>");
+    assert!(!terminal.output.contains("RESUMED:"));
+    assert!(!terminal.offer_file().exists());
 }

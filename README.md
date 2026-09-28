@@ -135,9 +135,11 @@ if [[ $ZSH_EVAL_CONTEXT == file && -o login && -o interactive &&
 fi
 ```
 
-Before its first prompt, the shell offers its tab to the daemon when it is
-Ghostty's sole terminal, the daemon is running, and there is no queued input,
-including an unfinished line. The shell decides nothing about what to restore.
+Before its first prompt, the shell offers its tab to the daemon when it
+started within thirty seconds of the Ghostty that owns it, is Ghostty's sole
+terminal, the daemon is running, and there is no queued input, including an
+unfinished line. Tabs opened later in a running Ghostty skip the sole-terminal
+lookup entirely, since only a new Ghostty instance can have tabs to take back. The shell decides nothing about what to restore.
 An offer from a new Ghostty instance counts as that instance's relaunch, and
 the daemon's ordinary restore pass runs at once. The pass opens its first
 session in the offered tab instead of a new one, running the same launch
