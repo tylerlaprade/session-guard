@@ -15,6 +15,7 @@ jobs:
           node-version: 24
       - run: npm ci --ignore-scripts
       - run: brew install shellcheck
+      - run: curl -fsSL -o "$HOME/.shellcheckrc" https://raw.githubusercontent.com/tylerlaprade/dotfiles/master/.shellcheckrc
       - run: npm run lint
       - run: npm test
       - run: brew install --cask ghostty iterm2
