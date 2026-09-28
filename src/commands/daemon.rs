@@ -169,9 +169,15 @@ pub fn run() -> Result<()> {
         }
 
         seconds_until_settle -= 1;
-        if seconds_until_settle == 0 {
+        let settle_tick = seconds_until_settle == 0;
+        if settle_tick {
             seconds_until_settle = SESSION_END_SETTLE_INTERVAL_SECS;
-            if let Ok(processes) = ProcessSnapshot::capture() {
+        }
+        let tab_offered = crate::fresh_tab::waiting()?;
+        if (settle_tick || tab_offered)
+            && let Ok(processes) = ProcessSnapshot::capture()
+        {
+            if settle_tick {
                 crate::continuation::observe(&processes)?;
                 let released = release_closed_tabs(&processes)?;
                 if released > 0 {
@@ -188,13 +194,16 @@ pub fn run() -> Result<()> {
                         summary.marked_recoverable
                     ))?;
                 }
-                if terminal_returned_with_victims(&mut terminal_watch, &processes)? {
-                    let summary = restore_once(RestoreMode::Manual)?;
-                    log_line(&format!("terminal returned: {}", summary.message()))?;
-                    for error in &summary.errors {
-                        log_line(error)?;
-                    }
+            }
+            if terminal_returned_with_victims(&mut terminal_watch, &processes, tab_offered)? {
+                let summary = restore_once(RestoreMode::Manual)?;
+                log_line(&format!("terminal returned: {}", summary.message()))?;
+                for error in &summary.errors {
+                    log_line(error)?;
                 }
+            }
+            if tab_offered {
+                crate::fresh_tab::decline()?;
             }
         }
 
@@ -558,6 +567,7 @@ impl TerminalWatch {
         &mut self,
         instances: &BTreeSet<chrono::NaiveDateTime>,
         now: chrono::NaiveDateTime,
+        scriptable: bool,
     ) -> Option<chrono::NaiveDateTime> {
         let current = instances.first().copied();
         let Some(seen) = self.seen.as_mut() else {
@@ -572,7 +582,7 @@ impl TerminalWatch {
             self.pending = fresh;
         }
         let started = self.pending?;
-        if (now - started).num_seconds() < TERMINAL_RELAUNCH_SETTLE_SECS {
+        if !scriptable && (now - started).num_seconds() < TERMINAL_RELAUNCH_SETTLE_SECS {
             return None;
         }
         self.pending.take()
@@ -614,9 +624,11 @@ impl TerminalWatch {
 
 // Restore on relaunch only when tabs died with the previous instance; a stale
 // pile alone must not reopen just because the terminal was reopened.
+// A tab offered by the new instance's shell proves it can already be scripted.
 fn terminal_returned_with_victims(
     watch: &mut TerminalWatch,
     processes: &ProcessSnapshot,
+    tab_offered: bool,
 ) -> Result<bool> {
     let Ok(terminal) = configured_terminal() else {
         return Ok(false);
@@ -625,6 +637,7 @@ fn terminal_returned_with_victims(
     if let Some(started_at) = watch.relaunched(
         &processes.instance_starts(terminal.process_name()),
         now.naive_utc(),
+        tab_offered,
     ) {
         log_line(&format!(
             "terminal relaunch detected: {terminal}, started at {started_at} UTC"
@@ -1285,9 +1298,12 @@ mod tests {
         let old = now - Duration::hours(2);
         let survivor = now - Duration::hours(1);
         let mut watch = TerminalWatch::default();
-        assert_eq!(watch.relaunched(&instances(&[old, survivor]), now), None);
         assert_eq!(
-            watch.relaunched(&instances(&[survivor]), now + Duration::seconds(5)),
+            watch.relaunched(&instances(&[old, survivor]), now, false),
+            None
+        );
+        assert_eq!(
+            watch.relaunched(&instances(&[survivor]), now + Duration::seconds(5), false),
             None
         );
     }
@@ -1297,13 +1313,13 @@ mod tests {
         let now = Utc::now().naive_utc();
         let old = now - Duration::hours(2);
         let mut watch = TerminalWatch::default();
-        assert_eq!(watch.relaunched(&instances(&[old]), now), None);
+        assert_eq!(watch.relaunched(&instances(&[old]), now, false), None);
         assert_eq!(
-            watch.relaunched(&instances(&[]), now + Duration::seconds(5)),
+            watch.relaunched(&instances(&[]), now + Duration::seconds(5), false),
             None
         );
         assert_eq!(
-            watch.relaunched(&instances(&[old]), now + Duration::seconds(10)),
+            watch.relaunched(&instances(&[old]), now + Duration::seconds(10), false),
             None
         );
     }
@@ -1315,15 +1331,18 @@ mod tests {
         let fresh = now + Duration::seconds(1);
         let mut watch = TerminalWatch::default();
 
-        assert_eq!(watch.relaunched(&instances(&[old]), now), None);
-        assert_eq!(watch.relaunched(&instances(&[old]), now), None);
-        assert_eq!(watch.relaunched(&instances(&[fresh]), fresh), None);
+        assert_eq!(watch.relaunched(&instances(&[old]), now, false), None);
+        assert_eq!(watch.relaunched(&instances(&[old]), now, false), None);
+        assert_eq!(watch.relaunched(&instances(&[fresh]), fresh, false), None);
         let settled_at = fresh + Duration::seconds(TERMINAL_RELAUNCH_SETTLE_SECS);
         assert_eq!(
-            watch.relaunched(&instances(&[fresh]), settled_at),
+            watch.relaunched(&instances(&[fresh]), settled_at, false),
             Some(fresh)
         );
-        assert_eq!(watch.relaunched(&instances(&[fresh]), settled_at), None);
+        assert_eq!(
+            watch.relaunched(&instances(&[fresh]), settled_at, false),
+            None
+        );
     }
 
     #[test]
@@ -1333,13 +1352,13 @@ mod tests {
         let mut watch = TerminalWatch::default();
 
         assert_eq!(
-            watch.relaunched(&instances(&[back - Duration::hours(1)]), now),
+            watch.relaunched(&instances(&[back - Duration::hours(1)]), now, false),
             None
         );
-        assert_eq!(watch.relaunched(&instances(&[]), now), None);
-        assert_eq!(watch.relaunched(&instances(&[]), now), None);
+        assert_eq!(watch.relaunched(&instances(&[]), now, false), None);
+        assert_eq!(watch.relaunched(&instances(&[]), now, false), None);
         assert_eq!(
-            watch.relaunched(&instances(&[back]), back + Duration::seconds(5)),
+            watch.relaunched(&instances(&[back]), back + Duration::seconds(5), false),
             Some(back)
         );
     }
@@ -1348,9 +1367,9 @@ mod tests {
     fn terminal_watch_ignores_a_daemon_that_starts_with_no_terminal() {
         let now = Utc::now().naive_utc();
         let mut watch = TerminalWatch::default();
-        assert_eq!(watch.relaunched(&instances(&[]), now), None);
+        assert_eq!(watch.relaunched(&instances(&[]), now, false), None);
         assert_eq!(
-            watch.relaunched(&instances(&[now]), now + Duration::seconds(5)),
+            watch.relaunched(&instances(&[now]), now + Duration::seconds(5), false),
             Some(now)
         );
     }
@@ -1363,17 +1382,35 @@ mod tests {
         let old = launched - Duration::hours(2);
         let mut watch = TerminalWatch::default();
         assert_eq!(
-            watch.relaunched(&instances(&[old]), launched - Duration::seconds(10)),
+            watch.relaunched(&instances(&[old]), launched - Duration::seconds(10), false),
             None
         );
         assert_eq!(
-            watch.relaunched(&instances(&[]), launched + Duration::seconds(1)),
+            watch.relaunched(&instances(&[]), launched + Duration::seconds(1), false),
             None
         );
         assert_eq!(
-            watch.relaunched(&instances(&[launched]), launched + Duration::seconds(6)),
+            watch.relaunched(
+                &instances(&[launched]),
+                launched + Duration::seconds(6),
+                false
+            ),
             Some(launched)
         );
+    }
+
+    #[test]
+    fn a_tab_offered_by_a_new_instance_brings_its_relaunch_forward() {
+        let now = Utc::now().naive_utc();
+        let old = now - Duration::hours(2);
+        let launched = now - Duration::seconds(1);
+        let mut watch = TerminalWatch::default();
+        assert_eq!(watch.relaunched(&instances(&[old]), old, true), None);
+        assert_eq!(
+            watch.relaunched(&instances(&[launched]), now, true),
+            Some(launched)
+        );
+        assert_eq!(watch.relaunched(&instances(&[launched]), now, true), None);
     }
 
     fn identity(time: chrono::NaiveDateTime) -> String {

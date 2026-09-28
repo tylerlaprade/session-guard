@@ -2,6 +2,7 @@ mod adapters;
 mod cargo_targets;
 mod commands;
 mod continuation;
+mod fresh_tab;
 mod harness;
 mod hooks;
 mod last_sessions;

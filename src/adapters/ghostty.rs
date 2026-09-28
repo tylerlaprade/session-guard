@@ -67,6 +67,9 @@ fn restore_tab_command(directory: &str, input: &str, window: &str) -> Command {
 
 impl TerminalAdapter for Ghostty {
     fn open_tab(&self, directory: &Path, command: &str) -> Result<()> {
+        if crate::fresh_tab::fill(directory, command)? {
+            return Ok(());
+        }
         if !self.is_running() {
             self.launch()?;
             thread::sleep(Duration::from_millis(700));

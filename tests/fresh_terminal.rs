@@ -1,4 +1,3 @@
-use fs2::FileExt;
 use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -17,24 +16,32 @@ fi";
 struct Terminal {
     home: tempfile::TempDir,
     master: Option<File>,
-    child: Child,
+    child: Option<Child>,
     output: String,
-    restore_lock: Option<File>,
+    helpers: Vec<Child>,
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        if let Some(child) = self.child.as_mut() {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
         }
-        let _ = self.child.kill();
         drop(self.master.take());
-        let _ = self.child.wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.wait();
+        }
+        for helper in &mut self.helpers {
+            let _ = helper.kill();
+            let _ = helper.wait();
+        }
     }
 }
 
 impl Terminal {
-    fn start(queued: &[u8], locked: bool, pending: bool) -> Self {
+    fn prepare() -> Self {
         let home = tempfile::tempdir().unwrap();
         let root = home.path();
         let config = root.join(".config/session-guard");
@@ -52,13 +59,15 @@ impl Terminal {
             json!([{
                 "session_id":"first-session", "tool":"claude", "directory":root,
                 "registered_at":"2020-01-01T00:00:00Z", "session_name":null,
-                "state":"recoverable", "restore_pending":pending,
-                "shell_pid":2_147_483_647, "shell_pid_started_at":"Wed Jan 1 00:00:00 2020"
+                "state":"recoverable", "restore_pending":true,
+                "shell_pid":2_147_483_647, "shell_pid_started_at":"Wed Jan 1 00:00:00 2020",
+                "tab_position":[1,1]
             },{
                 "session_id":"second-session", "tool":"codex", "directory":root,
                 "registered_at":"2020-01-01T00:00:00Z", "session_name":null,
-                "state":"recoverable", "restore_pending":pending,
-                "shell_pid":2_147_483_647, "shell_pid_started_at":"Wed Jan 1 00:00:00 2020"
+                "state":"recoverable", "restore_pending":true,
+                "shell_pid":2_147_483_647, "shell_pid_started_at":"Wed Jan 1 00:00:00 2020",
+                "tab_position":[1,2]
             }])
             .to_string(),
         )
@@ -75,11 +84,49 @@ impl Terminal {
         )
         .unwrap();
         fs::write(root.join(".zshrc"), format!("typeset -gi _ghostty_state=0\nclaude() {{ print -r -- \"RESUMED:$*\"; read -r answer; return 17; }}\n{STARTUP}\nPROMPT='FRESH_PROMPT> '\n")).unwrap();
-        let restore_lock = locked.then(|| {
-            let lock = File::create(config.join("restore.lock")).unwrap();
-            lock.lock_exclusive().unwrap();
-            lock
-        });
+        let mut terminal = Self {
+            home,
+            master: None,
+            child: None,
+            output: String::new(),
+            helpers: Vec::new(),
+        };
+        std::os::unix::fs::symlink("/bin/sleep", terminal.bin("session-guard-stub")).unwrap();
+        let daemon = terminal
+            .command("session-guard-stub", &["60"])
+            .spawn()
+            .unwrap();
+        fs::write(config.join("daemon.pid"), format!("{}\n", daemon.id())).unwrap();
+        terminal.helpers.push(daemon);
+        terminal
+    }
+
+    fn bin(&self, name: &str) -> std::path::PathBuf {
+        self.home.path().join("bin").join(name)
+    }
+
+    fn command(&self, name: &str, args: &[&str]) -> Command {
+        let root = self.home.path();
+        let mut command = Command::new(self.bin(name));
+        command
+            .args(args)
+            .env("HOME", root)
+            .env("ZDOTDIR", root)
+            .env("SHELL", "/bin/zsh")
+            .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
+            .env("CODEX_HOME", root.join(".codex"))
+            .env("TERM_PROGRAM", "ghostty")
+            .env(
+                "PATH",
+                format!(
+                    "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                    root.join("bin").display()
+                ),
+            );
+        command
+    }
+
+    fn open_tab(&mut self, queued: &[u8]) {
         let (mut master, mut slave) = (-1, -1);
         assert_eq!(
             unsafe {
@@ -105,16 +152,16 @@ impl Terminal {
         let mut command = Command::new("/bin/zsh");
         command
             .arg("-dil")
-            .env("HOME", root)
-            .env("ZDOTDIR", root)
+            .env("HOME", self.home.path())
+            .env("ZDOTDIR", self.home.path())
             .env("SHELL", "/bin/zsh")
-            .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
+            .env("CLAUDE_CONFIG_DIR", self.home.path().join(".claude"))
             .env("TERM_PROGRAM", "ghostty")
             .env(
                 "PATH",
                 format!(
                     "{}:/usr/bin:/bin:/usr/sbin:/sbin",
-                    root.join("bin").display()
+                    self.home.path().join("bin").display()
                 ),
             )
             .stdin(slave.try_clone().unwrap())
@@ -128,12 +175,21 @@ impl Terminal {
                 Ok(())
             });
         }
-        Self {
-            child: command.spawn().unwrap(),
-            home,
-            master: Some(master),
-            output: String::new(),
-            restore_lock,
+        self.child = Some(command.spawn().unwrap());
+        self.master = Some(master);
+    }
+
+    fn offer_file(&self) -> std::path::PathBuf {
+        self.home
+            .path()
+            .join(".config/session-guard/fresh-tab.json")
+    }
+
+    fn wait_for(what: &str, done: impl Fn() -> bool, within: Duration) {
+        let deadline = Instant::now() + within;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -168,24 +224,27 @@ impl Terminal {
 }
 
 #[test]
-fn first_prompt_claims_one_session_and_preserves_the_interactive_wrapper() {
-    let mut terminal = Terminal::start(b"", false, true);
+fn a_filled_offer_runs_the_restore_launch_in_the_fresh_tab() {
+    let mut terminal = Terminal::prepare();
+    terminal.open_tab(b"");
+    let offer_file = terminal.offer_file();
+    Terminal::wait_for(
+        "the tab's offer",
+        || offer_file.exists(),
+        Duration::from_secs(5),
+    );
+    let mut offer: Value = serde_json::from_slice(&fs::read(&offer_file).unwrap()).unwrap();
+    offer["answer"] = json!({"Launch": {
+        "directory": terminal.home.path(),
+        "command": format!("{} launch --session-id first-session", terminal.bin("session-guard").display()),
+    }});
+    fs::write(&offer_file, offer.to_string()).unwrap();
     terminal.until("RESUMED:--resume first-session");
     assert!(!terminal.output.contains("FRESH_PROMPT>"));
+    assert!(!offer_file.exists());
     let records = terminal.records();
     assert_eq!(records[0]["state"], "active");
-    assert_eq!(records[0]["restore_pending"], false);
     assert_eq!(records[1]["restore_pending"], true);
-    assert!(records[0]["pid"].as_u64().unwrap() > 1);
-    let lock = File::open(
-        terminal
-            .home
-            .path()
-            .join(".config/session-guard/restore.lock"),
-    )
-    .unwrap();
-    lock.try_lock_exclusive().unwrap();
-    drop(lock);
     terminal
         .master
         .as_mut()
@@ -194,35 +253,35 @@ fn first_prompt_claims_one_session_and_preserves_the_interactive_wrapper() {
         .unwrap();
     terminal.until("FRESH_PROMPT>");
     assert_eq!(terminal.records()[0]["restore_pending"], true);
-    terminal.output.clear();
-    terminal
-        .master
-        .as_mut()
-        .unwrap()
-        .write_all(b"source ~/.zshrc\n")
-        .unwrap();
-    terminal.until("FRESH_PROMPT>");
-    assert!(!terminal.output.contains("RESUMED:"));
 }
 
 #[test]
-fn queued_input_is_left_for_the_shell_even_without_a_newline() {
-    let mut terminal = Terminal::start(b"print -r -- USER_INPUT_PRESERVED", false, true);
+fn queued_input_keeps_the_tab_for_the_shell_even_without_a_newline() {
+    let mut terminal = Terminal::prepare();
+    terminal.open_tab(b"print -r -- USER_INPUT_PRESERVED");
     terminal.until("FRESH_PROMPT>");
     assert!(!terminal.output.contains("RESUMED:"));
-    assert_eq!(terminal.records()[0]["restore_pending"], true);
+    assert!(!terminal.offer_file().exists());
     terminal.output.clear();
     terminal.master.as_mut().unwrap().write_all(b"\n").unwrap();
     terminal.until("\r\nUSER_INPUT_PRESERVED\r\n");
 }
 
 #[test]
-fn daemon_restore_and_legacy_unknown_records_leave_the_shell_alone() {
-    for (locked, pending) in [(true, true), (false, false)] {
-        let mut terminal = Terminal::start(b"", locked, pending);
-        terminal.until("FRESH_PROMPT>");
-        assert!(!terminal.output.contains("RESUMED:"));
-        assert_eq!(terminal.records()[0]["state"], "recoverable");
-        drop(terminal.restore_lock.take());
-    }
+fn a_declined_offer_gives_the_shell_its_prompt() {
+    let mut terminal = Terminal::prepare();
+    terminal.open_tab(b"");
+    let offer_file = terminal.offer_file();
+    Terminal::wait_for(
+        "the tab's offer",
+        || offer_file.exists(),
+        Duration::from_secs(5),
+    );
+    let mut offer: Value = serde_json::from_slice(&fs::read(&offer_file).unwrap()).unwrap();
+    offer["answer"] = json!("Decline");
+    fs::write(&offer_file, offer.to_string()).unwrap();
+    terminal.until("FRESH_PROMPT>");
+    assert!(!terminal.output.contains("RESUMED:"));
+    assert!(!offer_file.exists());
+    assert_eq!(terminal.records()[0]["state"], "recoverable");
 }

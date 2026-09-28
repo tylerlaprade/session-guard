@@ -135,21 +135,24 @@ if [[ $ZSH_EVAL_CONTEXT == file && -o login && -o interactive &&
 fi
 ```
 
-The shell makes one attempt before its first prompt. It can claim one confirmed
-interruption from an earlier Ghostty instance only when it is Ghostty's sole
-terminal and has no queued input, including an unfinished line. The claim uses
-the same registry and launcher as ordinary restoration. A shared restore lock
-prevents the daemon and shell from opening the same session; a busy lock makes
-the shell skip reuse without waiting. The daemon restores the remaining sessions.
+Before its first prompt, the shell offers its tab to the daemon when it is
+Ghostty's sole terminal, the daemon is running, and there is no queued input,
+including an unfinished line. The shell decides nothing about what to restore.
+An offer from a new Ghostty instance counts as that instance's relaunch, and
+the daemon's ordinary restore pass runs at once. The pass opens its first
+session in the offered tab instead of a new one, running the same launch
+command, and opens the rest as new tabs. When nothing needs restoring, the
+daemon declines within about a second and the shell shows its prompt.
 
-Existing prompts, re-sourced configuration, subshells, multiple tabs or splits,
-unknown legacy records, and failed native lookups are never reclaimed. There is
-no polling of the prompt and no injected command or keystroke. Native lookup
-targets the running Ghostty PID without permission to reconnect or relaunch it.
+The shell withdraws its offer when input arrives or after fifteen seconds
+without an answer, and it rechecks for input before running what the daemon
+handed it. Existing prompts, re-sourced configuration, subshells, multiple tabs
+or splits, and failed native lookups never make an offer. There is no polling
+of the prompt and no injected command or keystroke. Native lookup targets the
+running Ghostty PID without permission to reconnect or relaunch it.
 
 When session-guard itself launches Ghostty, it disables the default empty window
 for that launch only. The first restored session creates the first window.
-Both paths use the same working-only continuation policy below.
 
 ### Continuing interrupted work
 

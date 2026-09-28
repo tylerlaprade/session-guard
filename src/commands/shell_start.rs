@@ -1,31 +1,27 @@
 use crate::adapters::ghostty;
-use crate::commands::{daemon, launch, restore};
+use crate::commands::daemon;
+use crate::fresh_tab::{self, Answer};
 use crate::paths;
-use crate::process::{self, ProcessSnapshot};
-use crate::sessions::{self, SessionRecord};
-use anyhow::Result;
-use fs2::FileExt;
+use crate::process;
+use anyhow::{Context, Result};
 use std::ffi::CStr;
 use std::io::IsTerminal;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
+
+// The daemon answers within a second when idle; a restore pass already
+// opening tabs can take longer to reach this one.
+const OFFER_TIMEOUT: Duration = Duration::from_secs(15);
+const ANSWER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn run() -> Result<()> {
     if std::env::var("TERM_PROGRAM").as_deref() != Ok("ghostty")
         || !std::io::stdin().is_terminal()
         || !paths::launch_agent_plist()?.is_file()
-    {
-        return Ok(());
-    }
-    let restore_lock = restore::lock()?;
-    match restore_lock.try_lock_exclusive() {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    let path = paths::sessions_file()?;
-    let processes = ProcessSnapshot::capture()?;
-    if !sessions::read_sessions(&path)?
-        .iter()
-        .any(|session| eligible(session, &processes))
+        || daemon::running_daemon_pid()?.is_none()
+        || !untouched()?
     {
         return Ok(());
     }
@@ -39,44 +35,33 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     let owner = i32::try_from(std::process::id())?;
-    let started = process::process_start_identity(owner)?;
-    let record = sessions::with_sessions_mut(&path, |sessions| {
-        let processes = ProcessSnapshot::capture()?;
-        let Some((_, session)) = sessions
-            .iter_mut()
-            .enumerate()
-            .filter(|(_, session)| eligible(session, &processes))
-            .min_by_key(|(index, session)| (daemon::tab_order(session), *index))
-        else {
-            return Ok(None);
-        };
-        if unsafe { libc::tcgetpgrp(0) } != unsafe { libc::getpgrp() } || input_waiting(0)? {
-            return Ok(None);
+    fresh_tab::offer(owner, &process::process_start_identity(owner)?)?;
+    let deadline = Instant::now() + OFFER_TIMEOUT;
+    let answer = loop {
+        let withdraw = Instant::now() >= deadline || !untouched()?;
+        if let Some(answer) = fresh_tab::take_answer(owner, withdraw)? {
+            break answer;
         }
-        Ok(Some(launch::claim(session, owner, &started)))
-    })?;
-    drop(restore_lock);
-    if let Some(record) = record {
-        daemon::log_line(&format!(
-            "reusing fresh terminal {tty}: {} {}",
-            record.record.tool, record.record.session_id
-        ))?;
-        launch::run_claimed(&record)?;
+        if withdraw {
+            return Ok(());
+        }
+        thread::sleep(ANSWER_POLL_INTERVAL);
+    };
+    let Answer::Launch { directory, command } = answer else {
+        return Ok(());
+    };
+    if !untouched()? {
+        return Ok(());
     }
-    Ok(())
+    Err(Command::new("/bin/sh")
+        .args(["-c", &command])
+        .current_dir(&directory)
+        .exec())
+    .with_context(|| format!("failed to run the restore in {}", directory.display()))
 }
 
-fn eligible(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
-    daemon::needs_terminal_restore(session, processes)
-        && session
-            .shell_pid_started_at
-            .as_deref()
-            .and_then(process::parse_identity)
-            .is_some()
-        && daemon::ending_verdict(session, processes, Some("ghostty"))
-            == daemon::EndingVerdict::Recoverable
-        && session.directory.is_dir()
-        && !crate::scan::is_unused_spare(session.tool, &session.session_id)
+fn untouched() -> Result<bool> {
+    Ok(unsafe { libc::tcgetpgrp(0) } == unsafe { libc::getpgrp() } && !input_waiting(0)?)
 }
 
 fn input_waiting(fd: i32) -> Result<bool> {

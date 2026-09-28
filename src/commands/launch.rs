@@ -6,9 +6,9 @@ use anyhow::{Context, Result, bail};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 
-pub(crate) struct LaunchRequest {
-    pub record: SessionRecord,
-    pub continue_work: bool,
+struct LaunchRequest {
+    record: SessionRecord,
+    continue_work: bool,
 }
 
 pub fn run(session_id: &str) -> Result<()> {
@@ -29,7 +29,7 @@ pub fn run(session_id: &str) -> Result<()> {
     run_claimed(&record)
 }
 
-pub(crate) fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchRequest {
+fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchRequest {
     let continue_work = crate::continuation::should_continue(session);
     session.pid = Some(owner);
     session.shell_pid = Some(owner);
@@ -44,7 +44,7 @@ pub(crate) fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> L
     }
 }
 
-pub(crate) fn run_claimed(request: &LaunchRequest) -> Result<()> {
+fn run_claimed(request: &LaunchRequest) -> Result<()> {
     let record = &request.record;
     let owner = std::process::id();
     daemon::log_line(&format!(
