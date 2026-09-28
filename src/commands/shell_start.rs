@@ -1,10 +1,8 @@
-use crate::adapters::ghostty;
 use crate::commands::daemon;
 use crate::fresh_tab::{self, Answer};
 use crate::paths;
 use crate::process;
 use anyhow::{Context, Result};
-use std::ffi::CStr;
 use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -15,28 +13,15 @@ use std::time::{Duration, Instant};
 // opening tabs can take longer to reach this one.
 const OFFER_TIMEOUT: Duration = Duration::from_secs(15);
 const ANSWER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-// Only a new Ghostty instance can have tabs to take back, and its first shell
-// starts within seconds of it. Tabs opened later skip the scripting lookup,
-// which can take seconds when Ghostty is busy.
-const FIRST_SHELL_WINDOW_SECS: i64 = 30;
 
 pub fn run() -> Result<()> {
     if std::env::var("TERM_PROGRAM").as_deref() != Ok("ghostty")
         || !std::io::stdin().is_terminal()
+        || !untouched()?
+        || !sole_terminal_of_its_ghostty()
         || !paths::launch_agent_plist()?.is_file()
         || daemon::running_daemon_pid()?.is_none()
-        || !untouched()?
-        || !started_with_its_terminal()?
     {
-        return Ok(());
-    }
-    let mut tty = [0_i8; 1024];
-    let result = unsafe { libc::ttyname_r(0, tty.as_mut_ptr(), tty.len()) };
-    if result != 0 {
-        return Err(std::io::Error::from_raw_os_error(result).into());
-    }
-    let tty = unsafe { CStr::from_ptr(tty.as_ptr()) }.to_str()?;
-    if !ghostty::is_only_terminal(tty)? {
         return Ok(());
     }
     let owner = i32::try_from(std::process::id())?;
@@ -65,38 +50,21 @@ pub fn run() -> Result<()> {
     .with_context(|| format!("failed to run the restore in {}", directory.display()))
 }
 
-fn started_with_its_terminal() -> Result<bool> {
-    let shell = unsafe { libc::getppid() };
-    let processes: std::collections::HashMap<i32, process::ProcInfo> = process::list_processes()?
+// Each Ghostty terminal, tab or split, is its own child process of Ghostty.
+fn sole_terminal_of_its_ghostty() -> bool {
+    let terminals: Vec<Vec<i32>> = process::pids_named("ghostty")
         .into_iter()
-        .map(|info| (info.pid, info))
+        .map(process::child_pids)
         .collect();
-    let mut ancestor = shell;
-    let terminal = loop {
-        let Some(info) = processes.get(&ancestor) else {
-            return Ok(false);
-        };
-        let executable = info.command.split_whitespace().next().unwrap_or_default();
-        if executable.rsplit('/').next() == Some("ghostty") {
-            break ancestor;
-        }
-        if info.ppid <= 1 {
-            return Ok(false);
-        }
-        ancestor = info.ppid;
-    };
-    let started = |pid| -> Result<chrono::NaiveDateTime> {
-        process::parse_identity(&process::process_start_identity(pid)?)
-            .context("unreadable process start time")
-    };
-    Ok(first_shell_of(started(terminal)?, started(shell)?))
-}
-
-fn first_shell_of(
-    terminal_started: chrono::NaiveDateTime,
-    shell_started: chrono::NaiveDateTime,
-) -> bool {
-    (shell_started - terminal_started).num_seconds() <= FIRST_SHELL_WINDOW_SECS
+    std::iter::successors(Some(unsafe { libc::getppid() }), |&pid| {
+        process::parent_pid(pid).filter(|&parent| parent > 1)
+    })
+    .find_map(|ancestor| {
+        terminals
+            .iter()
+            .find(|children| children.contains(&ancestor))
+    })
+    .is_some_and(|children| children.len() == 1)
 }
 
 fn untouched() -> Result<bool> {
@@ -132,19 +100,6 @@ mod tests {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
-
-    #[test]
-    fn only_a_shell_started_with_its_terminal_checks_for_a_sole_tab() {
-        let launched = chrono::Utc::now().naive_utc();
-        assert!(first_shell_of(
-            launched,
-            launched + chrono::Duration::seconds(4)
-        ));
-        assert!(!first_shell_of(
-            launched,
-            launched + chrono::Duration::hours(3)
-        ));
-    }
 
     #[test]
     fn unfinished_input_is_detected_without_consuming_it_or_changing_terminal_mode() {

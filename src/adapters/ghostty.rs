@@ -19,23 +19,6 @@ pub struct Ghostty {
     restore_window: RefCell<Option<String>>,
 }
 
-pub(crate) fn is_only_terminal(tty: &str) -> Result<bool> {
-    let mut command = Command::new("osascript");
-    command.args([
-        "-l",
-        "JavaScript",
-        "-e",
-        include_str!("ghostty_first_terminal.js"),
-        tty,
-    ]);
-    super::run_capture_timeout(
-        &mut command,
-        "checking first Ghostty terminal",
-        Duration::from_secs(2),
-    )
-    .map(|result| result == "true")
-}
-
 impl Ghostty {
     /// Keep the window a restore script reported for the pass's next tab.
     fn remember_window(&self, reply: &str) -> Result<()> {

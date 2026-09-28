@@ -362,6 +362,58 @@ pub fn list_processes() -> Result<Vec<ProcInfo>> {
     Ok(processes)
 }
 
+pub fn parent_pid(pid: i32) -> Option<i32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    i32::try_from(unsafe { info.assume_init() }.pbi_ppid).ok()
+}
+
+pub fn child_pids(pid: i32) -> Vec<i32> {
+    pid_list(|buffer, size| unsafe { libc::proc_listchildpids(pid, buffer, size) })
+}
+
+pub fn pids_named(name: &str) -> Vec<i32> {
+    pid_list(|buffer, size| unsafe { libc::proc_listallpids(buffer, size) })
+        .into_iter()
+        .filter(|&pid| {
+            let mut buffer = [0_u8; 64];
+            let length = unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), 64) };
+            usize::try_from(length)
+                .is_ok_and(|length| &buffer[..length.min(buffer.len())] == name.as_bytes())
+        })
+        .collect()
+}
+
+fn pid_list(list: impl Fn(*mut libc::c_void, libc::c_int) -> libc::c_int) -> Vec<i32> {
+    let mut capacity = 256;
+    loop {
+        let mut pids = vec![0_i32; capacity];
+        let Ok(size) = libc::c_int::try_from(pids.len() * std::mem::size_of::<i32>()) else {
+            return Vec::new();
+        };
+        let Ok(count) = usize::try_from(list(pids.as_mut_ptr().cast(), size)) else {
+            return Vec::new();
+        };
+        if count < capacity {
+            pids.truncate(count);
+            return pids;
+        }
+        capacity *= 2;
+    }
+}
+
 pub fn command_exists(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|path| is_executable(path.join(name)))
@@ -465,6 +517,19 @@ mod tests {
         let late = parse_identity("Sat Jul 11 09:03:01 2026").unwrap();
         assert!(early < late);
         assert!(parse_identity("not a start time").is_none());
+    }
+
+    #[test]
+    fn the_kernel_names_this_process_and_its_parent_and_children() {
+        let own = std::process::id() as i32;
+        let parent = parent_pid(own).unwrap();
+        assert_eq!(parent, unsafe { libc::getppid() });
+        assert!(child_pids(parent).contains(&own));
+        let executable = std::env::current_exe().unwrap();
+        let name = executable.file_name().unwrap().to_str().unwrap();
+        let kernel_name: String = name.chars().take(2 * libc::MAXCOMLEN).collect();
+        assert!(pids_named(&kernel_name).contains(&own));
+        assert!(pids_named("no-such-process-xyz").is_empty());
     }
 
     #[test]

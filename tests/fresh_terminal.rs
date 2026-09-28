@@ -13,6 +13,16 @@ const STARTUP: &str = r"if [[ $ZSH_EVAL_CONTEXT == file && -o login && -o intera
     session-guard shell-start
 fi";
 
+fn stand_in_ghostty_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("examples/ghostty")
+}
+
 struct Terminal {
     home: tempfile::TempDir,
     master: Option<File>,
@@ -98,7 +108,6 @@ impl Terminal {
             output: String::new(),
             helpers: Vec::new(),
         };
-        std::os::unix::fs::symlink("/bin/sh", terminal.bin("ghostty")).unwrap();
         std::os::unix::fs::symlink("/bin/sleep", terminal.bin("session-guard-stub")).unwrap();
         let daemon = terminal
             .command("session-guard-stub", &["60"])
@@ -135,10 +144,10 @@ impl Terminal {
     }
 
     fn open_tab(&mut self, queued: &[u8]) {
-        self.open_shell(queued, true);
+        self.open_shell(queued, Some(&["/bin/zsh -dil"]));
     }
 
-    fn open_shell(&mut self, queued: &[u8], under_a_fresh_terminal: bool) {
+    fn open_shell(&mut self, queued: &[u8], stand_in_ghostty: Option<&[&str]>) {
         let (mut master, mut slave) = (-1, -1);
         assert_eq!(
             unsafe {
@@ -161,10 +170,10 @@ impl Terminal {
             -1
         );
         master.write_all(queued).unwrap();
-        let mut command = if under_a_fresh_terminal {
-            let mut terminal = Command::new(self.bin("ghostty"));
-            terminal.args(["-c", "/bin/zsh -dil; :"]);
-            terminal
+        let mut command = if let Some(terminals) = stand_in_ghostty {
+            let mut ghostty = Command::new(stand_in_ghostty_path());
+            ghostty.args(terminals);
+            ghostty
         } else {
             let mut shell = Command::new("/bin/zsh");
             shell.arg("-dil");
@@ -306,9 +315,18 @@ fn a_declined_offer_gives_the_shell_its_prompt() {
 }
 
 #[test]
-fn a_shell_without_a_freshly_started_ghostty_makes_no_offer() {
+fn a_shell_outside_ghostty_makes_no_offer() {
     let mut terminal = Terminal::prepare();
-    terminal.open_shell(b"", false);
+    terminal.open_shell(b"", None);
+    terminal.until("FRESH_PROMPT>");
+    assert!(!terminal.output.contains("RESUMED:"));
+    assert!(!terminal.offer_file().exists());
+}
+
+#[test]
+fn a_second_terminal_in_the_same_ghostty_makes_no_offer() {
+    let mut terminal = Terminal::prepare();
+    terminal.open_shell(b"", Some(&["/bin/sleep 60", "/bin/zsh -dil"]));
     terminal.until("FRESH_PROMPT>");
     assert!(!terminal.output.contains("RESUMED:"));
     assert!(!terminal.offer_file().exists());

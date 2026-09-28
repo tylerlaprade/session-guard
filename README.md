@@ -135,11 +135,14 @@ if [[ $ZSH_EVAL_CONTEXT == file && -o login && -o interactive &&
 fi
 ```
 
-Before its first prompt, the shell offers its tab to the daemon when it
-started within thirty seconds of the Ghostty that owns it, is Ghostty's sole
-terminal, the daemon is running, and there is no queued input, including an
-unfinished line. Tabs opened later in a running Ghostty skip the sole-terminal
-lookup entirely, since only a new Ghostty instance can have tabs to take back. The shell decides nothing about what to restore.
+Before its first prompt, the shell offers its tab to the daemon when it is
+the sole terminal of the Ghostty that owns it, the daemon is running, and
+there is no queued input, including an unfinished line. Ghostty starts every
+terminal, tab or split, as its own child process, so the shell asks the kernel
+for the children of the Ghostty above it: sole means that Ghostty has exactly
+one, on the shell's own line of parents. The check takes no scripting call and
+no process listing, so a new tab in a running Ghostty costs little more than
+starting the binary. The shell decides nothing about what to restore.
 An offer from a new Ghostty instance counts as that instance's relaunch, and
 the daemon's ordinary restore pass runs at once. The pass opens its first
 session in the offered tab instead of a new one, running the same launch
@@ -148,10 +151,9 @@ daemon declines within about a second and the shell shows its prompt.
 
 The shell withdraws its offer when input arrives or after fifteen seconds
 without an answer, and it rechecks for input before running what the daemon
-handed it. Existing prompts, re-sourced configuration, subshells, multiple tabs
-or splits, and failed native lookups never make an offer. There is no polling
-of the prompt and no injected command or keystroke. Native lookup targets the
-running Ghostty PID without permission to reconnect or relaunch it.
+handed it. Existing prompts, re-sourced configuration, subshells, and multiple
+tabs or splits never make an offer. There is no polling of the prompt and no
+injected command or keystroke.
 
 When session-guard itself launches Ghostty, it disables the default empty window
 for that launch only. The first restored session creates the first window.
