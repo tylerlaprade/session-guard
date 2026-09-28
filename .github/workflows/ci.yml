@@ -27,6 +27,7 @@ jobs:
             osacompile -o "$RUNNER_TEMP/check.scpt" "$script"
           done
       - uses: dtolnay/rust-toolchain@stable
+      - run: curl -fsSL -o "$HOME/.rustfmt.toml" https://raw.githubusercontent.com/tylerlaprade/dotfiles/master/.rustfmt.toml
       - run: cargo fmt --check
       - run: cargo check
       - run: cargo clippy
