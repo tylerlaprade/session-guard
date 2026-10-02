@@ -163,6 +163,12 @@ impl Terminal {
         );
         let mut master = unsafe { File::from_raw_fd(master) };
         let slave = unsafe { File::from_raw_fd(slave) };
+        for descriptor in [master.as_raw_fd(), slave.as_raw_fd()] {
+            assert_eq!(
+                unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
         let fd = master.as_raw_fd();
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         assert_ne!(
@@ -249,6 +255,19 @@ impl Terminal {
         )
         .unwrap()
     }
+}
+
+#[test]
+fn helpers_do_not_inherit_another_terminals_pty() {
+    let mut terminal = Terminal::prepare();
+    terminal.open_shell(b"", None);
+    terminal.until("FRESH_PROMPT>");
+    let descriptor = terminal.master.as_ref().unwrap().as_raw_fd().to_string();
+    let status = Command::new("/bin/sh")
+        .args(["-c", "test -t \"$1\"", "pty-check", &descriptor])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
 }
 
 #[test]

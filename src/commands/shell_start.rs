@@ -118,6 +118,12 @@ mod tests {
         );
         let mut master = unsafe { File::from_raw_fd(master) };
         let mut slave = unsafe { File::from_raw_fd(slave) };
+        for descriptor in [master.as_raw_fd(), slave.as_raw_fd()] {
+            assert_eq!(
+                unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
         let fd = slave.as_raw_fd();
         let mut before = std::mem::MaybeUninit::<libc::termios>::uninit();
         assert_eq!(unsafe { libc::tcgetattr(fd, before.as_mut_ptr()) }, 0);

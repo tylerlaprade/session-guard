@@ -48,6 +48,12 @@ fn restored_launch_preserves_interactive_wrappers_and_provider_exit_status() {
     );
     let mut master = unsafe { File::from_raw_fd(master) };
     let slave = unsafe { File::from_raw_fd(slave) };
+    for descriptor in [master.as_raw_fd(), slave.as_raw_fd()] {
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
     let fd = master.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     assert_ne!(
