@@ -92,7 +92,9 @@ becomes recoverable, dated at its SessionEnd, even when the dying tab's shell
 or tool is still exiting. Without a configured terminal, a running tool or
 shell means the user ended it. Tabless (scan-tracked) sessions
 retire on SessionEnd directly, since a graceful end is the only cleanup they
-get.
+get. A SessionEnd for an already released record leaves it released. Codex's
+shared server can unload an old thread after its terminal has closed; that
+later end must not turn the old record into a new crash victim.
 
 The daemon records the operating system's boot identifier in its heartbeat.
 A reboot restores confirmed pending interruptions, including sessions whose

@@ -151,6 +151,10 @@ impl SessionRecord {
     }
 
     pub fn mark_ending(&mut self) {
+        // Codex can unload a thread after its terminal record was released.
+        if self.state == SessionState::Recoverable && !self.restore_pending {
+            return;
+        }
         self.state = SessionState::Ending;
         self.ending_at.get_or_insert(Utc::now());
     }

@@ -150,6 +150,29 @@ mod tests {
     }
 
     #[test]
+    fn a_late_session_end_leaves_a_released_record_out_of_the_next_relaunch() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_path = dir.path().join("active-sessions.json");
+        let last_sessions_path = dir.path().join("last-sessions.json");
+        let processes = crate::process::ProcessSnapshot::capture().unwrap();
+        let dead = "Wed Jan 1 00:00:00 2020".to_string();
+        let mut record = record_with_shell(Some(i32::MAX), Some(dead.clone()));
+        record.pid_started_at = Some(dead);
+        record.mark_recoverable();
+        record.restore_pending = false;
+        sessions::register(&sessions_path, record.clone()).unwrap();
+
+        end_from_hook(&sessions_path, &last_sessions_path, &record).unwrap();
+
+        let session = &sessions::read_sessions(&sessions_path).unwrap()[0];
+        assert_eq!(session.state, SessionState::Recoverable);
+        assert!(!session.restore_pending);
+        assert!(!crate::commands::daemon::needs_terminal_restore(
+            session, &processes
+        ));
+    }
+
+    #[test]
     fn session_end_without_shell_retires_the_record() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_path = dir.path().join("active-sessions.json");
