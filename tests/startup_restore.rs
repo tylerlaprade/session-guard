@@ -26,7 +26,20 @@ impl Drop for Daemon {
     }
 }
 
-fn run_startup(boot_id: &str, tool: &str, spare: bool, pending: bool) -> (String, Value) {
+#[derive(Clone, Copy)]
+enum Transcript {
+    Unreported,
+    NeverWritten,
+    Written,
+}
+
+fn run_startup(
+    boot_id: &str,
+    tool: &str,
+    spare: bool,
+    pending: bool,
+    transcript: Transcript,
+) -> (String, Value) {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path();
     let config = home.join(".config/session-guard");
@@ -36,6 +49,20 @@ fn run_startup(boot_id: &str, tool: &str, spare: bool, pending: bool) -> (String
     let now = Utc::now();
     let idle_since = now - Age::days(3);
     let session = "7a248d2c-865f-4829-af1b-2bee5f0c2b48";
+    let transcript_path = home
+        .join(".claude/projects/project")
+        .join(format!("{session}.jsonl"));
+    match transcript {
+        Transcript::Unreported | Transcript::NeverWritten => {}
+        Transcript::Written => {
+            fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+            fs::write(&transcript_path, "{}\n").unwrap();
+        }
+    }
+    let reported_transcript = match transcript {
+        Transcript::Unreported => Value::Null,
+        Transcript::NeverWritten | Transcript::Written => json!(transcript_path),
+    };
     fs::write(config.join("terminal"), "ghostty\n").unwrap();
     fs::write(
         config.join("active-sessions.json"),
@@ -43,7 +70,8 @@ fn run_startup(boot_id: &str, tool: &str, spare: bool, pending: bool) -> (String
             "session_id": session, "tool": tool, "pid": 2_147_483_647,
             "shell_pid": 2_147_483_646, "directory": home, "session_name": null,
             "registered_at": idle_since, "last_seen_at": idle_since, "state": "recoverable",
-            "dead_at": idle_since, "restore_pending": pending
+            "dead_at": idle_since, "restore_pending": pending,
+            "transcript_path": reported_transcript
         }])
         .to_string(),
     )
@@ -114,7 +142,11 @@ else:
             let records: Value =
                 serde_json::from_slice(&fs::read(config.join("active-sessions.json")).unwrap())
                     .unwrap();
-            if !spare && pending && boot_id == "previous-boot" {
+            if !spare
+                && pending
+                && boot_id == "previous-boot"
+                && !matches!(transcript, Transcript::NeverWritten)
+            {
                 let record = &records[0];
                 assert_eq!(record["state"], "active");
                 assert_eq!(record["restore_pending"], false);
@@ -160,7 +192,7 @@ else:
 fn three_day_idle_sessions_restore_without_provider_hooks() {
     for tool in ["codex", "claude", "grok", "opencode"] {
         assert!(
-            run_startup("previous-boot", tool, false, true)
+            run_startup("previous-boot", tool, false, true, Transcript::Unreported)
                 .0
                 .contains("Restored 1 sessions")
         );
@@ -169,13 +201,41 @@ fn three_day_idle_sessions_restore_without_provider_hooks() {
 
 #[test]
 fn reboot_excludes_native_spares_and_keeps_legacy_records() {
-    let (log, records) = run_startup("previous-boot", "claude", true, true);
+    let (log, records) = run_startup(
+        "previous-boot",
+        "claude",
+        true,
+        true,
+        Transcript::Unreported,
+    );
     assert!(log.contains("Restored 0 sessions"));
     assert!(log.contains("skipped unused spare"));
     assert_eq!(records.as_array().unwrap().len(), 1);
-    let (log, records) = run_startup("previous-boot", "codex", false, false);
+    let (log, records) = run_startup(
+        "previous-boot",
+        "codex",
+        false,
+        false,
+        Transcript::Unreported,
+    );
     assert!(log.contains("Restored 0 sessions"));
     assert_eq!(records.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn reboot_prunes_sessions_that_never_started_a_conversation() {
+    let (log, records) = run_startup(
+        "previous-boot",
+        "claude",
+        false,
+        true,
+        Transcript::NeverWritten,
+    );
+    assert!(log.contains("Restored 0 sessions"));
+    assert!(log.contains("Pruned 1 that never started a conversation."));
+    assert!(records.as_array().unwrap().is_empty());
+    let (log, _) = run_startup("previous-boot", "claude", false, true, Transcript::Written);
+    assert!(log.contains("Restored 1 sessions"));
 }
 
 #[test]
@@ -192,8 +252,14 @@ fn restarting_only_the_daemon_does_not_reopen_observed_deaths() {
     #[cfg(not(target_os = "macos"))]
     let current_boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
     assert!(
-        run_startup(current_boot.trim(), "codex", false, true)
-            .0
-            .contains("Restored 0 sessions")
+        run_startup(
+            current_boot.trim(),
+            "codex",
+            false,
+            true,
+            Transcript::Unreported
+        )
+        .0
+        .contains("Restored 0 sessions")
     );
 }

@@ -1,6 +1,6 @@
 use crate::adapters::{adapter_for, shell_quote};
 use crate::cargo_targets;
-use crate::harness::Integration;
+use crate::harness::{Discovery, Integration};
 use crate::last_sessions::{self, LastSessionRecord};
 use crate::paths;
 use crate::process::{self, ProcessSnapshot};
@@ -29,6 +29,7 @@ pub struct RestoreSummary {
     /// counts itself without a new field.
     pub restored: BTreeMap<Tool, usize>,
     pub pruned_missing_dirs: usize,
+    pub pruned_without_conversation: usize,
     pub pruned_duplicates: usize,
     pub fallback_sessions: usize,
     pub retired: usize,
@@ -67,6 +68,13 @@ impl RestoreSummary {
             per_tool.join(", "),
             self.pruned_missing_dirs,
         );
+        if self.pruned_without_conversation > 0 {
+            let _ = write!(
+                message,
+                " Pruned {} that never started a conversation.",
+                self.pruned_without_conversation
+            );
+        }
         if self.pruned_duplicates > 0 {
             let _ = write!(
                 message,
@@ -403,6 +411,15 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
 
             if !session.directory.is_dir() {
                 summary.pruned_missing_dirs += 1;
+                continue;
+            }
+
+            if never_started_a_conversation(&session) {
+                log_line(&format!(
+                    "pruned session that never started a conversation: {} {}",
+                    session.tool, session.session_id
+                ))?;
+                summary.pruned_without_conversation += 1;
                 continue;
             }
 
@@ -1006,6 +1023,18 @@ fn should_replace(
     candidate.last_seen_at > existing.last_seen_at
 }
 
+/// A harness writes its transcript on the first message, and its resume
+/// command refuses a session that has none.
+fn never_started_a_conversation(session: &SessionRecord) -> bool {
+    matches!(session.tool.spec().discovery, Discovery::Jsonl { .. })
+        && session
+            .transcript_path
+            .as_ref()
+            .is_some_and(|path| !path.exists())
+        && transcripts::transcript_path(session.tool, &session.session_id)
+            .is_ok_and(|found| found.is_none())
+}
+
 pub(crate) fn resume_command(session: &SessionRecord) -> String {
     let command: Vec<String> = session
         .command
@@ -1478,6 +1507,7 @@ mod tests {
         let summary = RestoreSummary {
             restored,
             pruned_missing_dirs: 0,
+            pruned_without_conversation: 1,
             pruned_duplicates: 1,
             fallback_sessions: 0,
             retired: 2,
@@ -1488,6 +1518,7 @@ mod tests {
         assert!(message.contains("Restored 5 sessions"));
         assert!(message.contains("1 OpenCode"));
         assert!(message.contains("Pruned 1 duplicate"));
+        assert!(message.contains("Pruned 1 that never started a conversation."));
         assert!(message.contains("Retired 2 ended sessions"));
     }
 }
