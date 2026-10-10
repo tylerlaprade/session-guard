@@ -130,3 +130,85 @@ fn activity_hooks_and_registration_share_the_same_exact_process_owner() {
     assert_eq!(hook("PermissionRequest", "b", "tool-4"), "waiting");
     assert_eq!(hook("Stop", "b", ""), "idle");
 }
+
+#[test]
+fn an_idle_restore_after_a_stop_with_background_tasks_asks_to_restart_them() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let store = root.join(".config/session-guard/active-sessions.json");
+    fs::create_dir(root.join("bin")).unwrap();
+    let executable = root.join("bin/claude");
+    fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 17\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let register = |pid: u32, mut payload: Value| {
+        use std::io::Write;
+        payload["cwd"] = json!(root);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_session-guard"))
+            .args(["register", "--tool", "claude", "--pid"])
+            .arg(pid.to_string())
+            .env("HOME", root)
+            .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let records: Value = serde_json::from_slice(&fs::read(&store).unwrap()).unwrap();
+        records[0]["background_tasks"].clone()
+    };
+    let stop = json!({"session_id":ID,"hook_event_name":"Stop","background_tasks":[
+        {"id":"b5hzqrsid","type":"shell","status":"running","description":"QA deploy",
+            "command":"sleep 40"},
+        {"id":"a4505039","type":"agent","status":"running","description":"Move memories",
+            "agent_type":"general-purpose"}]});
+    let owner = std::process::id();
+    assert_eq!(register(owner, stop.clone())[0]["id"], "b5hzqrsid");
+    let carried = register(
+        owner,
+        json!({"session_id":ID,"hook_event_name":"SessionStart"}),
+    );
+    assert_eq!(carried[1]["description"], "Move memories");
+    assert_eq!(register(1, json!({"session_id":ID})), Value::Null);
+    assert_eq!(register(owner, stop)[1]["id"], "a4505039");
+
+    let mut records: Value = serde_json::from_slice(&fs::read(&store).unwrap()).unwrap();
+    records[0]["pid"] = json!(2_147_483_647);
+    records[0]["state"] = json!("recoverable");
+    records[0]["restore_pending"] = json!(true);
+    fs::write(&store, records.to_string()).unwrap();
+    for attempt in 0..2 {
+        let output = Command::new(env!("CARGO_BIN_EXE_session-guard"))
+            .args(["launch", "--session-id", ID])
+            .env("HOME", root)
+            .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
+            .env("SHELL", "/bin/sh")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        let arguments: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let expected = if attempt == 0 {
+            vec![
+                "--resume".to_string(),
+                ID.to_string(),
+                "Background tasks stopped when this session was interrupted: QA deploy; Move \
+                 memories. Check what they finished and restart any that still need to run."
+                    .to_string(),
+            ]
+        } else {
+            vec!["--resume".to_string(), ID.to_string()]
+        };
+        assert_eq!(arguments, expected, "attempt {attempt}");
+    }
+}

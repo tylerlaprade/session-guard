@@ -26,6 +26,13 @@ pub struct Activity {
     pub needs_attention: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTask {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+}
+
 #[derive(Deserialize)]
 struct Event {
     #[serde(alias = "sessionId")]
@@ -159,12 +166,41 @@ fn apply_event(record: &mut SessionRecord, event: &Event) {
 }
 
 pub fn should_continue(record: &SessionRecord) -> bool {
-    (record.restore_pending || record.state != SessionState::Recoverable)
+    was_interrupted(record)
         && record
             .tool
             .spec()
             .was_working
             .is_some_and(|check| check(record))
+}
+
+fn was_interrupted(record: &SessionRecord) -> bool {
+    record.restore_pending || record.state != SessionState::Recoverable
+}
+
+pub fn restore_prompt(record: &SessionRecord) -> Option<String> {
+    if should_continue(record) {
+        return Some("continue".to_string());
+    }
+    let tasks = record
+        .background_tasks
+        .as_ref()
+        .filter(|tasks| !tasks.is_empty() && was_interrupted(record))?;
+    let names: Vec<&str> = tasks
+        .iter()
+        .map(|task| {
+            if task.description.is_empty() {
+                task.id.as_str()
+            } else {
+                task.description.as_str()
+            }
+        })
+        .collect();
+    Some(format!(
+        "Background tasks stopped when this session was interrupted: {}. \
+         Check what they finished and restart any that still need to run.",
+        names.join("; ")
+    ))
 }
 
 pub fn activity_was_working(record: &SessionRecord) -> bool {
@@ -381,6 +417,45 @@ mod tests {
         idle["status"] = json!("idle");
         record.activity = claude_native_activity(&record, &idle);
         assert!(!should_continue(&record));
+    }
+
+    #[test]
+    fn an_idle_restore_names_the_background_tasks_it_lost() {
+        let mut record = record("claude");
+        record.background_tasks = Some(vec![
+            BackgroundTask {
+                id: "b5hzqrsid".into(),
+                description: "QA deploy".into(),
+            },
+            BackgroundTask {
+                id: "a4505039".into(),
+                description: String::new(),
+            },
+        ]);
+        assert_eq!(
+            restore_prompt(&record).as_deref(),
+            Some(
+                "Background tasks stopped when this session was interrupted: QA deploy; \
+                 a4505039. Check what they finished and restart any that still need to run."
+            )
+        );
+        record.activity = Some(Activity {
+            state: WorkState::Working,
+            turn_id: String::new(),
+            owner_pid: 42,
+            owner_started_at: record.pid_started_at.clone().unwrap(),
+            pending_tools: BTreeSet::new(),
+            needs_attention: false,
+        });
+        assert_eq!(restore_prompt(&record).as_deref(), Some("continue"));
+        record.activity = None;
+        record.restore_pending = false;
+        assert_eq!(restore_prompt(&record), None);
+        record.restore_pending = true;
+        record.background_tasks = Some(Vec::new());
+        assert_eq!(restore_prompt(&record), None);
+        record.background_tasks = None;
+        assert_eq!(restore_prompt(&record), None);
     }
 
     #[test]

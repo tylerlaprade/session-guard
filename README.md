@@ -185,10 +185,21 @@ tool argument, or notification message text is classified.
 Codex also requires a matching native `task_started` event without a later
 completion, abort, or error event. These are lifecycle attributes, not message text.
 
-The launcher consumes the old activity before starting the restored process.
-A failed launch can be retried, but does not reuse the same continuation decision.
-New activity requires new native status or lifecycle evidence. Background-task
-loss is not automatically continued in this version.
+Claude's `Stop` hook lists the tasks still running in the background as a
+turn ends: background shells, agents, monitors, and the like. Registration
+keeps the latest list for that exact process. When an interrupted session was
+not mid-turn but had background tasks running, its restore gets a prompt that
+names each task by its description and asks the session to check what they
+finished and restart any that still need to run. A session that lost no
+background tasks still reopens without a prompt, and one that was mid-turn
+still gets `continue`. A turn that ends without `Stop`, such as an interrupted
+or failed one, leaves the previous list in place. Only Claude's hooks report
+background tasks.
+
+The launcher consumes the old activity and background-task list before
+starting the restored process. A failed launch can be retried, but does not
+reuse the same continuation decision. New activity requires new native status
+or lifecycle evidence.
 
 The daemon updates the hooks already installed each time it starts, so
 reinstalling the binary and restarting the daemon brings them up to date;

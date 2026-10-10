@@ -68,6 +68,8 @@ pub struct SessionRecord {
     pub restore_pending: bool,
     #[serde(default)]
     pub activity: Option<crate::continuation::Activity>,
+    #[serde(default)]
+    pub background_tasks: Option<Vec<crate::continuation::BackgroundTask>>,
     // The exact argv to replay, for a session that is its process (an editor)
     // rather than a resumable id.
     #[serde(default)]
@@ -114,6 +116,7 @@ impl SessionRecord {
             source,
             restore_pending: false,
             activity: None,
+            background_tasks: None,
             command: None,
             tab_position: None,
         }
@@ -145,6 +148,7 @@ impl SessionRecord {
             source: Some("transcript-fallback".to_string()),
             restore_pending: false,
             activity: None,
+            background_tasks: None,
             command: None,
             tab_position: None,
         }
@@ -296,6 +300,18 @@ pub fn register(path: &Path, mut record: SessionRecord) -> Result<()> {
                 && record.source.is_none()
         }) {
             record.activity.clone_from(&previous.activity);
+        }
+        if record.background_tasks.is_none()
+            && let Some(previous) = sessions.iter().find(|previous| {
+                previous.session_id == record.session_id
+                    && previous.pid == record.pid
+                    && previous.pid_started_at.is_some()
+                    && previous.pid_started_at == record.pid_started_at
+            })
+        {
+            record
+                .background_tasks
+                .clone_from(&previous.background_tasks);
         }
         if let Some(previous) = sessions
             .iter()

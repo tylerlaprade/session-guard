@@ -21,6 +21,8 @@ struct HookInput {
     transcript_path: Option<PathBuf>,
     source: Option<String>,
     name: Option<String>,
+    #[serde(default)]
+    background_tasks: Option<Vec<crate::continuation::BackgroundTask>>,
 }
 
 const SESSION_ID_ENVS: &[&str] = &[
@@ -110,6 +112,9 @@ pub fn run(
     }
 
     let source = hook_input.as_ref().and_then(|input| input.source.clone());
+    let background_tasks = hook_input
+        .as_ref()
+        .and_then(|input| input.background_tasks.clone());
     let name = name.or_else(|| hook_input.and_then(|input| input.name));
 
     sessions::repair_if_corrupt(&paths::sessions_file()?)?;
@@ -123,7 +128,13 @@ pub fn run(
         name,
         source,
     );
-    sessions::register(&paths::sessions_file()?, record)
+    sessions::register(
+        &paths::sessions_file()?,
+        SessionRecord {
+            background_tasks,
+            ..record
+        },
+    )
 }
 
 pub(crate) fn is_internal_directory(directory: &Path, tool_home: &Path) -> bool {

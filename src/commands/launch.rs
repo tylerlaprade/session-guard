@@ -1,3 +1,4 @@
+use crate::adapters::shell_quote;
 use crate::commands::{daemon, deregister};
 use crate::paths;
 use crate::process::{self, ProcessSnapshot};
@@ -8,7 +9,7 @@ use std::process::Command;
 
 struct LaunchRequest {
     record: SessionRecord,
-    continue_work: bool,
+    prompt: Option<String>,
 }
 
 pub fn run(session_id: &str) -> Result<()> {
@@ -30,7 +31,7 @@ pub fn run(session_id: &str) -> Result<()> {
 }
 
 fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchRequest {
-    let continue_work = crate::continuation::should_continue(session);
+    let prompt = crate::continuation::restore_prompt(session);
     session.pid = Some(owner);
     session.shell_pid = Some(owner);
     session.pid_started_at = Some(started.to_string());
@@ -38,9 +39,10 @@ fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchReques
     session.mark_active();
     session.source = Some("restore-launch".to_string());
     session.activity = None;
+    session.background_tasks = None;
     LaunchRequest {
         record: session.clone(),
-        continue_work,
+        prompt,
     }
 }
 
@@ -53,8 +55,9 @@ fn run_claimed(request: &LaunchRequest) -> Result<()> {
     ))?;
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
     let mut command = daemon::resume_command(record);
-    if request.continue_work {
-        command.push_str(" 'continue'");
+    if let Some(prompt) = &request.prompt {
+        command.push(' ');
+        command.push_str(&shell_quote(prompt));
         daemon::log_line(&format!(
             "continuing interrupted work: {} {}",
             record.tool, record.session_id
