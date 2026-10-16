@@ -164,7 +164,7 @@ fn an_idle_restore_after_a_stop_with_background_tasks_asks_to_restart_them() {
     let stop = json!({"session_id":ID,"hook_event_name":"Stop","background_tasks":[
         {"id":"b5hzqrsid","type":"shell","status":"running","description":"QA deploy",
             "command":"sleep 40"},
-        {"id":"a4505039","type":"agent","status":"running","description":"Move memories",
+        {"id":"a4505039","type":"subagent","status":"running","description":"Move memories",
             "agent_type":"general-purpose"}]});
     let owner = std::process::id();
     assert_eq!(register(owner, stop.clone())[0]["id"], "b5hzqrsid");
@@ -202,10 +202,10 @@ fn an_idle_restore_after_a_stop_with_background_tasks_asks_to_restart_them() {
             vec![
                 "--resume".to_string(),
                 ID.to_string(),
-                "Background tasks stopped when this session was interrupted: QA deploy; Move \
-                 memories. Check what each one finished. Resume a stopped subagent or workflow \
-                 where it left off rather than starting it over, and rerun only the shell \
-                 commands that still need to run."
+                "Background tasks stopped when this session was interrupted: QA deploy (shell); \
+                 Move memories (subagent). Check what each one finished. Resume a subagent or \
+                 workflow where it left off rather than starting it over, and rerun anything \
+                 else only if it still needs to run."
                     .to_string(),
             ]
         } else {

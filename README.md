@@ -202,9 +202,10 @@ Claude's `Stop` hook lists the tasks still running in the background as a
 turn ends: background shells, agents, monitors, and the like. Registration
 keeps the latest list for that exact process. When an interrupted session was
 not mid-turn but had background tasks running, its restore gets a prompt that
-names each task by its description and asks the session to check what each one
-finished, resume a stopped subagent or workflow where it left off rather than
-starting it over, and rerun only the shell commands that still need to run. A session that lost no
+names each task by its description and kind and asks the session to check what
+each one finished. It asks for a subagent or workflow to be resumed where it left
+off rather than started over, and for anything else to be rerun only if it still
+needs to run, mentioning only the kinds the session lost. A session that lost no
 background tasks still reopens without a prompt, and one that was mid-turn
 still gets `continue`. A turn that ends without `Stop`, such as an interrupted
 or failed one, leaves the previous list in place. Only Claude's hooks report

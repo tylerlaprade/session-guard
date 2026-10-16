@@ -29,6 +29,8 @@ pub struct Activity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundTask {
     pub id: String,
+    #[serde(default, rename = "type")]
+    pub kind: String,
     #[serde(default)]
     pub description: String,
 }
@@ -186,21 +188,35 @@ pub fn restore_prompt(record: &SessionRecord) -> Option<String> {
         .background_tasks
         .as_ref()
         .filter(|tasks| !tasks.is_empty() && was_interrupted(record))?;
-    let names: Vec<&str> = tasks
+    let names: Vec<String> = tasks
         .iter()
         .map(|task| {
-            if task.description.is_empty() {
+            let name = if task.description.is_empty() {
                 task.id.as_str()
             } else {
                 task.description.as_str()
+            };
+            if task.kind.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name} ({})", task.kind)
             }
         })
         .collect();
+    let resumable = |task: &BackgroundTask| matches!(task.kind.as_str(), "subagent" | "workflow");
+    let advice = match (tasks.iter().any(resumable), tasks.iter().all(resumable)) {
+        (false, _) => "Check what each one finished, and rerun any that still need to run.",
+        (true, true) => {
+            "Check what each one finished, and resume any that still need to run where it left \
+             off rather than starting it over."
+        }
+        (true, false) => {
+            "Check what each one finished. Resume a subagent or workflow where it left off \
+             rather than starting it over, and rerun anything else only if it still needs to run."
+        }
+    };
     Some(format!(
-        "Background tasks stopped when this session was interrupted: {}. \
-         Check what each one finished. Resume a stopped subagent or workflow where it left \
-         off rather than starting it over, and rerun only the shell commands that still need \
-         to run.",
+        "Background tasks stopped when this session was interrupted: {}. {advice}",
         names.join("; ")
     ))
 }
@@ -427,22 +443,43 @@ mod tests {
         record.background_tasks = Some(vec![
             BackgroundTask {
                 id: "b5hzqrsid".into(),
+                kind: "shell".into(),
                 description: "QA deploy".into(),
             },
             BackgroundTask {
                 id: "a4505039".into(),
+                kind: "subagent".into(),
                 description: String::new(),
             },
         ]);
         assert_eq!(
             restore_prompt(&record).as_deref(),
             Some(
-                "Background tasks stopped when this session was interrupted: QA deploy; \
-                 a4505039. Check what each one finished. Resume a stopped subagent or workflow \
-                 where it left off rather than starting it over, and rerun only the shell \
-                 commands that still need to run."
+                "Background tasks stopped when this session was interrupted: QA deploy (shell); \
+                 a4505039 (subagent). Check what each one finished. Resume a subagent or \
+                 workflow where it left off rather than starting it over, and rerun anything \
+                 else only if it still needs to run."
             )
         );
+        let lost = record.background_tasks.clone();
+        record.background_tasks = lost.as_ref().map(|tasks| tasks[..1].to_vec());
+        assert_eq!(
+            restore_prompt(&record).as_deref(),
+            Some(
+                "Background tasks stopped when this session was interrupted: QA deploy (shell). \
+                 Check what each one finished, and rerun any that still need to run."
+            )
+        );
+        record.background_tasks = lost.as_ref().map(|tasks| tasks[1..].to_vec());
+        assert_eq!(
+            restore_prompt(&record).as_deref(),
+            Some(
+                "Background tasks stopped when this session was interrupted: a4505039 \
+                 (subagent). Check what each one finished, and resume any that still need to \
+                 run where it left off rather than starting it over."
+            )
+        );
+        record.background_tasks = lost;
         record.activity = Some(Activity {
             state: WorkState::Working,
             turn_id: String::new(),
