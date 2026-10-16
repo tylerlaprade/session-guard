@@ -58,6 +58,18 @@ rejects unset vars such as `$PPID`. Grok 1.0.13+ injects `GROK_SESSION_ID`
 and `GROK_WORKSPACE_ROOT` on every hook; the script passes those as flags so
 register does not depend on stdin JSON field names (`cwd` vs `workspaceRoot`).
 
+The tools run hooks with the PATH that launched them, which lacks the login
+PATH when a terminal starts a tool directly as its command. Every installed
+hook therefore names the binary that installed it. A binary under the home
+folder is written relative to `${HOME}`, as in
+`${HOME}/.cargo/bin/session-guard`, which every harness expands and which keeps
+a settings file shared between machines the same on each; any other binary is
+written as its quoted absolute path. The OpenCode plugin holds the absolute
+path. An install from a different binary replaces the hooks that name the old
+one, including the bare `session-guard` commands of earlier versions. The other
+programs the hooks run, `ps` and `tr`, live in `/bin` and `/usr/bin`, which
+even that minimal PATH includes.
+
 OpenCode has no shell-command hooks; session-guard installs a JS plugin at
 `~/.config/opencode/plugin/session-guard.js` that OpenCode loads into its
 process. The plugin registers on `session.created`/`session.updated`, uses

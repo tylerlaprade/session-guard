@@ -20,7 +20,7 @@ esac
 # to stdin.
 shell_pid="${SESSION_GUARD_SHELL_PID:-}"
 [ -n "$shell_pid" ] || shell_pid="$(/bin/ps -o ppid= -p "$tool_pid" 2>/dev/null | tr -d ' ')"
-set -- session-guard register --tool grok --pid "$tool_pid"
+set -- @SESSION_GUARD@ register --tool grok --pid "$tool_pid"
 [ -n "$shell_pid" ] && set -- "$@" --shell-pid "$shell_pid"
 [ -n "$GROK_SESSION_ID" ] && set -- "$@" --session-id "$GROK_SESSION_ID"
 directory="${GROK_WORKSPACE_ROOT:-$CLAUDE_PROJECT_DIR}"

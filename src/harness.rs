@@ -17,6 +17,12 @@ use std::path::{Path, PathBuf};
 /// it was last active.
 pub type SessionMetadata = (String, PathBuf, DateTime<Utc>);
 
+// The tools run hooks with whatever PATH launched them, which lacks the login
+// PATH when a terminal starts the tool directly, so installs replace this
+// placeholder with the installed binary (see `hooks::Binary`).
+pub(crate) const SESSION_GUARD: &str = "@SESSION_GUARD@";
+pub(crate) const ACTIVITY_COMMAND: &str = "@SESSION_GUARD@ activity";
+
 // Every Claude frontend — terminal CLI, the desktop app, IDE extension
 // sidebars, SDK/headless runs — shares ~/.claude and fires these same hooks.
 // CLAUDE_CODE_ENTRYPOINT (inherited by hook subprocesses) names the frontend;
@@ -24,10 +30,10 @@ pub type SessionMetadata = (String, PathBuf, DateTime<Utc>);
 // `claude` launched inside a VS Code integrated terminal is still "cli".
 // (Headless remote workers never register via hooks anyway; the process scan
 // tracks them.)
-pub(crate) const CLAUDE_REGISTER: &str = r#"[ "$CLAUDE_CODE_ENTRYPOINT" = cli ] || exit 0; tool_pid="$PPID"; shell_pid="${SESSION_GUARD_SHELL_PID:-}"; [ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool claude --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool claude --pid "$tool_pid"; fi"#;
-pub(crate) const CLAUDE_DEREGISTER: &str = "session-guard deregister";
-pub(crate) const CODEX_REGISTER: &str = r#"tool_pid="$PPID"; shell_pid="${SESSION_GUARD_SHELL_PID:-}"; [ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then session-guard register --tool codex --pid "$tool_pid" --shell-pid "$shell_pid"; else session-guard register --tool codex --pid "$tool_pid"; fi"#;
-pub(crate) const CODEX_DEREGISTER: &str = "session-guard deregister";
+pub(crate) const CLAUDE_REGISTER: &str = r#"[ "$CLAUDE_CODE_ENTRYPOINT" = cli ] || exit 0; tool_pid="$PPID"; shell_pid="${SESSION_GUARD_SHELL_PID:-}"; [ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then @SESSION_GUARD@ register --tool claude --pid "$tool_pid" --shell-pid "$shell_pid"; else @SESSION_GUARD@ register --tool claude --pid "$tool_pid"; fi"#;
+pub(crate) const CLAUDE_DEREGISTER: &str = "@SESSION_GUARD@ deregister";
+pub(crate) const CODEX_REGISTER: &str = r#"tool_pid="$PPID"; shell_pid="${SESSION_GUARD_SHELL_PID:-}"; [ -n "$shell_pid" ] || shell_pid="$(ps -o ppid= -p "$tool_pid" | tr -d ' ')"; if [ -n "$shell_pid" ]; then @SESSION_GUARD@ register --tool codex --pid "$tool_pid" --shell-pid "$shell_pid"; else @SESSION_GUARD@ register --tool codex --pid "$tool_pid"; fi"#;
+pub(crate) const CODEX_DEREGISTER: &str = "@SESSION_GUARD@ deregister";
 // Grok expands $VAR / ${VAR} in hook `command` strings and fails the hook when
 // the var is unset. $PPID is a shell special, not an env var, so inline Claude-
 // style commands break. Keep the register logic in a companion script instead.
@@ -36,7 +42,7 @@ pub(crate) const CODEX_DEREGISTER: &str = "session-guard deregister";
 pub(crate) const GROK_REGISTER_SCRIPT_NAME: &str = "session-guard-register.sh";
 pub(crate) const GROK_HOOKS_FILE_NAME: &str = "session-guard.json";
 pub(crate) const GROK_REGISTER_SCRIPT: &str = include_str!("grok_register.sh");
-pub(crate) const GROK_DEREGISTER: &str = "session-guard deregister";
+pub(crate) const GROK_DEREGISTER: &str = "@SESSION_GUARD@ deregister";
 // OpenCode has no shell-command hooks; its extension point is a JS plugin
 // module loaded into the opencode process (Bun), discovered from
 // `<config>/plugin/*.js`. The plugin registers over the session event bus

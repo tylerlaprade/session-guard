@@ -3,6 +3,7 @@
 import { existsSync } from "node:fs";
 
 const REGISTER_THROTTLE_MS = 30_000;
+const SESSION_GUARD = "@SESSION_GUARD@";
 
 // Only interactive TUI sessions live in a terminal tab. Headless modes put a
 // subcommand in argv[2] (run, serve, web, acp, session, db, ...); the TUI is
@@ -27,7 +28,7 @@ export const SessionGuard = async ({ $, directory }) => {
       return;
     }
     lastRegistered.set(sessionID, now);
-    await $`session-guard register --tool opencode --session-id ${sessionID} --pid ${process.pid} --shell-pid ${shellPid} --directory ${dir}`
+    await $`${SESSION_GUARD} register --tool opencode --session-id ${sessionID} --pid ${process.pid} --shell-pid ${shellPid} --directory ${dir}`
       .quiet()
       .nothrow();
   };
@@ -37,7 +38,7 @@ export const SessionGuard = async ({ $, directory }) => {
   // tools' SessionEnd behavior.
   const deregister = async (sessionID) => {
     const payload = JSON.stringify({ session_id: sessionID });
-    await $`echo ${payload} | session-guard deregister`.quiet().nothrow();
+    await $`echo ${payload} | ${SESSION_GUARD} deregister`.quiet().nothrow();
   };
 
   return {

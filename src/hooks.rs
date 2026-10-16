@@ -1,5 +1,8 @@
 use crate::Tool;
-use crate::harness::{HookAction, HookEvent, Integration};
+use crate::adapters::shell_quote;
+use crate::harness::{
+    ACTIVITY_COMMAND, HookAction, HookEvent, Integration, SESSION_GUARD, ToolPath,
+};
 use anyhow::{Context, Result};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::fs;
@@ -28,51 +31,109 @@ pub struct HookChange {
     pub changed: bool,
 }
 
+/// The installed binary, as the hooks name it in place of `SESSION_GUARD`.
+struct Binary {
+    command: String,
+    literal: String,
+}
+
+impl Binary {
+    fn running() -> Result<Self> {
+        let path = std::env::current_exe().context("failed to locate the session-guard binary")?;
+        Ok(Self::at(&path, &crate::paths::home_dir()?))
+    }
+
+    /// A binary under the home folder is named through `${HOME}`, which every
+    /// harness expands, so a settings file shared between machines stays the
+    /// same on each of them.
+    fn at(path: &Path, home: &Path) -> Self {
+        let is_plain = |path: &Path| {
+            path.to_str().is_some_and(|text| {
+                text.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "._/+-".contains(character)
+                })
+            })
+        };
+        let command = match path.strip_prefix(home) {
+            Ok(relative) if is_plain(home) && is_plain(relative) => {
+                format!("${{HOME}}/{}", relative.display())
+            }
+            _ => shell_quote(&path.display().to_string()),
+        };
+        Self {
+            command,
+            literal: JsonValue::String(path.display().to_string()).to_string(),
+        }
+    }
+
+    fn command(&self, template: &str) -> String {
+        template.replace(SESSION_GUARD, &self.command)
+    }
+
+    fn plugin(&self, source: &str) -> String {
+        source.replace(&format!("\"{SESSION_GUARD}\""), &self.literal)
+    }
+}
+
 /// Installs the register/deregister hooks for one harness, in whatever shape
 /// that harness accepts. Adding a harness that reuses one of these shapes needs
 /// no code here — only a registry entry.
 pub fn install(tool: Tool) -> Result<HookChange> {
+    let Some(path) = config_path(&tool.spec().integration) else {
+        return Ok(HookChange::default());
+    };
+    install_with(tool, &path.resolve()?, &Binary::running()?)
+}
+
+fn config_path(integration: &Integration) -> Option<&ToolPath> {
+    match integration {
+        Integration::JsonSettings { path, .. }
+        | Integration::TomlConfig { path, .. }
+        | Integration::ScriptDir { path, .. }
+        | Integration::PluginFile { path, .. } => Some(path),
+        Integration::ProcessScan => None,
+    }
+}
+
+fn install_with(tool: Tool, path: &Path, binary: &Binary) -> Result<HookChange> {
+    let with_activity = |events: &[HookEvent]| -> Vec<HookEvent> {
+        events
+            .iter()
+            .chain(tool.spec().activity_hooks)
+            .cloned()
+            .collect()
+    };
     match &tool.spec().integration {
         Integration::JsonSettings {
-            path,
             events,
             register,
             deregister,
-        } => install_json_hooks(&path.resolve()?, events, register, deregister),
+            ..
+        } => install_json_hooks(path, events, register, deregister, binary),
         Integration::TomlConfig {
-            path,
             events,
             register,
             deregister,
-        } => {
-            let events: Vec<_> = events
-                .iter()
-                .chain(tool.spec().activity_hooks)
-                .cloned()
-                .collect();
-            install_toml_hooks(&path.resolve()?, &events, register, deregister)
-        }
+            ..
+        } => install_toml_hooks(path, &with_activity(events), register, deregister, binary),
         Integration::ScriptDir {
-            path,
             events,
             script_name,
             script,
             manifest_name,
             deregister,
+            ..
         } => install_script_dir(
-            &path.resolve()?,
-            &events
-                .iter()
-                .chain(tool.spec().activity_hooks)
-                .cloned()
-                .collect::<Vec<_>>(),
+            path,
+            &with_activity(events),
             script_name,
-            script,
+            &binary.command(script),
             manifest_name,
             deregister,
+            binary,
         ),
-        Integration::PluginFile { path, name, source } => {
-            install_plugin_file(&path.resolve()?, name, source)
+        Integration::PluginFile { name, source, .. } => {
+            install_plugin_file(path, name, &binary.plugin(source))
         }
         Integration::ProcessScan => Ok(HookChange { changed: false }),
     }
@@ -82,21 +143,25 @@ pub fn install(tool: Tool) -> Result<HookChange> {
 /// newer build can bring them up to date without adding hooks to a tool the
 /// user never installed them for.
 pub fn installed(tool: Tool) -> Result<bool> {
-    let contains_deregister = |path: &Path| {
-        fs::read_to_string(path).is_ok_and(|text| text.contains("session-guard deregister"))
-    };
     Ok(match &tool.spec().integration {
-        Integration::JsonSettings { path, .. } | Integration::TomlConfig { path, .. } => {
-            contains_deregister(&path.resolve()?)
-        }
+        Integration::JsonSettings { path, .. } => json_file_has_own_hook(&path.resolve()?)?,
+        Integration::TomlConfig { path, .. } => toml_file_has_own_hook(&path.resolve()?)?,
         Integration::ScriptDir {
             path,
             manifest_name,
             ..
-        } => contains_deregister(&path.resolve()?.join(manifest_name)),
+        } => json_file_has_own_hook(&path.resolve()?.join(manifest_name))?,
         Integration::PluginFile { path, name, .. } => path.resolve()?.join(name).is_file(),
         Integration::ProcessScan => false,
     })
+}
+
+fn json_file_has_own_hook(path: &Path) -> Result<bool> {
+    Ok(json_hook_commands(&read_json_config(path)?).any(is_own_hook))
+}
+
+fn toml_file_has_own_hook(path: &Path) -> Result<bool> {
+    Ok(toml_hook_commands(&read_toml_config(path)?).any(is_own_hook))
 }
 
 pub fn remove(tool: Tool) -> Result<HookChange> {
@@ -114,54 +179,22 @@ pub fn remove(tool: Tool) -> Result<HookChange> {
     }
 }
 
+#[cfg(test)]
+const TEST_HOME: &str = "/Users/tester";
+
+#[cfg(test)]
+fn test_binary() -> Binary {
+    Binary::at(
+        Path::new("/Users/tester/.cargo/bin/session-guard"),
+        Path::new(TEST_HOME),
+    )
+}
+
 /// Installs into an explicit directory or file instead of the harness's real
 /// path, so tests can exercise a harness end to end in a temp dir.
 #[cfg(test)]
 fn install_at(tool: Tool, path: &Path) -> Result<HookChange> {
-    match &tool.spec().integration {
-        Integration::JsonSettings {
-            events,
-            register,
-            deregister,
-            ..
-        } => install_json_hooks(path, events, register, deregister),
-        Integration::TomlConfig {
-            events,
-            register,
-            deregister,
-            ..
-        } => install_toml_hooks(
-            path,
-            &events
-                .iter()
-                .chain(tool.spec().activity_hooks)
-                .cloned()
-                .collect::<Vec<_>>(),
-            register,
-            deregister,
-        ),
-        Integration::ScriptDir {
-            events,
-            script_name,
-            script,
-            manifest_name,
-            deregister,
-            ..
-        } => install_script_dir(
-            path,
-            &events
-                .iter()
-                .chain(tool.spec().activity_hooks)
-                .cloned()
-                .collect::<Vec<_>>(),
-            script_name,
-            script,
-            manifest_name,
-            deregister,
-        ),
-        Integration::PluginFile { name, source, .. } => install_plugin_file(path, name, source),
-        Integration::ProcessScan => Ok(HookChange { changed: false }),
-    }
+    install_with(tool, path, &test_binary())
 }
 
 #[cfg(test)]
@@ -179,13 +212,30 @@ fn remove_at(tool: Tool, path: &Path) -> Result<HookChange> {
     }
 }
 
-/// The command a hook runs for one lifecycle event.
-fn hook_command<'a>(event: &HookEvent, register: &'a str, deregister: &'a str) -> &'a str {
+/// The command template a hook runs for one lifecycle event.
+fn hook_template<'a>(event: &HookEvent, register: &'a str, deregister: &'a str) -> &'a str {
     match event.action {
         HookAction::Register => register,
         HookAction::Deregister => deregister,
-        HookAction::Activity => "session-guard activity",
+        HookAction::Activity => ACTIVITY_COMMAND,
     }
+}
+
+fn rendered_hooks<'a>(
+    events: &'a [HookEvent],
+    register: &str,
+    deregister: &str,
+    binary: &Binary,
+) -> Vec<(&'a HookEvent, String)> {
+    events
+        .iter()
+        .map(|event| {
+            (
+                event,
+                binary.command(hook_template(event, register, deregister)),
+            )
+        })
+        .collect()
 }
 
 fn install_json_hooks(
@@ -193,17 +243,16 @@ fn install_json_hooks(
     events: &[HookEvent],
     register: &str,
     deregister: &str,
+    binary: &Binary,
 ) -> Result<HookChange> {
+    let hooks = rendered_hooks(events, register, deregister, binary);
     let mut root = read_json_config(path)?;
-    let mut changed = remove_json_hook_commands(&mut root, old_hook_commands());
+    let mut changed = remove_json_hook_commands(&mut root, |command| {
+        is_own_hook(command) && !hooks.iter().any(|(_, current)| current == command)
+    });
 
-    for event in events {
-        changed |= ensure_json_hook(
-            &mut root,
-            event.event,
-            event.matcher,
-            hook_command(event, register, deregister),
-        )?;
+    for (event, command) in &hooks {
+        changed |= ensure_json_hook(&mut root, event.event, event.matcher, command)?;
     }
 
     if changed {
@@ -219,7 +268,7 @@ fn remove_json_hooks(path: &Path) -> Result<HookChange> {
     }
 
     let mut root = read_json_config(path)?;
-    let changed = remove_json_hook_commands(&mut root, &all_hook_commands());
+    let changed = remove_json_hook_commands(&mut root, is_own_hook);
 
     if changed {
         write_json_config(path, &root)?;
@@ -233,17 +282,16 @@ fn install_toml_hooks(
     events: &[HookEvent],
     register: &str,
     deregister: &str,
+    binary: &Binary,
 ) -> Result<HookChange> {
+    let hooks = rendered_hooks(events, register, deregister, binary);
     let mut root = read_toml_config(path)?;
-    let mut changed = remove_toml_hook_commands(&mut root, old_hook_commands());
+    let mut changed = remove_toml_hook_commands(&mut root, |command| {
+        is_own_hook(command) && !hooks.iter().any(|(_, current)| current == command)
+    });
 
-    for event in events {
-        changed |= ensure_toml_hook(
-            &mut root,
-            event.event,
-            event.matcher,
-            hook_command(event, register, deregister),
-        )?;
+    for (event, command) in &hooks {
+        changed |= ensure_toml_hook(&mut root, event.event, event.matcher, command)?;
     }
 
     if changed {
@@ -259,7 +307,7 @@ fn remove_toml_hooks(path: &Path) -> Result<HookChange> {
     }
 
     let mut root = read_toml_config(path)?;
-    let changed = remove_toml_hook_commands(&mut root, &all_hook_commands());
+    let changed = remove_toml_hook_commands(&mut root, is_own_hook);
 
     if changed {
         write_toml_config(path, &root)?;
@@ -275,6 +323,7 @@ fn install_script_dir(
     script: &str,
     manifest_name: &str,
     deregister: &str,
+    binary: &Binary,
 ) -> Result<HookChange> {
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
@@ -290,7 +339,7 @@ fn install_script_dir(
         changed = true;
     }
 
-    let manifest = hooks_manifest_json(events, script_name, deregister);
+    let manifest = hooks_manifest_json(&rendered_hooks(events, script_name, deregister, binary));
     changed |= write_if_changed(&dir.join(manifest_name), &manifest)?;
 
     Ok(HookChange { changed })
@@ -316,10 +365,9 @@ fn remove_files(dir: &Path, names: &[&str]) -> Result<HookChange> {
 }
 
 /// A standalone hooks manifest: `{"hooks": {"<Event>": [{"hooks": [...]}]}}`.
-fn hooks_manifest_json(events: &[HookEvent], register: &str, deregister: &str) -> String {
+fn hooks_manifest_json(hooks_by_event: &[(&HookEvent, String)]) -> String {
     let mut hooks = serde_json::Map::new();
-    for event in events {
-        let command = hook_command(event, register, deregister);
+    for (event, command) in hooks_by_event {
         hooks
             .entry(event.event)
             .or_insert_with(|| json!([]))
@@ -391,11 +439,10 @@ fn old_hook_commands() -> &'static [&'static str] {
     ]
 }
 
-/// Every command session-guard has ever installed, current and retired, so an
-/// uninstall leaves nothing behind. Current commands come from the registry, so
-/// a new harness is covered the moment it is added.
-fn all_hook_commands() -> Vec<&'static str> {
-    let mut commands: Vec<&'static str> = Tool::all()
+/// Every command template session-guard installs. Templates come from the
+/// registry, so a new harness is covered the moment it is added.
+fn hook_templates() -> impl Iterator<Item = &'static str> {
+    Tool::all()
         .flat_map(|tool| match &tool.spec().integration {
             Integration::JsonSettings {
                 register,
@@ -410,12 +457,58 @@ fn all_hook_commands() -> Vec<&'static str> {
             Integration::ScriptDir { deregister, .. } => vec![*deregister],
             Integration::PluginFile { .. } | Integration::ProcessScan => Vec::new(),
         })
-        .collect();
-    commands.extend_from_slice(old_hook_commands());
-    commands.push("session-guard activity");
-    commands.sort_unstable();
-    commands.dedup();
-    commands
+        .chain([ACTIVITY_COMMAND])
+}
+
+/// Whether session-guard installed this command, current or retired, naming
+/// any binary, so a reinstall replaces it and an uninstall leaves nothing.
+fn is_own_hook(command: &str) -> bool {
+    old_hook_commands().contains(&command)
+        || hook_templates().any(|template| is_rendering_of(command, template))
+}
+
+fn is_rendering_of(command: &str, template: &str) -> bool {
+    let Some((prefix, rest)) = template.split_once(SESSION_GUARD) else {
+        return command == template;
+    };
+    let Some(from_binary) = command.strip_prefix(prefix) else {
+        return false;
+    };
+    let after_binary = rest
+        .split_once(SESSION_GUARD)
+        .map_or(rest, |(next, _)| next);
+    let binary_length = if after_binary.is_empty() {
+        Some(from_binary.len())
+    } else {
+        from_binary.find(after_binary)
+    };
+    binary_length.is_some_and(|length| {
+        length > 0 && command == template.replace(SESSION_GUARD, &from_binary[..length])
+    })
+}
+
+fn json_hook_commands(root: &JsonValue) -> impl Iterator<Item = &str> {
+    root.get("hooks")
+        .and_then(JsonValue::as_object)
+        .into_iter()
+        .flat_map(|hooks| hooks.values())
+        .filter_map(JsonValue::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(JsonValue::as_array))
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(JsonValue::as_str))
+}
+
+fn toml_hook_commands(root: &TomlValue) -> impl Iterator<Item = &str> {
+    root.get("hooks")
+        .and_then(TomlValue::as_table)
+        .into_iter()
+        .flat_map(|hooks| hooks.values())
+        .filter_map(TomlValue::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(TomlValue::as_array))
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(TomlValue::as_str))
 }
 
 fn ensure_json_hook(
@@ -471,7 +564,7 @@ fn json_event_has_command(event_hooks: &[JsonValue], command: &str) -> bool {
     })
 }
 
-fn remove_json_hook_commands(root: &mut JsonValue, commands: &[&str]) -> bool {
+fn remove_json_hook_commands(root: &mut JsonValue, is_removed: impl Fn(&str) -> bool) -> bool {
     let Some(hooks) = root.get_mut("hooks").and_then(JsonValue::as_object_mut) else {
         return false;
     };
@@ -491,7 +584,7 @@ fn remove_json_hook_commands(root: &mut JsonValue, commands: &[&str]) -> bool {
             inner_hooks.retain(|hook| {
                 hook.get("command")
                     .and_then(JsonValue::as_str)
-                    .is_none_or(|command| !commands.contains(&command))
+                    .is_none_or(|command| !is_removed(command))
             });
             changed |= inner_hooks.len() != before;
         }
@@ -621,7 +714,7 @@ fn toml_event_has_command(event_hooks: &[TomlValue], command: &str) -> bool {
     })
 }
 
-fn remove_toml_hook_commands(root: &mut TomlValue, commands: &[&str]) -> bool {
+fn remove_toml_hook_commands(root: &mut TomlValue, is_removed: impl Fn(&str) -> bool) -> bool {
     let Some(hooks) = root.get_mut("hooks").and_then(TomlValue::as_table_mut) else {
         return false;
     };
@@ -641,7 +734,7 @@ fn remove_toml_hook_commands(root: &mut TomlValue, commands: &[&str]) -> bool {
             inner_hooks.retain(|hook| {
                 hook.get("command")
                     .and_then(TomlValue::as_str)
-                    .is_none_or(|command| !commands.contains(&command))
+                    .is_none_or(|command| !is_removed(command))
             });
             changed |= inner_hooks.len() != before;
         }
@@ -688,8 +781,8 @@ fn toml_array_mut<'a>(value: &'a mut TomlValue, name: &str) -> Result<&'a mut Ve
 mod tests {
     use super::*;
     use crate::harness::{
-        CLAUDE_REGISTER, CODEX_DEREGISTER, CODEX_REGISTER, GROK_DEREGISTER, GROK_HOOKS_FILE_NAME,
-        GROK_REGISTER_SCRIPT_NAME, OPENCODE_PLUGIN_NAME,
+        CLAUDE_DEREGISTER, CLAUDE_REGISTER, CODEX_DEREGISTER, CODEX_REGISTER, GROK_DEREGISTER,
+        GROK_HOOKS_FILE_NAME, GROK_REGISTER_SCRIPT_NAME, OPENCODE_PLUGIN_NAME,
     };
 
     #[test]
@@ -705,7 +798,10 @@ mod tests {
         assert_eq!(start.len(), 1);
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1);
-        assert!(json_event_has_command(stop, CLAUDE_REGISTER));
+        assert!(json_event_has_command(
+            stop,
+            &test_binary().command(CLAUDE_REGISTER)
+        ));
     }
 
     #[test]
@@ -734,7 +830,10 @@ mod tests {
         let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
-        assert!(json_event_has_command(start, CLAUDE_REGISTER));
+        assert!(json_event_has_command(
+            start,
+            &test_binary().command(CLAUDE_REGISTER)
+        ));
         assert!(!json_event_has_command(start, OLD_CLAUDE_REGISTER_UNGATED));
     }
 
@@ -764,7 +863,10 @@ mod tests {
         let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
-        assert!(json_event_has_command(start, CLAUDE_REGISTER));
+        assert!(json_event_has_command(
+            start,
+            &test_binary().command(CLAUDE_REGISTER)
+        ));
         assert!(!json_event_has_command(start, OLD_CLAUDE_REGISTER_PARENT));
     }
 
@@ -793,7 +895,10 @@ mod tests {
         let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
-        assert!(json_event_has_command(start, CLAUDE_REGISTER));
+        assert!(json_event_has_command(
+            start,
+            &test_binary().command(CLAUDE_REGISTER)
+        ));
         assert!(!json_event_has_command(start, OLD_CLAUDE_REGISTER_ENV));
     }
 
@@ -810,13 +915,19 @@ mod tests {
         assert_eq!(start.len(), 1);
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2);
-        assert!(toml_event_has_command(stop, "session-guard activity"));
+        assert!(toml_event_has_command(
+            stop,
+            &test_binary().command(ACTIVITY_COMMAND)
+        ));
         assert!(toml_event_has_command(
             root["hooks"]["Interrupt"].as_array().unwrap(),
-            "session-guard activity"
+            &test_binary().command(ACTIVITY_COMMAND)
         ));
         let end = root["hooks"]["SessionEnd"].as_array().unwrap();
-        assert!(toml_event_has_command(end, CODEX_DEREGISTER));
+        assert!(toml_event_has_command(
+            end,
+            &test_binary().command(CODEX_DEREGISTER)
+        ));
         let contents = fs::read_to_string(path).unwrap();
         assert!(contents.contains("[[hooks.SessionStart]]"));
         assert!(contents.contains("[[hooks.Stop]]"));
@@ -848,7 +959,10 @@ command = "{}"
         let root = read_toml_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
-        assert!(toml_event_has_command(start, CODEX_REGISTER));
+        assert!(toml_event_has_command(
+            start,
+            &test_binary().command(CODEX_REGISTER)
+        ));
         assert!(!toml_event_has_command(start, OLD_CODEX_REGISTER_PARENT));
     }
 
@@ -874,7 +988,10 @@ command = '{OLD_CODEX_REGISTER_ENV}'
         let root = read_toml_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
-        assert!(toml_event_has_command(start, CODEX_REGISTER));
+        assert!(toml_event_has_command(
+            start,
+            &test_binary().command(CODEX_REGISTER)
+        ));
         assert!(!toml_event_has_command(start, OLD_CODEX_REGISTER_ENV));
     }
 
@@ -899,18 +1016,23 @@ command = '{OLD_CODEX_REGISTER_ENV}'
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert!(json_event_has_command(stop, GROK_REGISTER_SCRIPT_NAME));
         let end = root["hooks"]["SessionEnd"].as_array().unwrap();
-        assert!(json_event_has_command(end, GROK_DEREGISTER));
+        assert!(json_event_has_command(
+            end,
+            &test_binary().command(GROK_DEREGISTER)
+        ));
         let script = fs::read_to_string(&script_path).unwrap();
         assert!(script.contains("SESSION_GUARD_SHELL_PID"));
         assert!(script.contains("GROK_SESSION_ID"));
         assert!(script.contains("GROK_WORKSPACE_ROOT"));
         assert!(script.contains("/bin/ps"));
 
-        // Register script must not embed bare $VAR in the JSON command field —
-        // Grok expands those and fails when unset (e.g. $PPID).
+        assert!(script.contains("set -- ${HOME}/.cargo/bin/session-guard register"));
+
+        // Grok expands $VAR in the JSON command field and fails the hook when
+        // the variable is unset (e.g. $PPID); only HOME is always set.
         let json_text = fs::read_to_string(json_path).unwrap();
-        assert!(!json_text.contains("$PPID"));
-        assert!(!json_text.contains("${"));
+        assert!(json_text.contains("${HOME}/.cargo/bin/session-guard deregister"));
+        assert!(!json_text.replace("${HOME}", "").contains('$'));
     }
 
     #[test]
@@ -931,8 +1053,12 @@ command = '{OLD_CODEX_REGISTER_ENV}'
 
         let path = plugin_dir.join(OPENCODE_PLUGIN_NAME);
         let contents = fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("session-guard register --tool opencode"));
-        assert!(contents.contains("session-guard deregister"));
+        assert!(
+            contents.contains(r#"const SESSION_GUARD = "/Users/tester/.cargo/bin/session-guard";"#)
+        );
+        assert!(contents.contains("${SESSION_GUARD} register --tool opencode"));
+        assert!(contents.contains("${SESSION_GUARD} deregister"));
+        assert!(!contents.contains(SESSION_GUARD));
         assert!(contents.contains("export const SessionGuard"));
 
         assert!(
@@ -957,5 +1083,99 @@ command = '{OLD_CODEX_REGISTER_ENV}'
         assert!(!hooks_dir.join(GROK_HOOKS_FILE_NAME).exists());
         assert!(!hooks_dir.join(GROK_REGISTER_SCRIPT_NAME).exists());
         assert!(!remove_at(crate::tool("grok"), &hooks_dir).unwrap().changed);
+    }
+
+    #[test]
+    fn installs_name_the_binary_and_replace_bare_name_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let bare = |template: &str| template.replace(SESSION_GUARD, "session-guard");
+        let unrelated = "/opt/homebrew/bin/claude-title hook";
+        fs::write(
+            &path,
+            json!({"hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": bare(CLAUDE_REGISTER)}]},
+                    {"hooks": [{"type": "command", "command": unrelated}]}
+                ],
+                "SessionEnd": [
+                    {"hooks": [{"type": "command", "command": bare(CLAUDE_DEREGISTER)}]}
+                ]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(bare(CLAUDE_DEREGISTER), "session-guard deregister");
+        assert!(json_file_has_own_hook(&path).unwrap());
+
+        assert!(install_at(crate::tool("claude"), &path).unwrap().changed);
+        let root = read_json_config(&path).unwrap();
+        let commands: Vec<&str> = json_hook_commands(&root).collect();
+        assert!(commands.contains(&unrelated));
+        assert!(commands.contains(&"${HOME}/.cargo/bin/session-guard deregister"));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("'session-guard'"))
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.contains("${HOME}/.cargo/bin/session-guard register"))
+                .count(),
+            2
+        );
+        assert!(json_file_has_own_hook(&path).unwrap());
+
+        assert!(remove_json_hooks(&path).unwrap().changed);
+        let root = read_json_config(&path).unwrap();
+        assert_eq!(json_hook_commands(&root).collect::<Vec<_>>(), [unrelated]);
+        assert!(!json_file_has_own_hook(&path).unwrap());
+    }
+
+    #[test]
+    fn a_moved_binary_replaces_the_previous_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let moved = Binary::at(
+            Path::new("/opt/session guard/bin/session-guard"),
+            Path::new(TEST_HOME),
+        );
+        assert_eq!(
+            moved.command(CODEX_DEREGISTER),
+            "'/opt/session guard/bin/session-guard' deregister"
+        );
+        install_with(crate::tool("codex"), &path, &moved).unwrap();
+        assert!(toml_file_has_own_hook(&path).unwrap());
+        assert!(install_at(crate::tool("codex"), &path).unwrap().changed);
+        let root = read_toml_config(&path).unwrap();
+        assert!(!toml_hook_commands(&root).any(|command| command.contains("/opt/")));
+        assert!(!install_at(crate::tool("codex"), &path).unwrap().changed);
+    }
+
+    #[test]
+    fn only_exact_renderings_of_a_template_are_recognized() {
+        let template = CLAUDE_REGISTER;
+        assert!(is_rendering_of(&test_binary().command(template), template));
+        assert!(is_rendering_of(
+            &template.replace(SESSION_GUARD, "/x/sg"),
+            template
+        ));
+        let mixed = template
+            .replacen(SESSION_GUARD, "/x/sg", 1)
+            .replace(SESSION_GUARD, "/y/sg");
+        assert!(!is_rendering_of(&mixed, template));
+        assert!(!is_rendering_of(
+            &template.replace(SESSION_GUARD, ""),
+            template
+        ));
+        assert!(!is_rendering_of(
+            "session-guard deregister --all",
+            CLAUDE_DEREGISTER
+        ));
+        assert!(!is_rendering_of(
+            "/opt/homebrew/bin/claude-title hook",
+            CLAUDE_DEREGISTER
+        ));
     }
 }
