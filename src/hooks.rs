@@ -1178,4 +1178,35 @@ command = '{OLD_CODEX_REGISTER_ENV}'
             CLAUDE_DEREGISTER
         ));
     }
+
+    #[test]
+    fn hook_updates_keep_the_settings_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"statusLine": {"type": "command"}, "env": {"Z": "1", "A": "2"},
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "y"}]}], "PreToolUse": [{"hooks": [{"type": "command", "command": "x"}]}]}}"#,
+        )
+        .unwrap();
+        install_at(crate::tool("claude"), &path).unwrap();
+        let root = read_json_config(&path).unwrap();
+        let keys = |value: &JsonValue| {
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&root), ["statusLine", "env", "hooks"]);
+        assert_eq!(keys(&root["env"]), ["Z", "A"]);
+        assert_eq!(keys(&root["hooks"])[..2], ["Stop", "PreToolUse"]);
+
+        let toml_path = dir.path().join("config.toml");
+        fs::write(&toml_path, "model = \"m\"\napproval_policy = \"never\"\n").unwrap();
+        install_at(crate::tool("codex"), &toml_path).unwrap();
+        let contents = fs::read_to_string(&toml_path).unwrap();
+        assert!(contents.find("model =").unwrap() < contents.find("approval_policy =").unwrap());
+    }
 }

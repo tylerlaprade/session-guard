@@ -68,7 +68,8 @@ written as its quoted absolute path. The OpenCode plugin holds the absolute
 path. An install from a different binary replaces the hooks that name the old
 one, including the bare `session-guard` commands of earlier versions. The other
 programs the hooks run, `ps` and `tr`, live in `/bin` and `/usr/bin`, which
-even that minimal PATH includes.
+even that minimal PATH includes. An update rewrites only session-guard's hook
+entries and keeps every other key in its place.
 
 OpenCode has no shell-command hooks; session-guard installs a JS plugin at
 `~/.config/opencode/plugin/session-guard.js` that OpenCode loads into its
