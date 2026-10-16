@@ -203,7 +203,9 @@ fn an_idle_restore_after_a_stop_with_background_tasks_asks_to_restart_them() {
                 "--resume".to_string(),
                 ID.to_string(),
                 "Background tasks stopped when this session was interrupted: QA deploy; Move \
-                 memories. Check what they finished and restart any that still need to run."
+                 memories. Check what each one finished. Resume a stopped subagent or workflow \
+                 where it left off rather than starting it over, and rerun only the shell \
+                 commands that still need to run."
                     .to_string(),
             ]
         } else {

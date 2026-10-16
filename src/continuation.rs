@@ -198,7 +198,9 @@ pub fn restore_prompt(record: &SessionRecord) -> Option<String> {
         .collect();
     Some(format!(
         "Background tasks stopped when this session was interrupted: {}. \
-         Check what they finished and restart any that still need to run.",
+         Check what each one finished. Resume a stopped subagent or workflow where it left \
+         off rather than starting it over, and rerun only the shell commands that still need \
+         to run.",
         names.join("; ")
     ))
 }
@@ -436,7 +438,9 @@ mod tests {
             restore_prompt(&record).as_deref(),
             Some(
                 "Background tasks stopped when this session was interrupted: QA deploy; \
-                 a4505039. Check what they finished and restart any that still need to run."
+                 a4505039. Check what each one finished. Resume a stopped subagent or workflow \
+                 where it left off rather than starting it over, and rerun only the shell \
+                 commands that still need to run."
             )
         );
         record.activity = Some(Activity {
