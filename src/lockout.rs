@@ -22,11 +22,17 @@ use std::time::Duration;
 
 const STATE_PREFIX: &str = "LockoutUI changed state: ";
 const WAIT_INTERVAL: Duration = Duration::from_millis(500);
+// A stream can die a moment before its follower sees the end of it, so a
+// resumed read starts this far before the old follower stopped. Reading part
+// of what it already read again changes nothing.
+const RESUME_OVERLAP: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lockout {
     Clear,
     Engaged,
+    /// The watcher is still reading the terminal's state from the stored log.
+    Reading,
     Unknown(String),
 }
 
@@ -63,9 +69,14 @@ enum Seed {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Record {
     daemon: Instance,
-    watcher: Option<Instance>,
+    watcher: Instance,
     seed: Seed,
     engaged: BTreeSet<Instance>,
+    /// When this watcher stopped following, once its seed was read: the next
+    /// daemon reads the stored log from here instead of from the terminal's
+    /// launch.
+    #[serde(default)]
+    followed_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Record {
@@ -73,28 +84,41 @@ impl Record {
         let Some(current) = current else {
             return Lockout::Clear;
         };
-        let Some(watcher) = self
-            .watcher
-            .as_ref()
-            .filter(|watcher| running(&self.daemon) && running(watcher))
-        else {
+        if !running(&self.daemon) || !running(&self.watcher) {
             return Lockout::Unknown("the session-guard lockout watcher is not running".into());
-        };
-        let Seed::Read { terminal } = &self.seed else {
-            return Lockout::Unknown(
-                "the lockout watcher is still reading the terminal's state from the log".into(),
-            );
-        };
+        }
+        if self.seed == Seed::Reading {
+            return Lockout::Reading;
+        }
         if self.engaged.contains(current) {
             return Lockout::Engaged;
         }
-        if terminal.as_ref() == Some(current) || started_no_earlier(current, watcher) {
+        if self.covers(current) {
             return Lockout::Clear;
         }
         Lockout::Unknown(format!(
             "terminal pid {} started before the lockout watcher and its state was never read",
             current.pid
         ))
+    }
+
+    /// Whether this watcher knows `instance`'s state: it read it at start, or
+    /// was streaming when `instance` launched.
+    fn covers(&self, instance: &Instance) -> bool {
+        match &self.seed {
+            Seed::Reading => false,
+            Seed::Read { terminal } => {
+                terminal.as_ref() == Some(instance) || started_no_earlier(instance, &self.watcher)
+            }
+        }
+    }
+
+    /// Where a new watcher picks `instance` up from this stopped one: whether
+    /// it was locked out, and since when the stored log is still unread.
+    fn resume(&self, instance: &Instance) -> Option<(bool, chrono::DateTime<chrono::Utc>)> {
+        let until = self.followed_until?;
+        let engaged = self.engaged.contains(instance);
+        (engaged || self.covers(instance)).then_some((engaged, until - RESUME_OVERLAP))
     }
 }
 
@@ -194,7 +218,10 @@ pub struct Watcher {
 impl Watcher {
     pub fn start(terminal: TerminalKind) -> Result<Self> {
         let path = paths::lockout_state()?;
-        stop_orphaned_stream(&path);
+        let previous = read_record(&path).ok().flatten();
+        if let Some(previous) = &previous {
+            stop_orphaned_stream(previous);
+        }
         let mut stream = Command::new("log")
             .args([
                 "stream",
@@ -214,21 +241,29 @@ impl Watcher {
             .context("lockout log stream has no output")?;
         let record = Record {
             daemon: Instance::of(i32::try_from(std::process::id())?)?,
-            watcher: Some(Instance::of(i32::try_from(stream.id())?)?),
+            watcher: Instance::of(i32::try_from(stream.id())?)?,
             seed: Seed::Reading,
             engaged: BTreeSet::new(),
+            followed_until: None,
         };
         write_record(&path, &record)?;
         let reading = Arc::new(Mutex::new(None));
         let follower = {
             let reading = Arc::clone(&reading);
             thread::spawn(move || {
-                let result = follow(terminal, &path, record.clone(), stdout, &reading);
-                let stopped = Record {
-                    watcher: None,
-                    ..record
-                };
-                write_record(&path, &stopped)?;
+                let mut record = record;
+                let result = follow(
+                    terminal,
+                    &path,
+                    &mut record,
+                    previous.as_ref(),
+                    stdout,
+                    &reading,
+                );
+                if record.seed != Seed::Reading {
+                    record.followed_until = Some(chrono::Utc::now());
+                }
+                write_record(&path, &record)?;
                 result
             })
         };
@@ -266,31 +301,18 @@ impl Watcher {
         self.stream
             .wait()
             .context("failed to wait for the lockout log stream")?;
-        let followed = self
-            .follower
+        self.follower
             .join()
-            .map_err(|_| anyhow::anyhow!("lockout watcher panicked"))?;
-        match fs::remove_file(paths::lockout_state()?) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                return Err(error).context("failed to remove the lockout state");
-            }
-            _ => {}
-        }
-        Ok(followed)
+            .map_err(|_| anyhow::anyhow!("lockout watcher panicked"))
     }
 }
 
 // A daemon killed outright leaves its stream running until the stream next
 // writes to the closed pipe, which may be the next lockout.
-fn stop_orphaned_stream(path: &Path) {
-    if let Ok(Some(Record {
-        watcher: Some(watcher),
-        ..
-    })) = read_record(path)
-        && watcher.is_running()
-    {
+fn stop_orphaned_stream(previous: &Record) {
+    if previous.watcher.is_running() {
         unsafe {
-            libc::kill(watcher.pid, libc::SIGTERM);
+            libc::kill(previous.watcher.pid, libc::SIGTERM);
         }
     }
 }
@@ -298,18 +320,23 @@ fn stop_orphaned_stream(path: &Path) {
 fn follow(
     terminal: TerminalKind,
     path: &Path,
-    mut record: Record,
+    record: &mut Record,
+    previous: Option<&Record>,
     stream: ChildStdout,
     reading: &Mutex<Option<Child>>,
 ) -> Result<()> {
     let current = current_instance(terminal);
-    if let Some(instance) = &current
-        && read_stored(terminal, instance, reading)?
-    {
-        record.engaged.insert(instance.clone());
+    if let Some(instance) = &current {
+        let resumed = previous.and_then(|previous| previous.resume(instance));
+        let engaged = read_stored(terminal, instance, resumed.map(|(_, from)| from), reading)?
+            .or(resumed.map(|(engaged, _)| engaged))
+            .unwrap_or(false);
+        if engaged {
+            record.engaged.insert(instance.clone());
+        }
     }
     record.seed = Seed::Read { terminal: current };
-    write_record(path, &record)?;
+    write_record(path, record)?;
 
     for line in BufReader::new(stream).lines() {
         let Some((pid, engaged)) = parse_event(&line?)? else {
@@ -322,19 +349,22 @@ fn follow(
         } else {
             record.engaged.remove(&instance);
         }
-        write_record(path, &record)?;
+        write_record(path, record)?;
     }
     anyhow::bail!("the lockout log stream ended")
 }
 
-/// Whether `instance` is locked out by its last change in the stored log.
+/// `instance`'s state after its last change in the stored log since `from`,
+/// or since its launch; None when it logged no change there.
 fn read_stored(
     terminal: TerminalKind,
     instance: &Instance,
+    from: Option<chrono::DateTime<chrono::Utc>>,
     reading: &Mutex<Option<Child>>,
-) -> Result<bool> {
-    let started = process::parse_identity(&instance.started)
+) -> Result<Option<bool>> {
+    let launched = process::parse_identity(&instance.started)
         .with_context(|| format!("unreadable start time for pid {}", instance.pid))?;
+    let started = from.map_or(launched, |from| from.naive_utc().max(launched));
     let mut child = Command::new("log")
         .args([
             "show",
@@ -367,12 +397,12 @@ fn read_stored(
     if !status.success() {
         anyhow::bail!("log show failed with status {status}");
     }
-    let mut engaged = false;
+    let mut engaged = None;
     for line in output.lines() {
         if let Some((pid, state)) = parse_event(line)?
             && pid == instance.pid
         {
-            engaged = state;
+            engaged = Some(state);
         }
     }
     Ok(engaged)
@@ -391,10 +421,16 @@ pub fn run(wait: bool) -> ! {
     loop {
         match lockout(terminal) {
             Lockout::Clear => std::process::exit(0),
-            Lockout::Engaged if wait => thread::sleep(WAIT_INTERVAL),
+            Lockout::Engaged | Lockout::Reading if wait => thread::sleep(WAIT_INTERVAL),
             Lockout::Engaged => {
                 eprintln!("{terminal} is locked out by Screen Time");
                 std::process::exit(1);
+            }
+            Lockout::Reading => {
+                eprintln!(
+                    "cannot tell yet whether {terminal} is locked out: the lockout watcher is still reading its state from the log"
+                );
+                std::process::exit(2);
             }
             Lockout::Unknown(reason) => {
                 eprintln!("cannot tell whether {terminal} is locked out: {reason}");
@@ -418,9 +454,10 @@ mod tests {
     fn record(seed: Seed, engaged: &[Instance]) -> Record {
         Record {
             daemon: instance(10, "Sun Oct 18 11:00:00 2026"),
-            watcher: Some(instance(11, "Sun Oct 18 11:00:00 2026")),
+            watcher: instance(11, "Sun Oct 18 11:00:00 2026"),
             seed,
             engaged: engaged.iter().cloned().collect(),
+            followed_until: None,
         }
     }
 
@@ -474,15 +511,50 @@ mod tests {
     fn a_terminal_older_than_the_watcher_needs_its_stored_state_read() {
         let terminal = instance(627, EARLIER);
         let reading = record(Seed::Reading, &[]);
-        assert!(matches!(
-            reading.lockout(Some(&terminal), |_| true),
-            Lockout::Unknown(_)
-        ));
+        assert_eq!(reading.lockout(Some(&terminal), |_| true), Lockout::Reading);
         let unread = record(Seed::Read { terminal: None }, &[]);
         assert!(matches!(
             unread.lockout(Some(&terminal), |_| true),
             Lockout::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn a_new_watcher_resumes_where_a_stopped_one_left_off() {
+        let until = chrono::Utc::now();
+        let seeded = instance(627, EARLIER);
+        let launched_later = instance(700, LATER);
+        let mut stopped = record(
+            Seed::Read {
+                terminal: Some(seeded.clone()),
+            },
+            std::slice::from_ref(&seeded),
+        );
+        stopped.followed_until = Some(until);
+        assert_eq!(
+            stopped.resume(&seeded),
+            Some((true, until - RESUME_OVERLAP))
+        );
+        assert_eq!(
+            stopped.resume(&launched_later),
+            Some((false, until - RESUME_OVERLAP))
+        );
+        assert_eq!(stopped.resume(&instance(800, EARLIER)), None);
+    }
+
+    #[test]
+    fn a_watcher_that_never_finished_reading_cannot_be_resumed() {
+        let terminal = instance(627, EARLIER);
+        let mut unread = record(Seed::Reading, &[]);
+        unread.followed_until = Some(chrono::Utc::now());
+        assert_eq!(unread.resume(&terminal), None);
+        let crashed = record(
+            Seed::Read {
+                terminal: Some(terminal.clone()),
+            },
+            &[],
+        );
+        assert_eq!(crashed.resume(&terminal), None);
     }
 
     #[test]

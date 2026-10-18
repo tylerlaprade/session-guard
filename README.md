@@ -252,9 +252,12 @@ follows the line AppKit logs in the terminal at each change (`LockoutUI changed
 state: engaged` or `disengaged`). It runs one `log stream` for that line while
 it runs and keeps the state in `$TMPDIR/session-guard-lockout.json`, keyed by
 the terminal's PID and start time. A daemon that starts while the terminal is
-already running reads that terminal's state back from the stored log, which can
-take a minute or two, and restores wait until it knows. A pass that cannot know,
-because the watcher is not running, holds as well and says why.
+already running reads that terminal's state back from the stored log. After a
+clean stop it reads only from where the previous daemon stopped following,
+which takes seconds; after a crash, or for a terminal it never saw, it reads
+from the terminal's launch, which can take a minute or two. Restores wait until
+it knows. A pass that cannot know, because the watcher is not running, holds as
+well and says why.
 
 AppKit logs nothing for a terminal that launches unlocked, and logs `engaged`
 about a second and a half after launch for one that launches locked out. A
@@ -265,7 +268,7 @@ Scripts that open terminal tabs can ask the same question:
 
 ```sh
 session-guard lockout         # 0: not locked out, or not running; 1: locked out; 2: unknown
-session-guard lockout --wait  # waits while locked out: 0 once it lifts, 2 if it becomes unknown
+session-guard lockout --wait  # waits while locked out or still being read: 0 once clear, 2 if it becomes unknown
 ```
 
 ### Continuing interrupted work

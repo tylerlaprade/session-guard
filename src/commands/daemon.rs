@@ -545,6 +545,9 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
         let held_reason = match lockout::lockout(kind) {
             Lockout::Clear => None,
             Lockout::Engaged => Some(format!("{kind} is locked out by Screen Time")),
+            Lockout::Reading => Some(format!(
+                "the lockout watcher is still reading {kind}'s state from the log"
+            )),
             Lockout::Unknown(reason) => Some(format!(
                 "cannot tell whether {kind} is locked out: {reason}"
             )),

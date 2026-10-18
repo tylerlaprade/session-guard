@@ -9,13 +9,18 @@ use std::time::{Duration, Instant};
 
 const SESSION: &str = "5f0c2b48-865f-4829-af1b-7a248d2c2bee";
 
-// Stands in for `log`: the stream reports the terminal locked out at once and
-// lifts the lockout when the test creates `lift`.
+// Stands in for `log`. The stored log holds no change and takes a moment to
+// read. The first stream reports the terminal locked out, so a later daemon
+// knows it only from the record the first one left; any stream lifts the
+// lockout when the test creates `lift`.
 const LOG: &str = r#"#!/bin/sh
-[ "$1" = show ] && { echo '{"count":0,"finished":1}'; exit 0; }
+[ "$1" = show ] && { sleep 1; echo '{"count":0,"finished":1}'; exit 0; }
 echo $$ > "$HOME/stream.pid"
 echo 'Filtering the log data using "stand-in"'
-echo "{\"processID\":$TERMINAL_PID,\"eventMessage\":\"LockoutUI changed state: engaged\"}"
+if [ ! -e "$HOME/reported" ]; then
+    : > "$HOME/reported"
+    echo "{\"processID\":$TERMINAL_PID,\"eventMessage\":\"LockoutUI changed state: engaged\"}"
+fi
 while [ ! -e "$HOME/lift" ]; do sleep 0.1; done
 echo "{\"processID\":$TERMINAL_PID,\"eventMessage\":\"LockoutUI changed state: disengaged\"}"
 exec sleep 600
@@ -192,7 +197,11 @@ impl Fixture {
                 .daemon_log()
                 .contains("lockout watcher did not stop cleanly")
         );
-        assert!(!self.state_file().exists());
+        let state: Value = serde_json::from_slice(&fs::read(self.state_file()).unwrap()).unwrap();
+        assert!(state["followed_until"].is_string(), "{state}");
+        let unknown = self.lockout();
+        assert_eq!(unknown.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&unknown.stderr).contains("watcher is not running"));
     }
 
     fn state_file(&self) -> PathBuf {
@@ -208,6 +217,8 @@ fn alive(pid: i32) -> bool {
 fn a_locked_out_terminal_gets_no_tab_until_the_lockout_lifts() {
     let mut fixture = Fixture::new();
     fixture.start_daemon();
+    fixture.wait_for("the watcher to start", || fixture.state_file().exists());
+    let mut waiter = fixture.command(&["lockout", "--wait"]).spawn().unwrap();
 
     fixture.wait_for("the startup pass to hold", || {
         fixture.daemon_log().contains("Held 1 sessions")
@@ -223,9 +234,16 @@ fn a_locked_out_terminal_gets_no_tab_until_the_lockout_lifts() {
     assert_eq!(fixture.record()["restore_pending"], true);
     assert!(!fixture.daemon_log().contains("Restored"));
 
+    assert!(
+        waiter.try_wait().unwrap().is_none(),
+        "--wait returned while the state was being read or locked out"
+    );
+
     // A daemon restarted during the lockout, on the same boot, still holds
-    // the session rather than dropping it as an old recoverable record.
+    // the session rather than dropping it as an old recoverable record, and
+    // knows the lockout from where the previous daemon left off.
     fixture.stop_daemon();
+    assert_eq!(waiter.wait().unwrap().code(), Some(2));
     assert_eq!(fixture.record()["held_for_lockout"], true);
     fixture.start_daemon();
     fixture.wait_for("the restarted daemon to hold", || {
@@ -236,7 +254,7 @@ fn a_locked_out_terminal_gets_no_tab_until_the_lockout_lifts() {
     });
     assert!(!fixture.root().join("launcher.pid").exists());
 
-    let mut waiter = fixture.command(&["lockout", "--wait"]).spawn().unwrap();
+    waiter = fixture.command(&["lockout", "--wait"]).spawn().unwrap();
     thread::sleep(Duration::from_millis(700));
     assert!(
         waiter.try_wait().unwrap().is_none(),
@@ -257,11 +275,4 @@ fn a_locked_out_terminal_gets_no_tab_until_the_lockout_lifts() {
     assert_eq!(fixture.record()["held_for_lockout"], false);
 
     fixture.stop_daemon();
-
-    let unknown = fixture.lockout();
-    assert_eq!(unknown.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&unknown.stderr)
-            .contains("cannot tell whether alacritty is locked out")
-    );
 }
