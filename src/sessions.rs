@@ -27,6 +27,11 @@ fn now() -> DateTime<Utc> {
     Utc::now()
 }
 
+// A restored session's launcher runs the build that launched it, for as long
+// as the session lives, and rewrites the whole store when the session ends, so
+// every stored record carries the fields that build does not know.
+pub type UnknownFields = serde_json::Map<String, serde_json::Value>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -78,6 +83,8 @@ pub struct SessionRecord {
     // reopen in the order they had.
     #[serde(default)]
     pub tab_position: Option<(u32, u32)>,
+    #[serde(flatten)]
+    pub unknown_fields: UnknownFields,
 }
 
 impl SessionRecord {
@@ -119,6 +126,7 @@ impl SessionRecord {
             background_tasks: None,
             command: None,
             tab_position: None,
+            unknown_fields: UnknownFields::new(),
         }
     }
 
@@ -151,6 +159,7 @@ impl SessionRecord {
             background_tasks: None,
             command: None,
             tab_position: None,
+            unknown_fields: UnknownFields::new(),
         }
     }
 
@@ -359,6 +368,40 @@ pub fn deregister(path: &Path, session_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fields_from_a_newer_build_survive_an_older_build_rewriting_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active-sessions.json");
+        fs::write(
+            &path,
+            serde_json::json!([{
+                "session_id": "abc", "tool": "claude", "directory": "/tmp",
+                "session_name": null, "registered_at": "2020-01-01T00:00:00Z",
+                "future_field": {"kept": true},
+                "activity": {"state": "idle", "turn_id": "", "owner_pid": 1,
+                    "owner_started_at": "", "pending_tools": [], "needs_attention": false,
+                    "future_activity_field": 1},
+                "background_tasks": [{"id": "b1", "type": "shell", "description": "d",
+                    "future_task_field": "x"}]
+            }])
+            .to_string(),
+        )
+        .unwrap();
+
+        with_sessions_mut(&path, |sessions| {
+            sessions[0].mark_recoverable();
+            Ok(())
+        })
+        .unwrap();
+
+        let stored: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored[0]["state"], "recoverable");
+        assert_eq!(stored[0]["future_field"], serde_json::json!({"kept": true}));
+        assert_eq!(stored[0]["activity"]["future_activity_field"], 1);
+        assert_eq!(stored[0]["background_tasks"][0]["future_task_field"], "x");
+    }
 
     #[test]
     fn confirmed_interruptions_do_not_expire_or_depend_on_activity_time() {

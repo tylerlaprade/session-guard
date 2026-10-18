@@ -216,6 +216,12 @@ starting the restored process. A failed launch can be retried, but does not
 reuse the same continuation decision. New activity requires new native status
 or lifecycle evidence.
 
+A restored session's launcher runs the session-guard build that launched it
+until the session ends, then rewrites the session store. Every stored record
+therefore keeps the fields that build does not know, so an older launcher
+cannot erase what a newer build recorded, such as another session's background
+tasks.
+
 The daemon updates the hooks already installed each time it starts, so
 reinstalling the binary and restarting the daemon brings them up to date;
 `session-guard install-hooks` does the same by hand. Already-running tools may

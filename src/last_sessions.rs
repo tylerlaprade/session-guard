@@ -16,6 +16,8 @@ pub struct LastSessionRecord {
     pub shell_pid_started_at: String,
     pub directory: PathBuf,
     pub ended_at: DateTime<Utc>,
+    #[serde(flatten)]
+    pub unknown_fields: crate::sessions::UnknownFields,
 }
 
 impl LastSessionRecord {
@@ -27,6 +29,7 @@ impl LastSessionRecord {
             shell_pid_started_at: session.shell_pid_started_at.clone()?,
             directory: session.directory.clone(),
             ended_at: Utc::now(),
+            unknown_fields: crate::sessions::UnknownFields::new(),
         })
     }
 }

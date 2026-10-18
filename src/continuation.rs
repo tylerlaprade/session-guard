@@ -1,4 +1,4 @@
-use crate::sessions::{SessionRecord, SessionState};
+use crate::sessions::{SessionRecord, SessionState, UnknownFields};
 use crate::{paths, process, sessions};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ pub struct Activity {
     pub owner_started_at: String,
     pub pending_tools: BTreeSet<String>,
     pub needs_attention: bool,
+    #[serde(flatten)]
+    pub unknown_fields: UnknownFields,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +35,8 @@ pub struct BackgroundTask {
     pub kind: String,
     #[serde(default)]
     pub description: String,
+    #[serde(flatten)]
+    pub unknown_fields: UnknownFields,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +114,7 @@ fn apply_event(record: &mut SessionRecord, event: &Event) {
                 owner_started_at: record.pid_started_at.clone().unwrap_or_default(),
                 pending_tools: BTreeSet::new(),
                 needs_attention: false,
+                unknown_fields: UnknownFields::new(),
             });
         return;
     }
@@ -258,6 +263,7 @@ fn claude_native_activity(record: &SessionRecord, native: &serde_json::Value) ->
         owner_started_at: record.pid_started_at.clone()?,
         pending_tools: BTreeSet::new(),
         needs_attention: false,
+        unknown_fields: UnknownFields::new(),
     })
 }
 
@@ -411,6 +417,7 @@ mod tests {
             owner_started_at: record.pid_started_at.clone().unwrap(),
             pending_tools: BTreeSet::new(),
             needs_attention: false,
+            unknown_fields: UnknownFields::new(),
         });
         assert!(should_continue(&record));
         record.restore_pending = false;
@@ -445,11 +452,13 @@ mod tests {
                 id: "b5hzqrsid".into(),
                 kind: "shell".into(),
                 description: "QA deploy".into(),
+                unknown_fields: UnknownFields::new(),
             },
             BackgroundTask {
                 id: "a4505039".into(),
                 kind: "subagent".into(),
                 description: String::new(),
+                unknown_fields: UnknownFields::new(),
             },
         ]);
         assert_eq!(
@@ -487,6 +496,7 @@ mod tests {
             owner_started_at: record.pid_started_at.clone().unwrap(),
             pending_tools: BTreeSet::new(),
             needs_attention: false,
+            unknown_fields: UnknownFields::new(),
         });
         assert_eq!(restore_prompt(&record).as_deref(), Some("continue"));
         record.activity = None;
@@ -552,6 +562,7 @@ mod tests {
             owner_started_at: record.pid_started_at.clone().unwrap(),
             pending_tools: BTreeSet::new(),
             needs_attention: false,
+            unknown_fields: UnknownFields::new(),
         });
         let prefix = format!(
             "{}\n{}\n",
