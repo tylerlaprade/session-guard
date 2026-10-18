@@ -79,17 +79,21 @@ the start folder decides which project instructions the session loads. A
 session without a readable transcript reopens in the last folder its hooks
 reported.
 
-OpenCode has no shell-command hooks; session-guard installs a JS plugin at
-`~/.config/opencode/plugin/session-guard.js` that OpenCode loads into its
-process. The plugin registers on `session.created`/`session.updated`, uses
-`session.idle` as the per-turn heartbeat, and deregisters through `dispose`
-on graceful shutdown (via hook stdin, so the teardown gate applies). It
-registers only interactive TUI sessions — headless modes (`opencode run`,
-`serve`, `web`, `acp`) carry a subcommand in argv, which is the only mode
-marker OpenCode exposes — and skips subagent child sessions (`parentID`).
-Restores run `opencode --session <id>`; session ids are stable across
-resume. OpenCode keeps sessions in sqlite, so the transcript fallback does
-not cover it.
+OpenCode has no shell-command hooks. OpenCode 2 runs sessions on a shared
+background server, which cannot tell which tab shows a session, so
+session-guard installs a TUI plugin at
+`~/.config/opencode/plugins/session-guard/tui.js`; it runs in the tab's own
+`opencode` process. The plugin registers the root sessions that TUI shows, its
+open session tabs and the current route, against the TUI's process ID,
+refreshes a record on `session.idle` like the other tools' Stop heartbeat, and
+deregisters a session the TUI stops showing and, in its cleanup when the TUI
+exits, every session it holds (via hook stdin, so the teardown gate applies).
+Headless modes such as `opencode run` and `serve` start no TUI, so they never
+register. An install removes the OpenCode 1 plugin that earlier releases put
+at `~/.config/opencode/plugin/session-guard.js`, which OpenCode 2 rejects.
+Restores run `opencode --session <id>`; session ids are stable across resume.
+OpenCode keeps sessions in sqlite, so the transcript fallback does not cover
+it.
 
 The Codex desktop app, its scheduled automations, `codex exec`, and subagents
 run through the same codex core and fire the same hooks, but their threads

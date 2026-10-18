@@ -1,66 +1,89 @@
 // Installed by `session-guard install`; removed by `session-guard uninstall`.
 // Do not edit: session-guard rewrites this file when its contents change.
-import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import process from "node:process";
+import { createEffect, createRoot } from "solid-js";
 
-const REGISTER_THROTTLE_MS = 30_000;
 const SESSION_GUARD = "@SESSION_GUARD@";
 
-// Only interactive TUI sessions live in a terminal tab. Headless modes put a
-// subcommand in argv[2] (run, serve, web, acp, session, db, ...); the TUI is
-// invoked bare, with flags, or with a project path. OpenCode publishes no
-// official mode marker, so argv is the only signal.
-function isInteractiveTui() {
-  const [, , subcommand] = process.argv;
-  return !subcommand || subcommand.startsWith("-") || existsSync(subcommand);
+function sessionGuard(args, input) {
+  return new Promise((resolve) => {
+    const child = spawn(SESSION_GUARD, args, {
+      stdio: [input === undefined ? "ignore" : "pipe", "ignore", "ignore"],
+    });
+    child.on("error", resolve);
+    child.on("close", resolve);
+    child.stdin?.end(input);
+  });
 }
 
-export function SessionGuard({ $, directory }) {
-  if (!(isInteractiveTui() && $)) {
-    return {};
+// The TUI runs in the tab while sessions live on a shared background server,
+// so this tab holds exactly the root sessions its tabs and route show.
+function shownSessions(data, ui) {
+  const shown = new Set(
+    ui.tabs.enabled() ? ui.tabs.list().map((tab) => tab.sessionID) : [],
+  );
+  const route = ui.router.current();
+  if (route.type === "session") {
+    shown.add(data.session.root(route.sessionID));
   }
-
-  const lastRegistered = new Map();
-
-  const register = async (sessionId, dir) => {
-    const now = Date.now();
-    if (now - (lastRegistered.get(sessionId) ?? 0) < REGISTER_THROTTLE_MS) {
-      return;
-    }
-    lastRegistered.set(sessionId, now);
-    await $`${SESSION_GUARD} register --tool opencode --session-id ${sessionId} --pid ${process.pid} --directory ${dir}`
-      .quiet()
-      .nothrow();
-  };
-
-  // The stdin (hook) form, not --session-id: the hook path keeps the record
-  // when the tab's shell is already gone (GUI teardown), matching the other
-  // tools' SessionEnd behavior.
-  const deregister = async (sessionId) => {
-    const payload = JSON.stringify({ sessionId });
-    await $`echo ${payload} | ${SESSION_GUARD} deregister`.quiet().nothrow();
-  };
-
-  return {
-    event: async ({ event }) => {
-      const { type, properties } = event;
-      if (type === "session.created" || type === "session.updated") {
-        const { info } = properties;
-        if (info.parentID) {
-          return; // subagent child, never a tab
-        }
-        await register(info.id, info.directory || directory);
-      } else if (type === "session.idle") {
-        // Turn finished: force a fresh heartbeat like the other tools' Stop.
-        lastRegistered.delete(properties.sessionID);
-        await register(properties.sessionID, directory);
-      } else if (type === "session.deleted") {
-        lastRegistered.delete(properties.info.id);
-        await deregister(properties.info.id);
-      }
-    },
-    dispose: async () => {
-      await Promise.all([...lastRegistered.keys()].map(deregister));
-    },
-  };
+  return shown;
 }
+
+export default {
+  id: "session-guard",
+  setup(context) {
+    const { data, ui } = context;
+    const registered = new Set();
+
+    const register = (sessionId) =>
+      sessionGuard([
+        "register",
+        "--tool",
+        "opencode",
+        "--session-id",
+        sessionId,
+        "--pid",
+        String(process.pid),
+        "--directory",
+        data.session.get(sessionId)?.location.directory ?? process.cwd(),
+      ]);
+
+    // The stdin (hook) form, not --session-id: the daemon then judges the
+    // end by what the terminal does next, as with the other tools' SessionEnd.
+    const deregister = (sessionId) =>
+      sessionGuard(["deregister"], JSON.stringify({ sessionId }));
+
+    const stopWatching = createRoot((dispose) => {
+      createEffect(() => {
+        const shown = shownSessions(data, ui);
+        for (const sessionId of shown) {
+          if (!registered.has(sessionId)) {
+            registered.add(sessionId);
+            register(sessionId);
+          }
+        }
+        for (const sessionId of registered) {
+          if (!shown.has(sessionId)) {
+            registered.delete(sessionId);
+            deregister(sessionId);
+          }
+        }
+      });
+      return dispose;
+    });
+
+    // A finished turn refreshes the record, like the other tools' Stop hook.
+    const stopRefreshing = data.on("session.idle", (event) => {
+      if (registered.has(event.data.sessionID)) {
+        register(event.data.sessionID);
+      }
+    });
+
+    return async () => {
+      stopRefreshing();
+      stopWatching();
+      await Promise.all([...registered].map(deregister));
+    };
+  },
+};

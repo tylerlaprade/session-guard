@@ -132,8 +132,15 @@ fn install_with(tool: Tool, path: &Path, binary: &Binary) -> Result<HookChange> 
             deregister,
             binary,
         ),
-        Integration::PluginFile { name, source, .. } => {
-            install_plugin_file(path, name, &binary.plugin(source))
+        Integration::PluginFile {
+            name,
+            source,
+            retired,
+            ..
+        } => {
+            let mut change = install_plugin_file(path, name, &binary.plugin(source))?;
+            change.changed |= remove_files(path, retired)?.changed;
+            Ok(change)
         }
         Integration::ProcessScan => Ok(HookChange { changed: false }),
     }
@@ -151,7 +158,17 @@ pub fn installed(tool: Tool) -> Result<bool> {
             manifest_name,
             ..
         } => json_file_has_own_hook(&path.resolve()?.join(manifest_name))?,
-        Integration::PluginFile { path, name, .. } => path.resolve()?.join(name).is_file(),
+        Integration::PluginFile {
+            path,
+            name,
+            retired,
+            ..
+        } => {
+            let dir = path.resolve()?;
+            std::iter::once(name)
+                .chain(retired.iter())
+                .any(|file| dir.join(file).is_file())
+        }
         Integration::ProcessScan => false,
     })
 }
@@ -174,7 +191,17 @@ pub fn remove(tool: Tool) -> Result<HookChange> {
             manifest_name,
             ..
         } => remove_files(&path.resolve()?, &[manifest_name, script_name]),
-        Integration::PluginFile { path, name, .. } => remove_files(&path.resolve()?, &[name]),
+        Integration::PluginFile {
+            path,
+            name,
+            retired,
+            ..
+        } => remove_files(
+            &path.resolve()?,
+            &std::iter::once(*name)
+                .chain(retired.iter().copied())
+                .collect::<Vec<_>>(),
+        ),
         Integration::ProcessScan => Ok(HookChange { changed: false }),
     }
 }
@@ -207,7 +234,12 @@ fn remove_at(tool: Tool, path: &Path) -> Result<HookChange> {
             manifest_name,
             ..
         } => remove_files(path, &[manifest_name, script_name]),
-        Integration::PluginFile { name, .. } => remove_files(path, &[name]),
+        Integration::PluginFile { name, retired, .. } => remove_files(
+            path,
+            &std::iter::once(*name)
+                .chain(retired.iter().copied())
+                .collect::<Vec<_>>(),
+        ),
         Integration::ProcessScan => Ok(HookChange { changed: false }),
     }
 }
@@ -1038,13 +1070,17 @@ command = '{OLD_CODEX_REGISTER_ENV}'
     #[test]
     fn opencode_plugin_install_is_idempotent_and_removable() {
         let dir = tempfile::tempdir().unwrap();
-        let plugin_dir = dir.path().join("plugin");
+        let plugin_dir = dir.path().join("plugins/session-guard");
+        let retired = dir.path().join("plugin/session-guard.js");
+        fs::create_dir_all(retired.parent().unwrap()).unwrap();
+        fs::write(&retired, "export const SessionGuard = async () => ({});\n").unwrap();
 
         assert!(
             install_at(crate::tool("opencode"), &plugin_dir)
                 .unwrap()
                 .changed
         );
+        assert!(!retired.exists(), "the OpenCode 1 plugin stayed installed");
         assert!(
             !install_at(crate::tool("opencode"), &plugin_dir)
                 .unwrap()
@@ -1056,10 +1092,9 @@ command = '{OLD_CODEX_REGISTER_ENV}'
         assert!(
             contents.contains(r#"const SESSION_GUARD = "/Users/tester/.cargo/bin/session-guard";"#)
         );
-        assert!(contents.contains("${SESSION_GUARD} register --tool opencode"));
-        assert!(contents.contains("${SESSION_GUARD} deregister"));
         assert!(!contents.contains(SESSION_GUARD));
-        assert!(contents.contains("export function SessionGuard("));
+        assert!(contents.contains(r#"id: "session-guard""#));
+        assert!(contents.contains("export default {"));
 
         assert!(
             remove_at(crate::tool("opencode"), &plugin_dir)

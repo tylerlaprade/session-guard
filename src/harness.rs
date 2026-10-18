@@ -43,11 +43,10 @@ pub(crate) const GROK_REGISTER_SCRIPT_NAME: &str = "session-guard-register.sh";
 pub(crate) const GROK_HOOKS_FILE_NAME: &str = "session-guard.json";
 pub(crate) const GROK_REGISTER_SCRIPT: &str = include_str!("grok_register.sh");
 pub(crate) const GROK_DEREGISTER: &str = "@SESSION_GUARD@ deregister";
-// OpenCode has no shell-command hooks; its extension point is a JS plugin
-// module loaded into the opencode process (Bun), discovered from
-// `<config>/plugin/*.js`. The plugin registers over the session event bus
-// and shells out to session-guard with Bun's `$`.
-pub(crate) const OPENCODE_PLUGIN_NAME: &str = "session-guard.js";
+// OpenCode has no shell-command hooks. OpenCode 2 runs sessions on a shared
+// background server, so session-guard installs a TUI plugin, which runs in the
+// tab's own `opencode` process, discovered as `<config>/plugins/<id>/tui.js`.
+pub(crate) const OPENCODE_PLUGIN_NAME: &str = "tui.js";
 pub(crate) const OPENCODE_PLUGIN: &str = include_str!("../scripts/opencode_plugin.js");
 
 /// A path the harness owns, resolved as `$ENV/suffix` when `env` is set and
@@ -235,6 +234,9 @@ pub enum Integration {
         path: ToolPath,
         name: &'static str,
         source: &'static str,
+        /// Files earlier releases installed, relative to `path`; an install
+        /// removes them so the tool does not load a stale copy.
+        retired: &'static [&'static str],
     },
     /// No hooks: the daemon's process scan records the session.
     ProcessScan,
@@ -445,10 +447,11 @@ pub static HARNESSES: &[Harness] = &[
             path: ToolPath {
                 env: Some("OPENCODE_CONFIG_DIR"),
                 default: &[".config", "opencode"],
-                suffix: &["plugin"],
+                suffix: &["plugins", "session-guard"],
             },
             name: OPENCODE_PLUGIN_NAME,
             source: OPENCODE_PLUGIN,
+            retired: &["../../plugin/session-guard.js"],
         },
         session_id_env: None,
         thread_server: None,
