@@ -152,7 +152,7 @@ else:
                 assert_eq!(record["restore_pending"], false);
                 assert_ne!(record["pid"], 2_147_483_647);
                 assert_ne!(record["shell_pid"], 2_147_483_646);
-                assert!(!record["pid_started_at"].as_str().unwrap().is_empty());
+                assert_ne!(record["pid_started_at"].as_str().unwrap(), "");
                 assert_eq!(record["dead_at"], Value::Null);
                 let duplicate = Command::new(env!("CARGO_BIN_EXE_session-guard"))
                     .args(["launch", "--session-id", session])
@@ -233,7 +233,7 @@ fn reboot_prunes_sessions_that_never_started_a_conversation() {
     );
     assert!(log.contains("Restored 0 sessions"));
     assert!(log.contains("Pruned 1 that never started a conversation."));
-    assert!(records.as_array().unwrap().is_empty());
+    assert_eq!(records, json!([]));
     let (log, _) = run_startup("previous-boot", "claude", false, true, Transcript::Written);
     assert!(log.contains("Restored 1 sessions"));
 }

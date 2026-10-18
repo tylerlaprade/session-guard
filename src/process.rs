@@ -529,7 +529,7 @@ mod tests {
         let name = executable.file_name().unwrap().to_str().unwrap();
         let kernel_name: String = name.chars().take(2 * libc::MAXCOMLEN).collect();
         assert!(pids_named(&kernel_name).contains(&own));
-        assert!(pids_named("no-such-process-xyz").is_empty());
+        assert_eq!(pids_named("no-such-process-xyz"), Vec::<i32>::new());
     }
 
     #[test]

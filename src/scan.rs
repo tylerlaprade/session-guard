@@ -367,15 +367,21 @@ mod tests {
     #[test]
     fn an_editor_not_launched_by_the_user_at_a_shell_is_ignored() {
         let untracked = std::collections::HashSet::new();
-        assert!(discover_editors(&editor_under("git commit"), &untracked).is_empty());
-        assert!(discover_editors(&editor_under("/opt/homebrew/bin/nvim"), &untracked).is_empty());
+        assert_eq!(
+            discover_editors(&editor_under("git commit"), &untracked),
+            Vec::<SessionRecord>::new()
+        );
+        assert_eq!(
+            discover_editors(&editor_under("/opt/homebrew/bin/nvim"), &untracked),
+            Vec::<SessionRecord>::new()
+        );
         for tracked in [900_000, 900_001, std::process::id() as i32] {
-            assert!(
+            assert_eq!(
                 discover_editors(
                     &editor_under("-zsh"),
                     &std::collections::HashSet::from([tracked])
-                )
-                .is_empty()
+                ),
+                Vec::<SessionRecord>::new()
             );
         }
     }

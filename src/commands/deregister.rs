@@ -97,7 +97,10 @@ mod tests {
 
         remember_and_deregister(&sessions_path, &last_sessions_path, &session).unwrap();
 
-        assert!(sessions::read_sessions(&sessions_path).unwrap().is_empty());
+        assert_eq!(
+            sessions::read_sessions(&sessions_path).unwrap(),
+            Vec::<SessionRecord>::new()
+        );
         assert_eq!(
             last_sessions::find(
                 &last_sessions_path,
@@ -182,6 +185,9 @@ mod tests {
 
         end_from_hook(&sessions_path, &last_sessions_path, &record).unwrap();
 
-        assert!(sessions::read_sessions(&sessions_path).unwrap().is_empty());
+        assert_eq!(
+            sessions::read_sessions(&sessions_path).unwrap(),
+            Vec::<SessionRecord>::new()
+        );
     }
 }
