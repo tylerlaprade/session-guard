@@ -48,7 +48,7 @@ pub(crate) const GROK_DEREGISTER: &str = "@SESSION_GUARD@ deregister";
 // `<config>/plugin/*.js`. The plugin registers over the session event bus
 // and shells out to session-guard with Bun's `$`.
 pub(crate) const OPENCODE_PLUGIN_NAME: &str = "session-guard.js";
-pub(crate) const OPENCODE_PLUGIN: &str = include_str!("opencode_plugin.js");
+pub(crate) const OPENCODE_PLUGIN: &str = include_str!("../scripts/opencode_plugin.js");
 
 /// A path the harness owns, resolved as `$ENV/suffix` when `env` is set and
 /// non-empty, else `$HOME/default/suffix`.

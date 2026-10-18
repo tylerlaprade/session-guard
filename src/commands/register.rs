@@ -222,7 +222,7 @@ fn run_with_input(
             tool,
             session_id,
             pid,
-            shell_pid,
+            shell_pid.or_else(|| pid.and_then(owning_shell)),
             directory,
             transcript_path,
             name,
@@ -275,7 +275,7 @@ fn served_record(
     else {
         return Ok(None);
     };
-    set_owner(&mut record, client, client_shell(client));
+    set_owner(&mut record, client, owning_shell(client));
     Ok(Some(record))
 }
 
@@ -287,10 +287,12 @@ fn set_owner(record: &mut SessionRecord, pid: i32, shell_pid: Option<i32>) {
         shell_pid.and_then(|pid| process::process_start_identity(pid).ok());
 }
 
-fn client_shell(client: i32) -> Option<i32> {
-    process::process_environment_variable(client, crate::commands::launch::SHELL_PID_ENV)
+/// The shell holding a tool's tab: the restore launcher that started it, named
+/// in the tool's starting environment, or else its parent.
+fn owning_shell(tool_pid: i32) -> Option<i32> {
+    process::process_environment_variable(tool_pid, crate::commands::launch::SHELL_PID_ENV)
         .and_then(|pid| pid.parse().ok())
-        .or_else(|| process::parent_pid(client))
+        .or_else(|| process::parent_pid(tool_pid))
 }
 
 pub(crate) fn is_internal_directory(directory: &Path, tool_home: &Path) -> bool {

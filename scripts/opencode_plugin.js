@@ -1,6 +1,7 @@
 // Installed by `session-guard install`; removed by `session-guard uninstall`.
 // Do not edit: session-guard rewrites this file when its contents change.
 import { existsSync } from "node:fs";
+import process from "node:process";
 
 const REGISTER_THROTTLE_MS = 30_000;
 const SESSION_GUARD = "@SESSION_GUARD@";
@@ -10,25 +11,24 @@ const SESSION_GUARD = "@SESSION_GUARD@";
 // invoked bare, with flags, or with a project path. OpenCode publishes no
 // official mode marker, so argv is the only signal.
 function isInteractiveTui() {
-  const sub = process.argv[2];
-  return !sub || sub.startsWith("-") || existsSync(sub);
+  const [, , subcommand] = process.argv;
+  return !subcommand || subcommand.startsWith("-") || existsSync(subcommand);
 }
 
-export const SessionGuard = async ({ $, directory }) => {
-  if (!isInteractiveTui() || !$) {
+export function SessionGuard({ $, directory }) {
+  if (!(isInteractiveTui() && $)) {
     return {};
   }
 
-  const shellPid = process.env.SESSION_GUARD_SHELL_PID || process.ppid;
   const lastRegistered = new Map();
 
-  const register = async (sessionID, dir) => {
+  const register = async (sessionId, dir) => {
     const now = Date.now();
-    if (now - (lastRegistered.get(sessionID) ?? 0) < REGISTER_THROTTLE_MS) {
+    if (now - (lastRegistered.get(sessionId) ?? 0) < REGISTER_THROTTLE_MS) {
       return;
     }
-    lastRegistered.set(sessionID, now);
-    await $`${SESSION_GUARD} register --tool opencode --session-id ${sessionID} --pid ${process.pid} --shell-pid ${shellPid} --directory ${dir}`
+    lastRegistered.set(sessionId, now);
+    await $`${SESSION_GUARD} register --tool opencode --session-id ${sessionId} --pid ${process.pid} --directory ${dir}`
       .quiet()
       .nothrow();
   };
@@ -36,8 +36,8 @@ export const SessionGuard = async ({ $, directory }) => {
   // The stdin (hook) form, not --session-id: the hook path keeps the record
   // when the tab's shell is already gone (GUI teardown), matching the other
   // tools' SessionEnd behavior.
-  const deregister = async (sessionID) => {
-    const payload = JSON.stringify({ session_id: sessionID });
+  const deregister = async (sessionId) => {
+    const payload = JSON.stringify({ sessionId });
     await $`echo ${payload} | ${SESSION_GUARD} deregister`.quiet().nothrow();
   };
 
@@ -45,7 +45,7 @@ export const SessionGuard = async ({ $, directory }) => {
     event: async ({ event }) => {
       const { type, properties } = event;
       if (type === "session.created" || type === "session.updated") {
-        const info = properties.info;
+        const { info } = properties;
         if (info.parentID) {
           return; // subagent child, never a tab
         }
@@ -63,4 +63,4 @@ export const SessionGuard = async ({ $, directory }) => {
       await Promise.all([...lastRegistered.keys()].map(deregister));
     },
   };
-};
+}

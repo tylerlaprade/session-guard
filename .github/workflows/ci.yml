@@ -10,13 +10,14 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - run: npm ci --ignore-scripts
-      - run: brew install shellcheck
+      - run: brew install shellcheck biome
       - run: curl -fsSL -o "$HOME/.shellcheckrc" https://raw.githubusercontent.com/tylerlaprade/dotfiles/master/.shellcheckrc
-      - run: npm run lint
+      - run: shellcheck src/grok_register.sh
+      # biome.jsonc extends ../../.config/biome, which is ~/.config/biome for a checkout at ~/Code/<repo>.
+      - run: |
+          mkdir -p "$GITHUB_WORKSPACE/../../.config/biome"
+          curl -fsSL -o "$GITHUB_WORKSPACE/../../.config/biome/biome.jsonc" https://raw.githubusercontent.com/tylerlaprade/dotfiles/master/.config/biome/biome.jsonc
+      - run: biome check --error-on-warnings
       - run: brew install --cask ghostty iterm2
       - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Ghostty.app /Applications/iTerm.app
       - name: Compile AppleScript

@@ -1059,7 +1059,7 @@ command = '{OLD_CODEX_REGISTER_ENV}'
         assert!(contents.contains("${SESSION_GUARD} register --tool opencode"));
         assert!(contents.contains("${SESSION_GUARD} deregister"));
         assert!(!contents.contains(SESSION_GUARD));
-        assert!(contents.contains("export const SessionGuard"));
+        assert!(contents.contains("export function SessionGuard("));
 
         assert!(
             remove_at(crate::tool("opencode"), &plugin_dir)
