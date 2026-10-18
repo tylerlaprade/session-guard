@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 
+pub(crate) const SHELL_PID_ENV: &str = "SESSION_GUARD_SHELL_PID";
+
 struct LaunchRequest {
     record: SessionRecord,
     prompt: Option<String>,
@@ -36,6 +38,8 @@ fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchReques
     session.shell_pid = Some(owner);
     session.pid_started_at = Some(started.to_string());
     session.shell_pid_started_at = Some(started.to_string());
+    session.server_pid = None;
+    session.server_pid_started_at = None;
     session.mark_active();
     session.source = Some("restore-launch".to_string());
     session.activity = None;
@@ -66,7 +70,7 @@ fn run_claimed(request: &LaunchRequest) -> Result<()> {
     let result = Command::new(shell)
         .args(["-ic", &command])
         .current_dir(&record.directory)
-        .env("SESSION_GUARD_SHELL_PID", owner.to_string())
+        .env(SHELL_PID_ENV, owner.to_string())
         .status();
     finish(
         record,

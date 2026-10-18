@@ -93,11 +93,51 @@ The Codex desktop app, its scheduled automations, `codex exec`, and subagents
 run through the same codex core and fire the same hooks, but their threads
 live outside any terminal tab. Registration therefore reads the rollout's
 `session_meta` for the session's own id and records only threads a terminal
-owns (`source == "cli"`); the transcript fallback applies the same rule. A
-rollout also embeds its parent chain's metas — a subagent file ends with the
-root terminal's `cli` meta — which is why only own-id metas count. Codex asks
-once to trust a new or changed hook at the next interactive launch; until
+opened: `source == "cli"` from a TUI running its threads in-process, or
+`source == "vscode"` with the `codex-tui` originator from a TUI on the shared
+app-server. The transcript fallback applies the same rule. A rollout also
+embeds its parent chain's metas — a subagent file ends with the root
+terminal's `cli` meta — which is why only own-id metas count. Codex asks once
+to trust a new or changed hook at the next interactive launch; until
 approved, that hook does not run.
+
+Newer Codex TUIs run their threads in a shared app-server daemon, which fires
+the hooks for every tab, so a hook's parent is the daemon rather than the tab's
+`codex`. When the hook's parent is a Codex app-server, registration asks the
+daemon serving `$CODEX_HOME/app-server-control/app-server-control.sock`,
+confirmed by the socket's peer process ID, for the thread's `codex_tui` MCP
+endpoint. Each TUI gives the threads it opens its own task-tools endpoint on a
+loopback port, so the process listening on that port is the tab's `codex`,
+and its shell owns the tab. The thread is then judged by that TUI, exactly like
+an in-process one; the record also keeps the daemon's identity. Session-guard
+connects as the client name Codex exempts from setting the daemon's
+originator and User-Agent.
+
+A served thread joins a tab only through a prompt a user typed into it.
+Codex fires `UserPromptSubmit` only for typed input, before recording that
+input, and session-guard's existing `UserPromptSubmit` hook (`session-guard
+activity`) registers the thread for the daemon that started the
+hook: the parent of the hook's session leader, since Codex starts every hook
+in a new session. The harness is the one whose thread server that is and whose
+configured transcript root holds the thread. Registration completes before
+the turn's first model request, so it does not depend on reaching `Stop`.
+The TUI's background tasks carry its
+endpoint too, but the TUI starts their turns with a tool output, which fires
+no `UserPromptSubmit`, so they stay unrecorded unless someone types into one.
+The daemon must also report a client source for the thread (`cli` or
+`vscode`), which no subagent, `codex exec`, or internal thread has, whatever
+configuration it inherits. Desktop threads have no `codex_tui` endpoint and
+stay unrecorded. Once admitted, a later hook from the same daemon keeps a TUI
+that is still running; `SessionStart`, which begins a new runtime for the
+thread, and a different daemon ask again for the client without needing
+another prompt.
+
+A served TUI thread that nobody has typed into yet is not recorded. Codex
+fires no hook for a thread before its first turn, and the daemon exposes
+nothing that tells a TUI's main thread from a background task the TUI just
+started: both come from the TUI's connection with the same source, originator,
+thread source, endpoint, status, and zero turns. A TUI running its threads
+in-process fires no hook before the first turn either.
 
 A SessionEnd hook says the session id is finished, not why: tools fire it for
 an in-tab end (quit, `/clear`, `/resume` switching away), for a tab closed
@@ -113,7 +153,23 @@ shell means the user ended it. Tabless (scan-tracked) sessions
 retire on SessionEnd directly, since a graceful end is the only cleanup they
 get. A SessionEnd for an already released record leaves it released. Codex's
 shared server can unload an old thread after its terminal has closed; that
-later end must not turn the old record into a new crash victim.
+later end must not turn the old record into a new crash victim. The shared
+server also ends every thread it runs when it shuts down or is replaced, while
+the TUIs holding them reconnect to the next one, and a replaced server can
+still be ending threads after its successor has taken them over. A served
+thread's SessionEnd counts only when it comes from the server its record names,
+found as the parent of the hook's session leader, and that server still
+serves the control socket; any other leaves the record alone. A restored
+thread's record names no server until its first typed prompt, so the
+SessionEnd the server fires as the restored TUI reattaches, closing the
+runtime the dead TUI left loaded, leaves it alone. Codex fires the resumed
+thread's `SessionStart` only with that first prompt, which admits the restored
+TUI.
+
+A TUI on the shared server fires no SessionEnd when it quits: it unsubscribes
+from its thread, and the server keeps the thread without running a hook. Its
+record therefore stays recoverable while the tab's shell lives. Closing the tab
+releases it, but a terminal crash or reboot before then reopens the thread.
 
 The daemon records the operating system's boot identifier in its heartbeat.
 A reboot restores confirmed pending interruptions, including sessions whose
@@ -203,6 +259,9 @@ it, and late events from another turn cannot revive it. No prompt, response,
 tool argument, or notification message text is classified.
 Codex also requires a matching native `task_started` event without a later
 completion, abort, or error event. These are lifecycle attributes, not message text.
+A thread on Codex's shared app-server never gets `continue`: closing its tab
+does not stop the turn, and the daemon resumes the turns it was running when
+it shuts down itself.
 
 Claude's `Stop` hook lists the tasks still running in the background as a
 turn ends: background shells, agents, monitors, and the like. Registration
@@ -232,8 +291,10 @@ The daemon updates the hooks already installed each time it starts, so
 reinstalling the binary and restarting the daemon brings them up to date;
 `session-guard install-hooks` does the same by hand. Already-running tools may
 need a new session to load added hooks. Codex asks to trust new hooks; without
-that trust, conversation restoration still works but automatic continuation
-has no hook evidence and remains disabled.
+that trust, automatic continuation has no hook evidence and remains disabled,
+and a thread on Codex's shared app-server is never recorded, since only its
+`UserPromptSubmit` hook admits it. Conversation restoration for every other
+session still works.
 
 The daemon restores pending sessions when the terminal returns. A relaunch is
 a terminal instance the daemon has never seen, so an existing surviving
@@ -333,7 +394,8 @@ Where a harness needs bespoke parsing — a session id buried in a filename, a
 transcript that must be filtered before it counts — the entry carries a
 function pointer rather than forcing a match arm somewhere upstream. Codex uses
 both: its id is the trailing UUID of the rollout stem, and `accept` rejects
-threads that never held a terminal tab.
+threads that never held a terminal tab. A harness whose threads can run in a
+separate server sets `thread_server`, which names the client holding a thread.
 
 If the harness keeps sessions somewhere the crash scan cannot read, use
 `Discovery::Opaque`; hooks still track it live, only the transcript fallback

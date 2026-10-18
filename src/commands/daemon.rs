@@ -1487,7 +1487,9 @@ mod tests {
     #[test]
     fn a_returned_terminal_restores_previous_tabs_that_die_after_it_returns() {
         let processes = ProcessSnapshot::capture().unwrap();
-        let returned_at = Utc::now().naive_utc() - Duration::minutes(1);
+        let owner = i32::try_from(std::process::id()).unwrap();
+        let old_tab_started = process::process_start_identity(owner).unwrap();
+        let returned_at = process::parse_identity(&old_tab_started).unwrap() + Duration::seconds(1);
         let mut watch = TerminalWatch {
             current: Some(returned_at),
             returned: Some(ReturnedTerminal {
@@ -1496,8 +1498,7 @@ mod tests {
             }),
             ..TerminalWatch::default()
         };
-        let old_tab_started = process::process_start_identity(1).unwrap();
-        let mut victim = ended_session(1, &old_tab_started);
+        let mut victim = ended_session(owner, &old_tab_started);
         assert!(!watch.unattempted_victims(std::slice::from_ref(&victim), &processes));
         victim.shell_pid = Some(i32::MAX);
         let mut opened_by_the_new_instance =

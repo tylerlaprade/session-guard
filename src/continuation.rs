@@ -65,6 +65,9 @@ pub fn record_hook() -> Result<()> {
     if event.agent_type.is_some() || event.agent_id.is_some() {
         return Ok(());
     }
+    if event.hook_event_name == "UserPromptSubmit" {
+        crate::commands::register::admit_prompted(&contents)?;
+    }
     let tree = process::list_processes()?;
     let processes = process::ProcessSnapshot::capture()?;
     sessions::with_sessions_mut(&paths::sessions_file()?, |records| {
@@ -296,8 +299,11 @@ pub fn observe(processes: &process::ProcessSnapshot) -> Result<()> {
     })
 }
 
+// A thread server, not the tab, runs a served thread's turn: closing the tab
+// does not stop it, and Codex's daemon resumes the turns it was running when
+// it shuts down itself.
 pub fn codex_was_working(record: &SessionRecord) -> bool {
-    if !activity_was_working(record) {
+    if record.server_pid.is_some() || !activity_was_working(record) {
         return false;
     }
     let Some(path) = &record.transcript_path else {
@@ -306,7 +312,7 @@ pub fn codex_was_working(record: &SessionRecord) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    let mut own_cli = false;
+    let mut own_terminal = false;
     let mut active_turn = None;
     for line in io::BufReader::new(file).lines() {
         let Ok(line) = line else {
@@ -317,7 +323,7 @@ pub fn codex_was_working(record: &SessionRecord) -> bool {
         };
         let payload = &event["payload"];
         if event["type"] == "session_meta" && payload["id"] == record.session_id {
-            own_cli = payload["source"] == "cli";
+            own_terminal = crate::transcripts::codex_meta_has_terminal_frontend(payload);
         }
         if event["type"] == "event_msg" {
             match payload["type"].as_str() {
@@ -329,7 +335,7 @@ pub fn codex_was_working(record: &SessionRecord) -> bool {
             }
         }
     }
-    own_cli
+    own_terminal
         && active_turn.as_deref()
             == record
                 .activity
@@ -585,6 +591,15 @@ mod tests {
         std::fs::write(&path, format!("{prefix}{{")).unwrap();
         assert!(!should_continue(&record));
         std::fs::write(&path, prefix.replace("\"cli\"", "\"exec\"")).unwrap();
+        assert!(!should_continue(&record));
+
+        let in_process = prefix.replace(
+            "\"source\":\"cli\"",
+            "\"source\":\"vscode\",\"originator\":\"codex-tui\"",
+        );
+        std::fs::write(&path, &in_process).unwrap();
+        assert!(should_continue(&record));
+        record.server_pid = Some(7);
         assert!(!should_continue(&record));
     }
 }

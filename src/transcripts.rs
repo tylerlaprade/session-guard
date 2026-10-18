@@ -41,6 +41,16 @@ fn discovery_root(tool: Tool) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Whether a transcript path lies under the harness's own transcript root. A
+/// tool can name a new transcript before writing it, so only the root is
+/// resolved.
+pub(crate) fn holds_transcript(tool: Tool, transcript: &Path) -> bool {
+    discovery_root(tool).is_ok_and(|root| {
+        transcript.starts_with(&root)
+            || fs::canonicalize(&root).is_ok_and(|root| transcript.starts_with(root))
+    })
+}
+
 /// The transcript for one session, for harnesses that keep sessions in files.
 pub fn transcript_path(tool: Tool, session_id: &str) -> Result<Option<PathBuf>> {
     let Discovery::Jsonl {
@@ -192,15 +202,17 @@ fn discover_jsonl(
 /// terminal tab and restore as junk. The rollout's `session_meta` records the
 /// owning frontend. A rollout also embeds its ANCESTOR chain's metas — a
 /// subagent file ends with the root terminal's "cli" meta — so only metas for
-/// the session's own id count; re-opening the thread appends another own-id
-/// meta, and the latest of those decides. Only `source == "cli"` threads
-/// belong in a tab.
-pub fn codex_rollout_is_cli(path: &Path, session_id: &str) -> bool {
-    let Ok(file) = File::open(path) else {
-        return false;
-    };
+/// the session's own id count, and the latest of those decides. A TUI running
+/// its threads in-process records them as `cli`; one running them in the
+/// shared app-server records `vscode`, as the desktop app does, under the
+/// `codex-tui` originator.
+pub fn codex_rollout_has_terminal_frontend(path: &Path, session_id: &str) -> bool {
+    codex_own_meta(path, session_id).is_some_and(|meta| codex_meta_has_terminal_frontend(&meta))
+}
 
-    let mut source = None;
+fn codex_own_meta(path: &Path, session_id: &str) -> Option<Value> {
+    let file = File::open(path).ok()?;
+    let mut meta = None;
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else {
             break;
@@ -208,20 +220,25 @@ pub fn codex_rollout_is_cli(path: &Path, session_id: &str) -> bool {
         if !line.contains("\"session_meta\"") {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         if value.get("type").and_then(Value::as_str) == Some("session_meta")
             && value.pointer("/payload/id").and_then(Value::as_str) == Some(session_id)
-            && let Some(meta_source) = value.pointer("/payload/source")
         {
-            source = Some(meta_source.clone());
+            meta = Some(value["payload"].take());
         }
     }
+    meta
+}
 
-    // Subagent threads carry an object source ({"subagent": ...}); as_str
-    // rejects those along with "vscode"/"exec"/"mcp".
-    source.is_some_and(|source| source.as_str() == Some("cli"))
+/// Subagent threads carry an object source (`{"subagent": ...}`), which is
+/// never a terminal frontend.
+pub(crate) fn codex_meta_has_terminal_frontend(meta: &Value) -> bool {
+    let source = meta.get("source").and_then(Value::as_str);
+    source == Some("cli")
+        || (source == Some("vscode")
+            && meta.get("originator").and_then(Value::as_str) == Some("codex-tui"))
 }
 
 fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -346,7 +363,7 @@ mod tests {
             r#"{"type":"session_meta","payload":{"id":"a","cwd":"/tmp","source":"vscode"}}"#,
         )
         .unwrap();
-        assert!(!codex_rollout_is_cli(&path, "a"));
+        assert!(!codex_rollout_has_terminal_frontend(&path, "a"));
 
         // Re-opened in a terminal afterwards: the appended own-id cli meta wins.
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -356,7 +373,7 @@ mod tests {
             r#"{{"type":"session_meta","payload":{{"id":"a","cwd":"/tmp","source":"cli"}}}}"#
         )
         .unwrap();
-        assert!(codex_rollout_is_cli(&path, "a"));
+        assert!(codex_rollout_has_terminal_frontend(&path, "a"));
 
         // Picked up by the desktop app afterwards: no longer a tab.
         writeln!(
@@ -364,7 +381,44 @@ mod tests {
             r#"{{"type":"session_meta","payload":{{"id":"a","cwd":"/tmp","source":"vscode"}}}}"#
         )
         .unwrap();
-        assert!(!codex_rollout_is_cli(&path, "a"));
+        assert!(!codex_rollout_has_terminal_frontend(&path, "a"));
+    }
+
+    #[test]
+    fn codex_rollout_from_a_tui_on_the_shared_server_has_a_terminal_frontend() {
+        let dir = tempfile::tempdir().unwrap();
+        let tui = dir.path().join("tui.jsonl");
+        fs::write(
+            &tui,
+            r#"{"type":"session_meta","payload":{"id":"a","cwd":"/tmp","source":"vscode","originator":"codex-tui"}}"#,
+        )
+        .unwrap();
+        assert!(codex_rollout_has_terminal_frontend(&tui, "a"));
+
+        let desktop = dir.path().join("desktop.jsonl");
+        fs::write(
+            &desktop,
+            r#"{"type":"session_meta","payload":{"id":"a","cwd":"/tmp","source":"vscode","originator":"Codex Desktop"}}"#,
+        )
+        .unwrap();
+        assert!(!codex_rollout_has_terminal_frontend(&desktop, "a"));
+    }
+
+    #[test]
+    fn a_transcript_not_yet_written_belongs_to_the_harness_whose_root_holds_it() {
+        let codex = crate::tool("codex");
+        let root = discovery_root(codex).unwrap();
+        assert!(holds_transcript(
+            codex,
+            &root.join("2026/10/02/rollout-not-yet-written.jsonl")
+        ));
+        assert!(!holds_transcript(
+            codex,
+            &discovery_root(crate::tool("claude"))
+                .unwrap()
+                .join("project/session.jsonl")
+        ));
+        assert!(!holds_transcript(codex, Path::new("/tmp/rollout.jsonl")));
     }
 
     #[test]
@@ -384,7 +438,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!codex_rollout_is_cli(&path, "child"));
+        assert!(!codex_rollout_has_terminal_frontend(&path, "child"));
     }
 
     #[test]
@@ -397,13 +451,13 @@ mod tests {
             r#"{"type":"session_meta","payload":{"id":"a","cwd":"/tmp","source":{"subagent":"review"}}}"#,
         )
         .unwrap();
-        assert!(!codex_rollout_is_cli(&subagent, "a"));
+        assert!(!codex_rollout_has_terminal_frontend(&subagent, "a"));
 
         let no_meta = dir.path().join("no-meta.jsonl");
         fs::write(&no_meta, r#"{"type":"turn_context","payload":{}}"#).unwrap();
-        assert!(!codex_rollout_is_cli(&no_meta, "a"));
+        assert!(!codex_rollout_has_terminal_frontend(&no_meta, "a"));
 
-        assert!(!codex_rollout_is_cli(
+        assert!(!codex_rollout_has_terminal_frontend(
             &dir.path().join("missing.jsonl"),
             "a"
         ));

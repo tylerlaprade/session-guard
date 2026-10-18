@@ -48,6 +48,11 @@ pub struct SessionRecord {
     pub pid_started_at: Option<String>,
     #[serde(default)]
     pub shell_pid_started_at: Option<String>,
+    // Codex's shared backend emits hooks for the TUI recorded in pid.
+    #[serde(default)]
+    pub server_pid: Option<i32>,
+    #[serde(default)]
+    pub server_pid_started_at: Option<String>,
     pub directory: PathBuf,
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
@@ -111,6 +116,8 @@ impl SessionRecord {
             pid_started_at: pid.and_then(|pid| process::process_start_identity(pid).ok()),
             shell_pid_started_at: shell_pid
                 .and_then(|pid| process::process_start_identity(pid).ok()),
+            server_pid: None,
+            server_pid_started_at: None,
             directory,
             transcript_path,
             session_name,
@@ -144,6 +151,8 @@ impl SessionRecord {
             shell_pid: None,
             pid_started_at: None,
             shell_pid_started_at: None,
+            server_pid: None,
+            server_pid_started_at: None,
             directory,
             transcript_path: Some(transcript_path),
             session_name: None,

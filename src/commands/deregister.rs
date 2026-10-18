@@ -1,7 +1,8 @@
 use crate::commands::register;
+use crate::harness::ThreadServer;
 use crate::last_sessions::{self, LastSessionRecord};
-use crate::paths;
 use crate::sessions::{self, SessionRecord};
+use crate::{paths, process};
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -27,6 +28,15 @@ pub fn run(session_id: Option<String>) -> Result<()> {
         return Ok(());
     };
     if from_hook {
+        if let Some(server) = &record.tool.spec().thread_server
+            && !ended_by_its_server(
+                &record,
+                server,
+                register::hook_emitter(i32::try_from(std::process::id())?),
+            )
+        {
+            return Ok(());
+        }
         return end_from_hook(&sessions_path, &paths::last_sessions_file()?, &record);
     }
     remember_and_deregister(&sessions_path, &paths::last_sessions_file()?, &record)
@@ -58,6 +68,20 @@ pub(crate) fn end_from_hook(
         }
         Ok(())
     })
+}
+
+// Codex can deliver the old daemon's ends after its successor resumes the live TUIs.
+fn ended_by_its_server(
+    record: &SessionRecord,
+    server: &ThreadServer,
+    emitter: Option<i32>,
+) -> bool {
+    let Some(server_pid) = record.server_pid else {
+        return !emitter.is_some_and(server.is_server);
+    };
+    emitter == Some(server_pid)
+        && process::process_start_identity(server_pid).ok() == record.server_pid_started_at
+        && (server.serving)(record.tool) == Some(server_pid)
 }
 
 fn remember_and_deregister(
@@ -172,6 +196,100 @@ mod tests {
         assert!(!session.restore_pending);
         assert!(!crate::commands::daemon::needs_terminal_restore(
             session, &processes
+        ));
+    }
+
+    fn own_pid() -> i32 {
+        i32::try_from(std::process::id()).unwrap()
+    }
+
+    const SERVING_THIS_PROCESS: ThreadServer = ThreadServer {
+        is_server: crate::codex_server::is_server,
+        serving: |_| Some(i32::try_from(std::process::id()).unwrap()),
+        client: |_| Ok(None),
+    };
+
+    fn served_record_naming_this_process() -> SessionRecord {
+        let mut record = record_with_shell(Some(own_pid()), None);
+        record.server_pid = Some(own_pid());
+        record.server_pid_started_at = crate::process::process_start_identity(own_pid()).ok();
+        record
+    }
+
+    #[test]
+    fn a_served_thread_ends_only_from_the_serving_server_its_record_names() {
+        let record = served_record_naming_this_process();
+        assert!(ended_by_its_server(
+            &record,
+            &SERVING_THIS_PROCESS,
+            Some(own_pid())
+        ));
+
+        let serving_another = ThreadServer {
+            serving: |_| Some(1),
+            ..SERVING_THIS_PROCESS
+        };
+        assert!(!ended_by_its_server(
+            &record,
+            &serving_another,
+            Some(own_pid())
+        ));
+        let serving_none = ThreadServer {
+            serving: |_| None,
+            ..SERVING_THIS_PROCESS
+        };
+        assert!(!ended_by_its_server(
+            &record,
+            &serving_none,
+            Some(own_pid())
+        ));
+
+        let mut stale = record;
+        stale.server_pid_started_at = Some("Wed Jan 1 00:00:00 2020".to_string());
+        assert!(!ended_by_its_server(
+            &stale,
+            &SERVING_THIS_PROCESS,
+            Some(own_pid())
+        ));
+
+        let unserved = record_with_shell(Some(own_pid()), None);
+        assert!(ended_by_its_server(&unserved, &serving_none, None));
+        assert!(ended_by_its_server(
+            &unserved,
+            &SERVING_THIS_PROCESS,
+            Some(own_pid())
+        ));
+    }
+
+    // Resuming a thread shuts down the runtime its dead client left loaded,
+    // which fires SessionEnd before the restored record names any server.
+    #[test]
+    fn a_server_ending_a_thread_its_record_does_not_name_it_for_is_ignored() {
+        let restored = record_with_shell(Some(own_pid()), None);
+        let any_server = ThreadServer {
+            is_server: |_| true,
+            ..SERVING_THIS_PROCESS
+        };
+        assert!(!ended_by_its_server(
+            &restored,
+            &any_server,
+            Some(own_pid())
+        ));
+    }
+
+    #[test]
+    fn a_replaced_server_ending_a_thread_its_successor_took_over_is_ignored() {
+        let refreshed_by_the_successor = served_record_naming_this_process();
+        let replaced = crate::process::parent_pid(own_pid()).unwrap();
+        assert!(!ended_by_its_server(
+            &refreshed_by_the_successor,
+            &SERVING_THIS_PROCESS,
+            Some(replaced)
+        ));
+        assert!(!ended_by_its_server(
+            &refreshed_by_the_successor,
+            &SERVING_THIS_PROCESS,
+            None
         ));
     }
 

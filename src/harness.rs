@@ -260,6 +260,18 @@ pub enum Discovery {
     Opaque,
 }
 
+pub struct ThreadServer {
+    pub is_server: fn(i32) -> bool,
+    pub serving: fn(crate::Tool) -> Option<i32>,
+    pub client: fn(&ServedThread) -> Result<Option<i32>>,
+}
+
+pub struct ServedThread<'a> {
+    pub tool: crate::Tool,
+    pub server: i32,
+    pub session_id: &'a str,
+}
+
 pub struct Harness {
     pub activity_hooks: &'static [HookEvent],
     pub was_working: Option<fn(&crate::sessions::SessionRecord) -> bool>,
@@ -285,6 +297,7 @@ pub struct Harness {
     pub is_unused_spare: Option<fn(&Path, &str) -> bool>,
     /// Environment variable a live session exports carrying its own id.
     pub session_id_env: Option<&'static str>,
+    pub thread_server: Option<ThreadServer>,
     /// Recognizes the harness's own process. Defaults to matching `binary`
     /// against the executable name when the harness needs nothing cleverer.
     pub identifies_process: Option<fn(&ProcInfo) -> bool>,
@@ -322,6 +335,7 @@ pub static HARNESSES: &[Harness] = &[
             deregister: CLAUDE_DEREGISTER,
         },
         session_id_env: Some("CLAUDE_CODE_SESSION_ID"),
+        thread_server: None,
         identifies_process: Some(crate::scan::is_claude_session_process),
         session_id_from_process: Some(crate::scan::claude_session_id_from_process),
         is_unused_spare: Some(crate::scan::claude_is_unused_spare),
@@ -349,7 +363,7 @@ pub static HARNESSES: &[Harness] = &[
                     .and_then(|start| stem.get(start..))
                     .map(ToOwned::to_owned)
             },
-            accept: Some(crate::transcripts::codex_rollout_is_cli),
+            accept: Some(crate::transcripts::codex_rollout_has_terminal_frontend),
         },
         integration: Integration::TomlConfig {
             path: ToolPath {
@@ -362,6 +376,11 @@ pub static HARNESSES: &[Harness] = &[
             deregister: CODEX_DEREGISTER,
         },
         session_id_env: Some("CODEX_THREAD_ID"),
+        thread_server: Some(ThreadServer {
+            is_server: crate::codex_server::is_server,
+            serving: crate::codex_server::serving,
+            client: crate::codex_server::client,
+        }),
         identifies_process: None,
         session_id_from_process: None,
         is_unused_spare: None,
@@ -400,6 +419,7 @@ pub static HARNESSES: &[Harness] = &[
             deregister: GROK_DEREGISTER,
         },
         session_id_env: Some("GROK_SESSION_ID"),
+        thread_server: None,
         identifies_process: None,
         session_id_from_process: None,
         is_unused_spare: None,
@@ -431,6 +451,7 @@ pub static HARNESSES: &[Harness] = &[
             source: OPENCODE_PLUGIN,
         },
         session_id_env: None,
+        thread_server: None,
         identifies_process: None,
         session_id_from_process: None,
         is_unused_spare: None,
@@ -473,6 +494,7 @@ pub static EDITOR: Harness = Harness {
     discovery: Discovery::Opaque,
     integration: Integration::ProcessScan,
     session_id_env: None,
+    thread_server: None,
     identifies_process: Some(crate::scan::is_editor_process),
     session_id_from_process: None,
     is_unused_spare: None,

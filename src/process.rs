@@ -55,6 +55,24 @@ pub fn boot_identifier() -> Option<String> {
 /// `ps` joins arguments with spaces, which cannot be replayed faithfully.
 #[cfg(target_os = "macos")]
 pub fn process_arguments(pid: i32) -> Option<Vec<String>> {
+    parse_process_arguments(&process_arguments_buffer(pid)?)
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_environment_variable(pid: i32, name: &str) -> Option<String> {
+    parse_process_environment_variable(&process_arguments_buffer(pid)?, name)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_environment_variable(pid: i32, name: &str) -> Option<String> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .ok()?
+        .split(|byte| *byte == 0)
+        .find_map(|entry| environment_value(entry, name))
+}
+
+#[cfg(target_os = "macos")]
+fn process_arguments_buffer(pid: i32) -> Option<Vec<u8>> {
     let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut length = 0;
     if unsafe {
@@ -85,7 +103,7 @@ pub fn process_arguments(pid: i32) -> Option<Vec<String>> {
         return None;
     }
     buffer.truncate(length);
-    parse_process_arguments(&buffer)
+    Some(buffer)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -101,6 +119,23 @@ pub fn process_arguments(pid: i32) -> Option<Vec<String>> {
 /// `KERN_PROCARGS2` lays out argc, the executable path, NUL padding, and then
 /// argc NUL-terminated arguments followed by the environment.
 fn parse_process_arguments(buffer: &[u8]) -> Option<Vec<String>> {
+    let (argc, strings) = process_strings(buffer)?;
+    let arguments: Vec<String> = strings
+        .take(argc)
+        .map(|argument| String::from_utf8(argument.to_vec()).ok())
+        .collect::<Option<_>>()?;
+    (arguments.len() == argc).then_some(arguments)
+}
+
+fn parse_process_environment_variable(buffer: &[u8], name: &str) -> Option<String> {
+    let (argc, strings) = process_strings(buffer)?;
+    strings
+        .skip(argc)
+        .take_while(|entry| !entry.is_empty())
+        .find_map(|entry| environment_value(entry, name))
+}
+
+fn process_strings(buffer: &[u8]) -> Option<(usize, impl Iterator<Item = &[u8]>)> {
     let argc = usize::try_from(i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?)).ok()?;
     let rest = buffer.get(4..)?;
     let executable_end = rest.iter().position(|byte| *byte == 0)?;
@@ -109,13 +144,12 @@ fn parse_process_arguments(buffer: &[u8]) -> Option<Vec<String>> {
             .get(executable_end..)?
             .iter()
             .position(|byte| *byte != 0)?;
-    let arguments: Vec<String> = rest
-        .get(arguments_start..)?
-        .split(|byte| *byte == 0)
-        .take(argc)
-        .map(|argument| String::from_utf8(argument.to_vec()).ok())
-        .collect::<Option<_>>()?;
-    (arguments.len() == argc).then_some(arguments)
+    Some((argc, rest.get(arguments_start..)?.split(|byte| *byte == 0)))
+}
+
+fn environment_value(entry: &[u8], name: &str) -> Option<String> {
+    let value = entry.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+    String::from_utf8(value.to_vec()).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -158,9 +192,34 @@ pub fn process_command(pid: i32) -> Result<String> {
 }
 
 pub fn process_start_identity(pid: i32) -> Result<String> {
-    query_process_start_identity(pid, "UTC")
+    if pid <= 0 {
+        anyhow::bail!("invalid process id {pid}");
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())?;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        anyhow::bail!(
+            "kernel could not inspect start time for pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let info = unsafe { info.assume_init() };
+    let timestamp = i64::try_from(info.pbi_start_tvsec)?;
+    let started = chrono::DateTime::from_timestamp(timestamp, 0)
+        .with_context(|| format!("invalid kernel start time for pid {pid}"))?;
+    Ok(started.format("%a %b %-d %H:%M:%S %Y").to_string())
 }
 
+#[cfg(test)]
 fn query_process_start_identity(pid: i32, timezone: &str) -> Result<String> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
@@ -187,6 +246,7 @@ fn query_process_start_identity(pid: i32, timezone: &str) -> Result<String> {
 // Identities are compared across ps invocations whose column layouts differ
 // (per-pid vs the batched snapshot), so collapse runs of whitespace before
 // persisting or comparing.
+#[cfg(test)]
 fn normalize_identity(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -380,6 +440,12 @@ pub fn parent_pid(pid: i32) -> Option<i32> {
     i32::try_from(unsafe { info.assume_init() }.pbi_ppid).ok()
 }
 
+/// The leader of the session a process belongs to.
+pub fn session_leader(pid: i32) -> Option<i32> {
+    let leader = unsafe { libc::getsid(pid) };
+    (leader > 0).then_some(leader)
+}
+
 pub fn child_pids(pid: i32) -> Vec<i32> {
     pid_list(|buffer, size| unsafe { libc::proc_listchildpids(pid, buffer, size) })
 }
@@ -394,6 +460,160 @@ pub fn pids_named(name: &str) -> Vec<i32> {
                 .is_ok_and(|length| &buffer[..length.min(buffer.len())] == name.as_bytes())
         })
         .collect()
+}
+
+pub fn socket_peer_pid(socket: &impl std::os::fd::AsRawFd) -> Option<i32> {
+    let mut pid: libc::pid_t = 0;
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::pid_t>()).ok()?;
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&raw mut pid).cast(),
+            &raw mut length,
+        )
+    };
+    (result == 0).then_some(pid)
+}
+
+pub fn loopback_listener(port: u16, candidates: &[i32]) -> Option<i32> {
+    candidates.iter().copied().find(|&pid| {
+        socket_descriptors(pid)
+            .into_iter()
+            .any(|descriptor| listens_on_loopback(pid, descriptor, port))
+    })
+}
+
+fn socket_descriptors(pid: i32) -> Vec<i32> {
+    let size =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let Ok(capacity) = usize::try_from(size) else {
+        return Vec::new();
+    };
+    let mut descriptors = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0,
+        };
+        capacity / std::mem::size_of::<libc::proc_fdinfo>()
+    ];
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            descriptors.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    let Ok(written) = usize::try_from(written) else {
+        return Vec::new();
+    };
+    descriptors.truncate(written / std::mem::size_of::<libc::proc_fdinfo>());
+    descriptors
+        .into_iter()
+        .filter(|descriptor| u32::try_from(libc::PROX_FDTYPE_SOCKET) == Ok(descriptor.proc_fdtype))
+        .map(|descriptor| descriptor.proc_fd)
+        .collect()
+}
+
+const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+const SOCKINFO_TCP: libc::c_int = 2;
+const TSI_S_LISTEN: libc::c_int = 1;
+
+// These layouts match sys/proc_info.h; libc does not expose the socket bindings.
+#[repr(C)]
+struct SocketFdInfo {
+    _pfi: [u64; 3],
+    psi: SocketInfo,
+}
+
+#[repr(C)]
+struct SocketInfo {
+    _soi_stat: libc::vinfo_stat,
+    _soi_so: u64,
+    _soi_pcb: u64,
+    _soi_type: libc::c_int,
+    _soi_protocol: libc::c_int,
+    soi_family: libc::c_int,
+    _soi_options: libc::c_short,
+    _soi_linger: libc::c_short,
+    _soi_state: libc::c_short,
+    _soi_qlen: libc::c_short,
+    _soi_incqlen: libc::c_short,
+    _soi_qlimit: libc::c_short,
+    _soi_timeo: libc::c_short,
+    _soi_error: libc::c_ushort,
+    _soi_oobmark: u32,
+    _soi_rcv: [u32; 6],
+    _soi_snd: [u32; 6],
+    soi_kind: libc::c_int,
+    _rfu_1: u32,
+    soi_proto: SocketProtocolInfo,
+}
+
+#[repr(C)]
+union SocketProtocolInfo {
+    pri_tcp: TcpSockInfo,
+    _pri_un: [u64; 66],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TcpSockInfo {
+    tcpsi_ini: InSockInfo,
+    tcpsi_state: libc::c_int,
+    _tcpsi_timer: [libc::c_int; 4],
+    _tcpsi_mss: libc::c_int,
+    _tcpsi_flags: u32,
+    _rfu_1: u32,
+    _tcpsi_tp: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InSockInfo {
+    _insi_fport: libc::c_int,
+    insi_lport: libc::c_int,
+    _insi_gencnt: u64,
+    _insi_flags: u32,
+    _insi_flow: u32,
+    _insi_vflag: u8,
+    _insi_ip_ttl: u8,
+    _rfu_1: u32,
+    _insi_faddr: [u32; 4],
+    insi_laddr: [u32; 4],
+    _insi_v4: u8,
+    _insi_v6: [u32; 3],
+}
+
+fn listens_on_loopback(pid: i32, descriptor: i32, port: u16) -> bool {
+    let mut info = std::mem::MaybeUninit::<SocketFdInfo>::zeroed();
+    let Ok(size) = libc::c_int::try_from(std::mem::size_of::<SocketFdInfo>()) else {
+        return false;
+    };
+    let written = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            descriptor,
+            PROC_PIDFDSOCKETINFO,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return false;
+    }
+    let socket = unsafe { info.assume_init() }.psi;
+    if socket.soi_family != libc::AF_INET || socket.soi_kind != SOCKINFO_TCP {
+        return false;
+    }
+    let tcp = unsafe { socket.soi_proto.pri_tcp };
+    tcp.tcpsi_state == TSI_S_LISTEN
+        && u16::try_from(tcp.tcpsi_ini.insi_lport).map(u16::from_be) == Ok(port)
+        && std::net::Ipv4Addr::from(u32::from_be(tcp.tcpsi_ini.insi_laddr[3]))
+            == std::net::Ipv4Addr::LOCALHOST
 }
 
 fn pid_list(list: impl Fn(*mut libc::c_void, libc::c_int) -> libc::c_int) -> Vec<i32> {
@@ -471,6 +691,60 @@ mod tests {
             Some(vec!["hx".into(), "my notes.txt".into(), String::new()])
         );
         assert_eq!(parse_process_arguments(&buffer[..10]), None);
+    }
+
+    #[test]
+    fn environment_follows_the_arguments_up_to_the_first_empty_string() {
+        let mut buffer = 2_i32.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(
+            b"/bin/codex\0\0codex\0SESSION_GUARD_SHELL_PID=7\0PATH=/bin\0SESSION_GUARD=no\0\0ptr_munge=\0",
+        );
+        assert_eq!(
+            parse_process_environment_variable(&buffer, "PATH"),
+            Some("/bin".into())
+        );
+        assert_eq!(
+            parse_process_environment_variable(&buffer, "SESSION_GUARD"),
+            Some("no".into())
+        );
+        assert_eq!(
+            parse_process_environment_variable(&buffer, "SESSION_GUARD_SHELL_PID=7"),
+            None
+        );
+        assert_eq!(parse_process_environment_variable(&buffer, "codex"), None);
+        assert_eq!(
+            parse_process_environment_variable(&buffer, "ptr_munge"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_live_process_reports_the_environment_it_started_with() {
+        let pid = std::process::id() as i32;
+        assert_eq!(
+            process_environment_variable(pid, "HOME"),
+            std::env::var("HOME").ok()
+        );
+        assert_eq!(
+            process_environment_variable(pid, "SESSION_GUARD_NO_SUCH_VARIABLE"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_kernel_names_the_loopback_listener_and_the_socket_peer() {
+        let own = std::process::id() as i32;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(loopback_listener(port, &[own]), Some(own));
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let client_port = client.local_addr().unwrap().port();
+        assert_eq!(loopback_listener(client_port, &[own]), None);
+        drop(listener);
+        assert_eq!(loopback_listener(port, &[own]), None);
+
+        let (left, _right) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(socket_peer_pid(&left), Some(own));
     }
 
     #[test]

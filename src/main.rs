@@ -1,5 +1,6 @@
 mod adapters;
 mod cargo_targets;
+mod codex_server;
 mod commands;
 mod continuation;
 mod fresh_tab;
