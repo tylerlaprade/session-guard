@@ -71,6 +71,12 @@ programs the hooks run, `ps` and `tr`, live in `/bin` and `/usr/bin`, which
 even that minimal PATH includes. An update rewrites only session-guard's hook
 entries and keeps every other key in its place.
 
+A session reopens in the folder its transcript began in, which is the folder it
+was started in. Hooks report the folder a session has since changed into, but
+the start folder decides which project instructions the session loads. A
+session without a readable transcript reopens in the last folder its hooks
+reported.
+
 OpenCode has no shell-command hooks; session-guard installs a JS plugin at
 `~/.config/opencode/plugin/session-guard.js` that OpenCode loads into its
 process. The plugin registers on `session.created`/`session.updated`, uses

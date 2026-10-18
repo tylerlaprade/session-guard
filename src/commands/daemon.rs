@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -407,6 +408,10 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 ))?;
                 alive_kept.push(session);
                 continue;
+            }
+
+            if let Some(launched_in) = launch_directory(&session) {
+                session.directory = launched_in;
             }
 
             if !session.directory.is_dir() {
@@ -1023,6 +1028,17 @@ fn should_replace(
     candidate.last_seen_at > existing.last_seen_at
 }
 
+/// Hooks report the folder a session has since changed into, but the folder
+/// it started in decides which instructions it loads, so a restore reopens
+/// it where its transcript began.
+fn launch_directory(session: &SessionRecord) -> Option<PathBuf> {
+    let transcript = session.transcript_path.as_ref()?;
+    transcripts::read_metadata(transcript, session.tool)
+        .ok()
+        .flatten()
+        .map(|(_, cwd, _)| cwd)
+}
+
 /// A harness writes its transcript on the first message, and its resume
 /// command refuses a session that has none.
 fn never_started_a_conversation(session: &SessionRecord) -> bool {
@@ -1128,6 +1144,28 @@ mod tests {
                 "unplaced-b"
             ]
         );
+    }
+
+    #[test]
+    fn a_restore_reopens_a_session_where_its_transcript_began() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"summary\"}\n\
+             {\"cwd\":\"/Users/tester/Code\",\"timestamp\":\"2026-10-18T11:00:00Z\"}\n\
+             {\"cwd\":\"/Users/tester/Code/dotfiles\"}\n",
+        )
+        .unwrap();
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.directory = PathBuf::from("/Users/tester/Code/dotfiles");
+        session.transcript_path = Some(transcript);
+        assert_eq!(
+            launch_directory(&session),
+            Some(PathBuf::from("/Users/tester/Code"))
+        );
+        session.transcript_path = None;
+        assert_eq!(launch_directory(&session), None);
     }
 
     #[test]

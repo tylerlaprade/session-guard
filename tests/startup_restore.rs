@@ -55,8 +55,19 @@ fn run_startup(
     match transcript {
         Transcript::Unreported | Transcript::NeverWritten => {}
         Transcript::Written => {
+            let launched_in = home.join("launch");
+            fs::create_dir(&launched_in).unwrap();
             fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
-            fs::write(&transcript_path, "{}\n").unwrap();
+            fs::write(
+                &transcript_path,
+                format!(
+                    "{}\n{}\n{}\n",
+                    json!({"type": "summary"}),
+                    json!({"type": "user", "cwd": launched_in, "timestamp": idle_since}),
+                    json!({"type": "user", "cwd": home, "timestamp": idle_since})
+                ),
+            )
+            .unwrap();
         }
     }
     let reported_transcript = match transcript {
@@ -234,8 +245,14 @@ fn reboot_prunes_sessions_that_never_started_a_conversation() {
     assert!(log.contains("Restored 0 sessions"));
     assert!(log.contains("Pruned 1 that never started a conversation."));
     assert_eq!(records, json!([]));
-    let (log, _) = run_startup("previous-boot", "claude", false, true, Transcript::Written);
+    let (log, records) = run_startup("previous-boot", "claude", false, true, Transcript::Written);
     assert!(log.contains("Restored 1 sessions"));
+    assert!(
+        records[0]["directory"]
+            .as_str()
+            .unwrap()
+            .ends_with("/launch")
+    );
 }
 
 #[test]
