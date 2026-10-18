@@ -29,6 +29,7 @@ jobs:
       - run: curl -fsSL -o "$HOME/.rustfmt.toml" https://raw.githubusercontent.com/tylerlaprade/dotfiles/master/.rustfmt.toml
       - run: cargo fmt --check
       - run: cargo check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: curl -fsSL -o "$RUNNER_TEMP/cargo-clippy.py" https://raw.githubusercontent.com/tylerlaprade/dotfiles/master/scripts/cargo-clippy.py
+      - run: python3 "$RUNNER_TEMP/cargo-clippy.py" clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
