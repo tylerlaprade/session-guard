@@ -119,6 +119,15 @@ else:
     print("test-window\ttest-tab")
 "#).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    // The real log would read this Mac's own terminal, and its stored log
+    // takes minutes to scan; no lockout is ever reported here.
+    let log = bin.join("log");
+    fs::write(
+        &log,
+        "#!/bin/sh\n[ \"$1\" = stream ] && exec sleep 60\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o755)).unwrap();
     let provider = bin.join(tool);
     fs::write(&provider, "#!/bin/sh\nexec sleep 30\n").unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o755)).unwrap();
@@ -126,6 +135,7 @@ else:
         Command::new(env!("CARGO_BIN_EXE_session-guard"))
             .arg("daemon")
             .env("HOME", home)
+            .env("TMPDIR", home)
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CODEX_HOME", home.join(".codex"))
             .env("SHELL", "/bin/sh")

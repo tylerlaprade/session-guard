@@ -2,6 +2,7 @@ use crate::adapters::{adapter_for, shell_quote};
 use crate::cargo_targets;
 use crate::harness::{Discovery, Integration};
 use crate::last_sessions::{self, LastSessionRecord};
+use crate::lockout::{self, Lockout};
 use crate::paths;
 use crate::process::{self, ProcessSnapshot};
 use crate::scan;
@@ -36,6 +37,9 @@ pub struct RestoreSummary {
     pub retired: usize,
     pub failed: usize,
     pub errors: Vec<String>,
+    /// Sessions left unopened because the terminal could not take a tab yet.
+    pub held: Vec<SessionRecord>,
+    pub held_reason: Option<String>,
 }
 
 impl RestoreSummary {
@@ -63,11 +67,24 @@ impl RestoreSummary {
             Some(editors) if editors > 1 => per_tool.push(format!("{editors} editors")),
             _ => {}
         }
-        let mut message = format!(
-            "Restored {} sessions ({}). Pruned {} (directory gone).",
-            self.restored_total(),
-            per_tool.join(", "),
-            self.pruned_missing_dirs,
+        let held = format!(
+            "Held {} sessions: {}.",
+            self.held.len(),
+            self.held_reason.as_deref().unwrap_or_default()
+        );
+        let mut message = if self.restored_total() == 0 && !self.held.is_empty() {
+            held.clone()
+        } else {
+            format!(
+                "Restored {} sessions ({}).",
+                self.restored_total(),
+                per_tool.join(", ")
+            )
+        };
+        let _ = write!(
+            message,
+            " Pruned {} (directory gone).",
+            self.pruned_missing_dirs
         );
         if self.pruned_without_conversation > 0 {
             let _ = write!(
@@ -95,6 +112,9 @@ impl RestoreSummary {
         }
         if self.failed > 0 {
             let _ = write!(message, " Failed to restore {} sessions.", self.failed);
+        }
+        if self.restored_total() > 0 && !self.held.is_empty() {
+            let _ = write!(message, " {held}");
         }
         message
     }
@@ -130,6 +150,7 @@ pub fn run() -> Result<()> {
 
     write_pid_file()?;
     log_line("daemon started")?;
+    let mut lockout_watcher = start_lockout_watcher();
     update_installed_hooks()?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -140,11 +161,13 @@ pub fn run() -> Result<()> {
     flag::register(SIGUSR1, Arc::clone(&restore_requested))?;
     flag::register(SIGUSR2, Arc::clone(&restore_all_requested))?;
 
+    let mut held = Vec::new();
     let summary = restore_once(RestoreMode::Startup)?;
     log_line(&summary.message())?;
     for error in &summary.errors {
         log_line(error)?;
     }
+    hold(&mut held, summary.held);
 
     let added = reconcile_from_scan()?;
     if added > 0 {
@@ -168,6 +191,7 @@ pub fn run() -> Result<()> {
             for error in &summary.errors {
                 log_line(error)?;
             }
+            hold(&mut held, summary.held);
         }
         if restore_all_requested.swap(false, Ordering::Relaxed) {
             let summary = restore_once(RestoreMode::All)?;
@@ -175,6 +199,18 @@ pub fn run() -> Result<()> {
             for error in &summary.errors {
                 log_line(error)?;
             }
+            hold(&mut held, summary.held);
+        }
+        if !held.is_empty()
+            && configured_terminal()
+                .is_ok_and(|terminal| lockout::lockout(terminal) == Lockout::Clear)
+        {
+            let summary = restore_held(&std::mem::take(&mut held))?;
+            log_line(&format!("held restore: {}", summary.message()))?;
+            for error in &summary.errors {
+                log_line(error)?;
+            }
+            hold(&mut held, summary.held);
         }
 
         seconds_until_settle -= 1;
@@ -210,6 +246,7 @@ pub fn run() -> Result<()> {
                 for error in &summary.errors {
                     log_line(error)?;
                 }
+                hold(&mut held, summary.held);
             }
             if tab_offered {
                 crate::fresh_tab::decline()?;
@@ -240,6 +277,17 @@ pub fn run() -> Result<()> {
                 ))?;
             }
 
+            if lockout_watcher
+                .as_ref()
+                .is_some_and(|watcher| !watcher.is_running())
+            {
+                if let Some(Err(error)) = lockout_watcher.take().map(lockout::Watcher::stop) {
+                    log_line(&format!("lockout watcher stopped: {error:#}"))?;
+                }
+                log_line("restarting the lockout watcher")?;
+                lockout_watcher = start_lockout_watcher();
+            }
+
             monitor_cycles_until_cleanup -= 1;
             if monitor_cycles_until_cleanup == 0 {
                 run_cargo_target_cleanup()?;
@@ -249,9 +297,29 @@ pub fn run() -> Result<()> {
         }
     }
 
+    if let Some(Err(error)) = lockout_watcher.map(lockout::Watcher::stop) {
+        log_line(&format!("lockout watcher did not stop cleanly: {error:#}"))?;
+    }
     log_line("daemon stopped")?;
     remove_pid_file_if_current()?;
     Ok(())
+}
+
+fn start_lockout_watcher() -> Option<lockout::Watcher> {
+    let terminal = configured_terminal().ok()?;
+    lockout::Watcher::start(terminal)
+        .map_err(|error| {
+            let _ = log_line(&format!("lockout watcher failed to start: {error:#}"));
+        })
+        .ok()
+}
+
+// A later pass's record of a session replaces the one held from before.
+fn hold(held: &mut Vec<SessionRecord>, sessions: Vec<SessionRecord>) {
+    for session in sessions {
+        held.retain(|kept| kept.session_id != session.session_id);
+        held.push(session);
+    }
 }
 
 fn run_cargo_target_cleanup() -> Result<()> {
@@ -458,13 +526,57 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
         Ok((summary, to_open))
     })?;
 
-    // Phase 2: open tabs without holding the exclusive sessions lock.
+    open_restores(to_open, &mut summary)?;
+    Ok(summary)
+}
+
+/// Opens what a pass held back while the terminal was locked out, minus
+/// sessions that came back on their own meanwhile.
+pub fn restore_held(held: &[SessionRecord]) -> Result<RestoreSummary> {
+    let restore_lock = crate::commands::restore::lock()?;
+    restore_lock.lock_exclusive()?;
+    let processes = ProcessSnapshot::capture()?;
+    let registry = sessions::read_sessions(&paths::sessions_file()?)?;
+    let to_open = held
+        .iter()
+        .filter_map(|held| {
+            registry
+                .iter()
+                .find(|session| session.session_id == held.session_id)
+        })
+        .filter(|session| {
+            !session_is_alive(session, &processes) && !session_shell_is_alive(session, &processes)
+        })
+        .cloned()
+        .collect();
+    let mut summary = RestoreSummary::default();
+    open_restores(to_open, &mut summary)?;
+    Ok(summary)
+}
+
+// Phase 2 of a restore: open tabs without holding the exclusive sessions lock.
+// A tab added while Screen Time has the terminal locked out crashes the
+// terminal when the lockout lifts, so each tab waits on that answer.
+fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> Result<()> {
+    let path = paths::sessions_file()?;
     let mut adapter = None;
-    for session in to_open {
-        if adapter.is_none() {
-            let kind = configured_terminal()?;
-            adapter = Some(adapter_for(kind));
+    let mut to_open = to_open.into_iter();
+    while let Some(session) = to_open.next() {
+        let kind = configured_terminal()?;
+        let held_reason = match lockout::lockout(kind) {
+            Lockout::Clear => None,
+            Lockout::Engaged => Some(format!("{kind} is locked out by Screen Time")),
+            Lockout::Unknown(reason) => Some(format!(
+                "cannot tell whether {kind} is locked out: {reason}"
+            )),
+        };
+        if let Some(reason) = held_reason {
+            summary.held.push(session);
+            summary.held.extend(to_open);
+            summary.held_reason = Some(reason);
+            break;
         }
+        let adapter = adapter.get_or_insert_with(|| adapter_for(kind));
 
         let command = format!(
             "{} launch --session-id {}",
@@ -472,8 +584,6 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             shell_quote(&session.session_id)
         );
         match adapter
-            .as_ref()
-            .unwrap()
             .open_tab(&session.directory, &command)
             .and_then(|()| wait_for_restore_owner(&path, &session.session_id))
         {
@@ -495,7 +605,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
         }
     }
 
-    Ok(summary)
+    Ok(())
 }
 
 fn wait_for_restore_owner(path: &std::path::Path, session_id: &str) -> Result<()> {
@@ -941,7 +1051,7 @@ fn remove_pid_file_if_current() -> Result<()> {
     Ok(())
 }
 
-fn configured_terminal() -> Result<TerminalKind> {
+pub(crate) fn configured_terminal() -> Result<TerminalKind> {
     let path = paths::terminal_file()?;
     let contents =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -1552,6 +1662,8 @@ mod tests {
             retired: 2,
             failed: 0,
             errors: vec![],
+            held: vec![],
+            held_reason: None,
         };
         let message = summary.message();
         assert!(message.contains("Restored 5 sessions"));
@@ -1559,5 +1671,45 @@ mod tests {
         assert!(message.contains("Pruned 1 duplicate"));
         assert!(message.contains("Pruned 1 that never started a conversation."));
         assert!(message.contains("Retired 2 ended sessions"));
+    }
+
+    #[test]
+    fn a_held_pass_does_not_read_as_a_restore() {
+        let held = sample(crate::tool("claude"), "held-session");
+        let summary = RestoreSummary {
+            held: vec![held.clone()],
+            held_reason: Some("ghostty is locked out by Screen Time".into()),
+            ..RestoreSummary::default()
+        };
+        let message = summary.message();
+        assert!(message.starts_with("Held 1 sessions: ghostty is locked out by Screen Time."));
+        assert!(!message.contains("Restored"));
+
+        let mut partly = RestoreSummary {
+            held: vec![held],
+            held_reason: Some("ghostty is locked out by Screen Time".into()),
+            ..RestoreSummary::default()
+        };
+        partly.record_restore(crate::tool("claude"));
+        let message = partly.message();
+        assert!(message.starts_with("Restored 1 sessions"));
+        assert!(message.ends_with("Held 1 sessions: ghostty is locked out by Screen Time."));
+    }
+
+    #[test]
+    fn a_later_pass_replaces_a_held_session() {
+        let mut held = vec![
+            sample(crate::tool("claude"), "first"),
+            sample(crate::tool("claude"), "second"),
+        ];
+        let mut newer = sample(crate::tool("claude"), "first");
+        newer.restore_pending = true;
+        hold(&mut held, vec![newer]);
+        let ids: Vec<&str> = held
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["second", "first"]);
+        assert!(held[1].restore_pending);
     }
 }

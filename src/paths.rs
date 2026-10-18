@@ -38,6 +38,43 @@ pub fn daemon_heartbeat() -> Result<PathBuf> {
     Ok(config_dir()?.join("daemon-heartbeat"))
 }
 
+/// Names this boot's processes, so it lives in machine-local storage.
+pub fn lockout_state() -> Result<PathBuf> {
+    Ok(user_temp_dir()?.join("session-guard-lockout.json"))
+}
+
+// launchd gives the LaunchAgent no TMPDIR, so the daemon asks for the
+// per-user directory that shells' TMPDIR names.
+fn user_temp_dir() -> Result<PathBuf> {
+    if let Some(directory) = env::var_os("TMPDIR").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(directory));
+    }
+    darwin_user_temp_dir()
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buffer = vec![0_u8; usize::try_from(libc::PATH_MAX)?];
+    let length = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if length == 0 || length > buffer.len() {
+        anyhow::bail!("macOS reported no per-user temporary directory");
+    }
+    buffer.truncate(length - 1);
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn darwin_user_temp_dir() -> Result<PathBuf> {
+    Ok(env::temp_dir())
+}
+
 pub fn cargo_targets_dir() -> Result<PathBuf> {
     Ok(home_dir()?
         .join("Library")

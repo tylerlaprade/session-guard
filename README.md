@@ -30,6 +30,8 @@ Supported terminal values:
 session-guard status
 session-guard restore
 session-guard restore --all
+session-guard lockout
+session-guard lockout --wait
 session-guard daemon
 session-guard cargo-target -- cargo test -p my-crate
 session-guard uninstall
@@ -234,6 +236,35 @@ injected command or keystroke.
 
 When session-guard itself launches Ghostty, it disables the default empty window
 for that launch only. The first restored session creates the first window.
+
+### Screen Time lockouts
+
+When Screen Time locks the terminal out, for Downtime or an app limit, AppKit
+covers its native fullscreen windows. A tab opened under that cover crashes the
+terminal when the lockout lifts. The daemon therefore opens no tab while the
+terminal is locked out: a restore pass that finds it locked out holds its
+sessions, still pending, and opens them once the lockout lifts.
+
+Reading the policy behind a lockout takes a private entitlement, so the daemon
+follows the line AppKit logs in the terminal at each change (`LockoutUI changed
+state: engaged` or `disengaged`). It runs one `log stream` for that line while
+it runs and keeps the state in `$TMPDIR/session-guard-lockout.json`, keyed by
+the terminal's PID and start time. A daemon that starts while the terminal is
+already running reads that terminal's state back from the stored log, which can
+take a minute or two, and restores wait until it knows. A pass that cannot know,
+because the watcher is not running, holds as well and says why.
+
+AppKit logs nothing for a terminal that launches unlocked, and logs `engaged`
+about a second and a half after launch for one that launches locked out. A
+terminal launched after the daemon started counts as unlocked until it logs, so
+that first moment after a launch is not covered.
+
+Scripts that open terminal tabs can ask the same question:
+
+```sh
+session-guard lockout         # 0: not locked out, or not running; 1: locked out; 2: unknown
+session-guard lockout --wait  # waits while locked out: 0 once it lifts, 2 if it becomes unknown
+```
 
 ### Continuing interrupted work
 

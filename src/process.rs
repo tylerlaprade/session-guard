@@ -451,13 +451,22 @@ pub fn child_pids(pid: i32) -> Vec<i32> {
 }
 
 pub fn pids_named(name: &str) -> Vec<i32> {
+    pids_whose_name(|found| found == name.as_bytes())
+}
+
+/// For names known lowercased, as `ps -o comm=` reports them here; the kernel
+/// keeps the executable's own case (`iTerm2`).
+pub fn pids_named_ignoring_case(name: &str) -> Vec<i32> {
+    pids_whose_name(|found| found.eq_ignore_ascii_case(name.as_bytes()))
+}
+
+fn pids_whose_name(matches: impl Fn(&[u8]) -> bool) -> Vec<i32> {
     pid_list(|buffer, size| unsafe { libc::proc_listallpids(buffer, size) })
         .into_iter()
         .filter(|&pid| {
             let mut buffer = [0_u8; 64];
             let length = unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), 64) };
-            usize::try_from(length)
-                .is_ok_and(|length| &buffer[..length.min(buffer.len())] == name.as_bytes())
+            usize::try_from(length).is_ok_and(|length| matches(&buffer[..length.min(buffer.len())]))
         })
         .collect()
 }

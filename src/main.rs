@@ -7,6 +7,7 @@ mod fresh_tab;
 mod harness;
 mod hooks;
 mod last_sessions;
+mod lockout;
 mod paths;
 mod process;
 mod scan;
@@ -249,6 +250,13 @@ enum Command {
         )]
         all: bool,
     },
+    /// Exit 0 unless Screen Time has the terminal locked out (1), or that
+    /// cannot be known (2). Opening a tab while it is locked out crashes it
+    /// when the lockout lifts.
+    Lockout {
+        #[arg(long, help = "Wait while the terminal is locked out")]
+        wait: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -275,5 +283,6 @@ fn main() -> Result<()> {
         } => commands::register::run(tool, session_id, pid, shell_pid, directory, name),
         Command::Deregister { session_id } => commands::deregister::run(session_id),
         Command::Restore { all } => commands::restore::run(all),
+        Command::Lockout { wait } => lockout::run(wait),
     }
 }
