@@ -167,6 +167,34 @@ impl Fixture {
         }
     }
 
+    fn start_daemon(&mut self) {
+        self.daemon = Some(
+            self.command(&["daemon"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+
+    /// Stops the daemon the way launchd does and checks it took its stream
+    /// along.
+    fn stop_daemon(&mut self) {
+        let stream = self.pid_in("stream.pid").unwrap();
+        let daemon = self.daemon.take().unwrap();
+        unsafe {
+            libc::kill(i32::try_from(daemon.id()).unwrap(), libc::SIGTERM);
+        }
+        let status = daemon.wait_with_output().unwrap().status;
+        assert!(status.success(), "daemon exited with {status}");
+        assert!(!alive(stream), "the daemon left its log stream running");
+        assert!(
+            !self
+                .daemon_log()
+                .contains("lockout watcher did not stop cleanly")
+        );
+        assert!(!self.state_file().exists());
+    }
+
     fn state_file(&self) -> PathBuf {
         self.root().join("session-guard-lockout.json")
     }
@@ -179,13 +207,7 @@ fn alive(pid: i32) -> bool {
 #[test]
 fn a_locked_out_terminal_gets_no_tab_until_the_lockout_lifts() {
     let mut fixture = Fixture::new();
-    fixture.daemon = Some(
-        fixture
-            .command(&["daemon"])
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    fixture.start_daemon();
 
     fixture.wait_for("the startup pass to hold", || {
         fixture.daemon_log().contains("Held 1 sessions")
@@ -200,6 +222,19 @@ fn a_locked_out_terminal_gets_no_tab_until_the_lockout_lifts() {
     assert!(!fixture.root().join("launcher.pid").exists());
     assert_eq!(fixture.record()["restore_pending"], true);
     assert!(!fixture.daemon_log().contains("Restored"));
+
+    // A daemon restarted during the lockout, on the same boot, still holds
+    // the session rather than dropping it as an old recoverable record.
+    fixture.stop_daemon();
+    assert_eq!(fixture.record()["held_for_lockout"], true);
+    fixture.start_daemon();
+    fixture.wait_for("the restarted daemon to hold", || {
+        fixture.daemon_log().matches("Held 1 sessions").count() == 2
+    });
+    fixture.wait_for("the lockout to be known again", || {
+        fixture.lockout().status.code() == Some(1)
+    });
+    assert!(!fixture.root().join("launcher.pid").exists());
 
     let mut waiter = fixture.command(&["lockout", "--wait"]).spawn().unwrap();
     thread::sleep(Duration::from_millis(700));
@@ -219,16 +254,9 @@ fn a_locked_out_terminal_gets_no_tab_until_the_lockout_lifts() {
     fixture.wait_for("the restored owner", || {
         fixture.record()["state"] == "active"
     });
+    assert_eq!(fixture.record()["held_for_lockout"], false);
 
-    let stream = fixture.pid_in("stream.pid").unwrap();
-    let daemon = fixture.daemon.take().unwrap();
-    unsafe {
-        libc::kill(i32::try_from(daemon.id()).unwrap(), libc::SIGTERM);
-    }
-    let status = daemon.wait_with_output().unwrap().status;
-    assert!(status.success(), "daemon exited with {status}");
-    assert!(!alive(stream), "the daemon left its log stream running");
-    assert!(!fixture.state_file().exists());
+    fixture.stop_daemon();
 
     let unknown = fixture.lockout();
     assert_eq!(unknown.status.code(), Some(2));

@@ -76,6 +76,10 @@ pub struct SessionRecord {
     pub source: Option<String>,
     #[serde(default)]
     pub restore_pending: bool,
+    // A restore pass chose this session but held it because Screen Time had
+    // the terminal locked out; later passes open it once the lockout lifts.
+    #[serde(default)]
+    pub held_for_lockout: bool,
     #[serde(default)]
     pub activity: Option<crate::continuation::Activity>,
     #[serde(default)]
@@ -129,6 +133,7 @@ impl SessionRecord {
             ending_at: None,
             source,
             restore_pending: false,
+            held_for_lockout: false,
             activity: None,
             background_tasks: None,
             command: None,
@@ -164,6 +169,7 @@ impl SessionRecord {
             ending_at: None,
             source: Some("transcript-fallback".to_string()),
             restore_pending: false,
+            held_for_lockout: false,
             activity: None,
             background_tasks: None,
             command: None,
@@ -194,6 +200,7 @@ impl SessionRecord {
 
     pub fn mark_active(&mut self) {
         self.restore_pending = false;
+        self.held_for_lockout = false;
         self.state = SessionState::Active;
         self.dead_at = None;
         self.recoverable_until = None;

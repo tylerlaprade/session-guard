@@ -243,7 +243,9 @@ When Screen Time locks the terminal out, for Downtime or an app limit, AppKit
 covers its native fullscreen windows. A tab opened under that cover crashes the
 terminal when the lockout lifts. The daemon therefore opens no tab while the
 terminal is locked out: a restore pass that finds it locked out holds its
-sessions, still pending, and opens them once the lockout lifts.
+sessions, still pending, and opens them once the lockout lifts. The hold is
+kept on each session's record, so a daemon restarted during the lockout still
+opens them.
 
 Reading the policy behind a lockout takes a private entitlement, so the daemon
 follows the line AppKit logs in the terminal at each change (`LockoutUI changed

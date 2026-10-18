@@ -243,7 +243,17 @@ impl Watcher {
         !self.follower.is_finished()
     }
 
-    pub fn stop(mut self) -> Result<()> {
+    /// Stops a watcher on purpose; how its follower ended is the stop's doing.
+    pub fn stop(self) -> Result<()> {
+        self.shut_down().map(|_| ())
+    }
+
+    /// Cleans up after a watcher that ended on its own, and says why it did.
+    pub fn reap(self) -> Result<()> {
+        self.shut_down()?
+    }
+
+    fn shut_down(mut self) -> Result<Result<()>> {
         if let Some(reading) = self
             .reading
             .lock()
@@ -256,7 +266,7 @@ impl Watcher {
         self.stream
             .wait()
             .context("failed to wait for the lockout log stream")?;
-        let result = self
+        let followed = self
             .follower
             .join()
             .map_err(|_| anyhow::anyhow!("lockout watcher panicked"))?;
@@ -266,7 +276,7 @@ impl Watcher {
             }
             _ => {}
         }
-        result
+        Ok(followed)
     }
 }
 

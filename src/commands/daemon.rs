@@ -137,6 +137,8 @@ pub enum RestoreMode {
     Startup,
     Manual,
     All,
+    /// Only the sessions an earlier pass held for a lockout.
+    Held,
 }
 
 pub fn run() -> Result<()> {
@@ -161,13 +163,12 @@ pub fn run() -> Result<()> {
     flag::register(SIGUSR1, Arc::clone(&restore_requested))?;
     flag::register(SIGUSR2, Arc::clone(&restore_all_requested))?;
 
-    let mut held = Vec::new();
     let summary = restore_once(RestoreMode::Startup)?;
     log_line(&summary.message())?;
     for error in &summary.errors {
         log_line(error)?;
     }
-    hold(&mut held, summary.held);
+    let mut holding = !summary.held.is_empty();
 
     let added = reconcile_from_scan()?;
     if added > 0 {
@@ -191,7 +192,7 @@ pub fn run() -> Result<()> {
             for error in &summary.errors {
                 log_line(error)?;
             }
-            hold(&mut held, summary.held);
+            holding |= !summary.held.is_empty();
         }
         if restore_all_requested.swap(false, Ordering::Relaxed) {
             let summary = restore_once(RestoreMode::All)?;
@@ -199,18 +200,18 @@ pub fn run() -> Result<()> {
             for error in &summary.errors {
                 log_line(error)?;
             }
-            hold(&mut held, summary.held);
+            holding |= !summary.held.is_empty();
         }
-        if !held.is_empty()
+        if holding
             && configured_terminal()
                 .is_ok_and(|terminal| lockout::lockout(terminal) == Lockout::Clear)
         {
-            let summary = restore_held(&std::mem::take(&mut held))?;
+            let summary = restore_once(RestoreMode::Held)?;
             log_line(&format!("held restore: {}", summary.message()))?;
             for error in &summary.errors {
                 log_line(error)?;
             }
-            hold(&mut held, summary.held);
+            holding = !summary.held.is_empty();
         }
 
         seconds_until_settle -= 1;
@@ -246,7 +247,7 @@ pub fn run() -> Result<()> {
                 for error in &summary.errors {
                     log_line(error)?;
                 }
-                hold(&mut held, summary.held);
+                holding |= !summary.held.is_empty();
             }
             if tab_offered {
                 crate::fresh_tab::decline()?;
@@ -281,7 +282,7 @@ pub fn run() -> Result<()> {
                 .as_ref()
                 .is_some_and(|watcher| !watcher.is_running())
             {
-                if let Some(Err(error)) = lockout_watcher.take().map(lockout::Watcher::stop) {
+                if let Some(Err(error)) = lockout_watcher.take().map(lockout::Watcher::reap) {
                     log_line(&format!("lockout watcher stopped: {error:#}"))?;
                 }
                 log_line("restarting the lockout watcher")?;
@@ -312,14 +313,6 @@ fn start_lockout_watcher() -> Option<lockout::Watcher> {
             let _ = log_line(&format!("lockout watcher failed to start: {error:#}"));
         })
         .ok()
-}
-
-// A later pass's record of a session replaces the one held from before.
-fn hold(held: &mut Vec<SessionRecord>, sessions: Vec<SessionRecord>) {
-    for session in sessions {
-        held.retain(|kept| kept.session_id != session.session_id);
-        held.push(session);
-    }
 }
 
 fn run_cargo_target_cleanup() -> Result<()> {
@@ -423,7 +416,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     // writing its own heartbeats.
     let heartbeat = match mode {
         RestoreMode::Startup => read_daemon_heartbeat(),
-        RestoreMode::Manual | RestoreMode::All => None,
+        RestoreMode::Manual | RestoreMode::All | RestoreMode::Held => None,
     };
     let rebooted = heartbeat
         .as_ref()
@@ -498,7 +491,16 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
 
             session.mark_recoverable();
 
-            if mode == RestoreMode::Startup && was_recoverable && !rebooted {
+            if mode == RestoreMode::Held && !session.held_for_lockout {
+                alive_kept.push(session);
+                continue;
+            }
+
+            if mode == RestoreMode::Startup
+                && was_recoverable
+                && !rebooted
+                && !session.held_for_lockout
+            {
                 alive_kept.push(session);
                 continue;
             }
@@ -510,7 +512,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 continue;
             }
 
-            if mode != RestoreMode::All && !session.restore_pending {
+            if mode != RestoreMode::All && !session.restore_pending && !session.held_for_lockout {
                 alive_kept.push(session);
                 continue;
             }
@@ -530,36 +532,13 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
     Ok(summary)
 }
 
-/// Opens what a pass held back while the terminal was locked out, minus
-/// sessions that came back on their own meanwhile.
-pub fn restore_held(held: &[SessionRecord]) -> Result<RestoreSummary> {
-    let restore_lock = crate::commands::restore::lock()?;
-    restore_lock.lock_exclusive()?;
-    let processes = ProcessSnapshot::capture()?;
-    let registry = sessions::read_sessions(&paths::sessions_file()?)?;
-    let to_open = held
-        .iter()
-        .filter_map(|held| {
-            registry
-                .iter()
-                .find(|session| session.session_id == held.session_id)
-        })
-        .filter(|session| {
-            !session_is_alive(session, &processes) && !session_shell_is_alive(session, &processes)
-        })
-        .cloned()
-        .collect();
-    let mut summary = RestoreSummary::default();
-    open_restores(to_open, &mut summary)?;
-    Ok(summary)
-}
-
 // Phase 2 of a restore: open tabs without holding the exclusive sessions lock.
 // A tab added while Screen Time has the terminal locked out crashes the
 // terminal when the lockout lifts, so each tab waits on that answer.
 fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> Result<()> {
     let path = paths::sessions_file()?;
     let mut adapter = None;
+    let mut attempted = Vec::new();
     let mut to_open = to_open.into_iter();
     while let Some(session) = to_open.next() {
         let kind = configured_terminal()?;
@@ -577,6 +556,7 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
             break;
         }
         let adapter = adapter.get_or_insert_with(|| adapter_for(kind));
+        attempted.push(session.session_id.clone());
 
         let command = format!(
             "{} launch --session-id {}",
@@ -605,7 +585,33 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
         }
     }
 
-    Ok(())
+    record_holds(&path, &attempted, &summary.held)
+}
+
+// The hold lives in the registry, so a daemon restarted during a lockout
+// still opens what the previous one held. An attempted open ends the hold,
+// whatever its outcome.
+fn record_holds(
+    path: &std::path::Path,
+    attempted: &[String],
+    held: &[SessionRecord],
+) -> Result<()> {
+    if attempted.is_empty() && held.is_empty() {
+        return Ok(());
+    }
+    sessions::with_sessions_mut(path, |sessions| {
+        for session in sessions.iter_mut() {
+            if held
+                .iter()
+                .any(|held| held.session_id == session.session_id)
+            {
+                session.held_for_lockout = true;
+            } else if attempted.contains(&session.session_id) {
+                session.held_for_lockout = false;
+            }
+        }
+        Ok(())
+    })
 }
 
 fn wait_for_restore_owner(path: &std::path::Path, session_id: &str) -> Result<()> {
@@ -1694,22 +1700,5 @@ mod tests {
         let message = partly.message();
         assert!(message.starts_with("Restored 1 sessions"));
         assert!(message.ends_with("Held 1 sessions: ghostty is locked out by Screen Time."));
-    }
-
-    #[test]
-    fn a_later_pass_replaces_a_held_session() {
-        let mut held = vec![
-            sample(crate::tool("claude"), "first"),
-            sample(crate::tool("claude"), "second"),
-        ];
-        let mut newer = sample(crate::tool("claude"), "first");
-        newer.restore_pending = true;
-        hold(&mut held, vec![newer]);
-        let ids: Vec<&str> = held
-            .iter()
-            .map(|session| session.session_id.as_str())
-            .collect();
-        assert_eq!(ids, ["second", "first"]);
-        assert!(held[1].restore_pending);
     }
 }
