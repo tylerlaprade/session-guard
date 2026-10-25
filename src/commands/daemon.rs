@@ -225,6 +225,12 @@ pub fn run() -> Result<()> {
         {
             if settle_tick {
                 crate::continuation::observe(&processes)?;
+                for session in reopen_in_living_tabs(&processes)? {
+                    log_line(&format!(
+                        "restored in the tab it crashed in: {} {}",
+                        session.tool, session.session_id
+                    ))?;
+                }
                 let released = release_closed_tabs(&processes)?;
                 if released > 0 {
                     log_line(&format!(
@@ -561,13 +567,8 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
         let adapter = adapter.get_or_insert_with(|| adapter_for(kind));
         attempted.push(session.session_id.clone());
 
-        let command = format!(
-            "{} launch --session-id {}",
-            shell_quote(&std::env::current_exe()?.to_string_lossy()),
-            shell_quote(&session.session_id)
-        );
         match adapter
-            .open_tab(&session.directory, &command)
+            .open_tab(&session.directory, &launch_command(&session.session_id)?)
             .and_then(|()| wait_for_restore_owner(&path, &session.session_id))
         {
             Ok(()) => {
@@ -589,6 +590,14 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
     }
 
     record_holds(&path, &attempted, &summary.held)
+}
+
+fn launch_command(session_id: &str) -> Result<String> {
+    Ok(format!(
+        "{} launch --session-id {}",
+        shell_quote(&std::env::current_exe()?.to_string_lossy()),
+        shell_quote(session_id)
+    ))
 }
 
 // The hold lives in the registry, so a daemon restarted during a lockout
@@ -870,6 +879,61 @@ fn release_closed_tabs(processes: &ProcessSnapshot) -> Result<usize> {
     })
 }
 
+// A tool that died without a SessionEnd while its shell lives on was killed or
+// crashed: closing a tab takes its shell down with it. A shell idle at its
+// prompt gets the restore typed into its own tab; one the user has already put
+// to other work is left to them, released like a closed tab.
+fn reopen_in_living_tabs(processes: &ProcessSnapshot) -> Result<Vec<SessionRecord>> {
+    let path = paths::sessions_file()?;
+    let now = chrono::Utc::now();
+    let crashed_in_living_tab = |session: &SessionRecord| {
+        session.state == SessionState::Recoverable
+            && session.restore_pending
+            && session
+                .dead_at
+                .is_some_and(|dead_at| (now - dead_at).num_seconds() >= SESSION_END_GRACE_SECS)
+            && session_shell_is_alive(session, processes)
+    };
+    let crashed: Vec<SessionRecord> = sessions::read_sessions(&path)?
+        .into_iter()
+        .filter(crashed_in_living_tab)
+        .collect();
+    let Some(kind) = crashed.first().and_then(|_| configured_terminal().ok()) else {
+        return Ok(Vec::new());
+    };
+    if lockout::lockout(kind) != Lockout::Clear {
+        return Ok(Vec::new());
+    }
+    let adapter = adapter_for(kind);
+    let mut reopened = Vec::new();
+    let mut released = Vec::new();
+    for session in crashed {
+        let in_tab = session
+            .shell_pid
+            .filter(|shell| processes.in_foreground(*shell))
+            .and_then(|shell| processes.tty(shell))
+            .map(|tty| adapter.run_in_tab(tty, &launch_command(&session.session_id)?))
+            .transpose()?
+            .unwrap_or(false);
+        if in_tab && wait_for_restore_owner(&path, &session.session_id).is_ok() {
+            reopened.push(session);
+        } else {
+            released.push(session.session_id);
+        }
+    }
+    if !released.is_empty() {
+        sessions::with_sessions_mut(&path, |sessions| {
+            for session in sessions.iter_mut() {
+                if released.contains(&session.session_id) && crashed_in_living_tab(session) {
+                    session.restore_pending = false;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(reopened)
+}
+
 // The terminal's tab order, recorded on each live session so a restore can
 // reopen its tabs in the order they had.
 fn record_tab_positions(processes: &ProcessSnapshot) -> Result<()> {
@@ -923,6 +987,7 @@ fn closed_under_running_terminal(
             .dead_at
             .is_some_and(|dead_at| (now - dead_at).num_seconds() >= SESSION_END_GRACE_SECS)
         && ending_verdict(session, processes, terminal_executable) == EndingVerdict::Retire
+        && !session_shell_is_alive(session, processes)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1452,6 +1517,15 @@ mod tests {
         relaunched.mark_recoverable();
         assert!(!closed_under_running_terminal(
             &relaunched,
+            &processes,
+            Some(&terminal),
+            settled
+        ));
+        let pid = std::process::id() as i32;
+        let mut crashed = ended_session(pid, &process::process_start_identity(pid).unwrap());
+        crashed.mark_recoverable();
+        assert!(!closed_under_running_terminal(
+            &crashed,
             &processes,
             Some(&terminal),
             settled

@@ -194,6 +194,23 @@ aftermath as a SessionEnd once the ten-second grace has passed. If the terminal
 instance that owned the tab is still running, the user ended it: the record stops waiting for a relaunch and stays recoverable
 through `restore --all` until it expires.
 
+A tool can also die alone, killed for memory or crashed, while its tab stays
+open. Closing a tab takes its shell down with the tool, so a shell that outlives
+a tool that fired no SessionEnd tells the two apart. Once the grace has passed,
+the daemon types the session's `session-guard launch` into that shell's own tab,
+found by its tty, when the shell sits idle at its prompt; a shell the user has
+already put to other work is released like a closed tab. Typing into a tab
+needs Ghostty's scripting. Other terminals release the record as before.
+
+A restored tab's launcher handles the same death itself. When the tool is
+killed by a signal that only memory pressure, a crash, or `kill -9` sends
+(KILL, SEGV, BUS, ABRT, ILL, FPE, TRAP, SYS) after it registered, the launcher
+claims the session again and resumes it in place, after waiting out any
+critical memory pressure. A closed tab's SIGHUP, and SIGINT and SIGTERM, are
+stops, and a tool that dies before it registers is not relaunched, so a crash
+at startup cannot loop. Either way, the resume gets the same continuation and
+lost-message handling as any restore.
+
 Restored tabs run through `session-guard launch`. That foreground controller
 registers its process identity before starting the provider in the user's
 interactive shell, preserving shell wrappers. It remains alive for the command's

@@ -18,18 +18,83 @@ pub fn run(session_id: &str) -> Result<()> {
     let path = paths::sessions_file()?;
     let owner = i32::try_from(std::process::id())?;
     let owner_started = process::process_start_identity(owner)?;
-    let record = sessions::with_sessions_mut(&path, |sessions| {
-        let processes = ProcessSnapshot::capture()?;
-        let session = sessions
-            .iter_mut()
-            .find(|session| session.session_id == session_id)
-            .context("restore record no longer exists")?;
-        if daemon::session_is_alive(session, &processes) {
-            bail!("session {session_id} already has a live owner");
+    loop {
+        let request = sessions::with_sessions_mut(&path, |sessions| {
+            let processes = ProcessSnapshot::capture()?;
+            let session = sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+                .context("restore record no longer exists")?;
+            if daemon::session_is_alive(session, &processes) {
+                bail!("session {session_id} already has a live owner");
+            }
+            Ok(claim(session, owner, &owner_started))
+        })?;
+        let status = run_claimed(&request)?;
+        if let Some(signal) = crash_signal(status)
+            && came_up(&path, session_id, owner)?
+        {
+            daemon::log_line(&format!(
+                "relaunching in its tab after signal {signal}: {} {session_id}",
+                request.record.tool
+            ))?;
+            eprintln!(
+                "session-guard: {} was killed by signal {signal}. Resuming it here.",
+                request.record.tool.spec().display_name
+            );
+            wait_out_critical_memory_pressure();
+            continue;
         }
-        Ok(claim(session, owner, &owner_started))
+        finish(&request.record, status.success())?;
+        std::process::exit(
+            status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+        );
+    }
+}
+
+/// The signal that killed the tool, when it was killed rather than stopped:
+/// out of memory, by a crash, or by `kill -9`. A closed tab's SIGHUP and the
+/// deliberate SIGINT and SIGTERM are stops. The tool runs under `$SHELL -ic`,
+/// which reports a command killed by signal N as exit status 128 + N.
+fn crash_signal(status: std::process::ExitStatus) -> Option<i32> {
+    let signal = status.signal().or_else(|| {
+        status
+            .code()
+            .filter(|code| *code > 128)
+            .map(|code| code - 128)
     })?;
-    run_claimed(&record)
+    [
+        libc::SIGKILL,
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGABRT,
+        libc::SIGILL,
+        libc::SIGFPE,
+        libc::SIGTRAP,
+        libc::SIGSYS,
+    ]
+    .contains(&signal)
+    .then_some(signal)
+}
+
+// The tool's registration replaces this launcher as the record's owner, so a
+// tool that crashes before it registers is not relaunched into a loop.
+fn came_up(path: &std::path::Path, session_id: &str, owner: i32) -> Result<bool> {
+    Ok(sessions::read_sessions(path)?
+        .iter()
+        .any(|session| session.session_id == session_id && session.pid != Some(owner)))
+}
+
+fn wait_out_critical_memory_pressure() {
+    if !process::memory_pressure_is_critical() {
+        return;
+    }
+    eprintln!("session-guard: waiting for memory pressure to ease first.");
+    while process::memory_pressure_is_critical() {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchRequest {
@@ -50,7 +115,7 @@ fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchReques
     }
 }
 
-fn run_claimed(request: &LaunchRequest) -> Result<()> {
+fn run_claimed(request: &LaunchRequest) -> Result<std::process::ExitStatus> {
     let record = &request.record;
     let owner = std::process::id();
     daemon::log_line(&format!(
@@ -72,20 +137,15 @@ fn run_claimed(request: &LaunchRequest) -> Result<()> {
         .current_dir(&record.directory)
         .env(SHELL_PID_ENV, owner.to_string())
         .status();
-    finish(
-        record,
-        result.as_ref().is_ok_and(std::process::ExitStatus::success),
-    )?;
+    if result.is_err() {
+        finish(record, false)?;
+    }
     let status = result.context("failed to launch restored session")?;
     daemon::log_line(&format!(
         "restored command exited: {} {} status={status}",
         record.tool, record.session_id
     ))?;
-    std::process::exit(
-        status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
-    );
+    Ok(status)
 }
 
 fn finish(record: &SessionRecord, succeeded: bool) -> Result<()> {
@@ -108,4 +168,31 @@ fn finish(record: &SessionRecord, succeeded: bool) -> Result<()> {
         deregister::end_from_hook(&path, &paths::last_sessions_file()?, &current)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_kill_or_crash_counts_as_a_crash() {
+        let exited = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        let signaled = std::process::ExitStatus::from_raw;
+        assert_eq!(
+            crash_signal(exited(128 + libc::SIGKILL)),
+            Some(libc::SIGKILL)
+        );
+        assert_eq!(
+            crash_signal(exited(128 + libc::SIGSEGV)),
+            Some(libc::SIGSEGV)
+        );
+        assert_eq!(crash_signal(signaled(libc::SIGABRT)), Some(libc::SIGABRT));
+        for stopped in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+            assert_eq!(crash_signal(exited(128 + stopped)), None, "{stopped}");
+            assert_eq!(crash_signal(signaled(stopped)), None, "{stopped}");
+        }
+        for code in [0, 1, 2, 127, 128] {
+            assert_eq!(crash_signal(exited(code)), None, "{code}");
+        }
+    }
 }

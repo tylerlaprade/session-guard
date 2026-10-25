@@ -18,6 +18,12 @@ pub trait TerminalAdapter {
     fn tab_positions(&self) -> Result<Vec<((u32, u32), String)>> {
         Ok(Vec::new())
     }
+    /// Runs `command` at the prompt of the tab on `tty`, replacing anything
+    /// typed there. False when no tab has that tty, or the terminal's
+    /// scripting cannot type into a tab.
+    fn run_in_tab(&self, _tty: &str, _command: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 pub fn adapter_for(kind: TerminalKind) -> Box<dyn TerminalAdapter> {

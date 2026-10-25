@@ -94,6 +94,25 @@ impl TerminalAdapter for Ghostty {
         )?;
         Ok(parse_tab_positions(&reply))
     }
+
+    // One `text:` action writes Ctrl-U, the command, and Return to the tab in
+    // order. Separate key events queue behind a paste, so a Ctrl-U sent ahead
+    // of `input text` erases the command it was meant to make room for.
+    fn run_in_tab(&self, tty: &str, command: &str) -> Result<bool> {
+        let mut osa = Command::new("osascript");
+        osa.args([
+            "-e",
+            include_str!("ghostty_run_in_tab.applescript"),
+            tty,
+            &command.replace('\\', "\\\\"),
+        ]);
+        let reply = super::run_capture_timeout(
+            &mut osa,
+            "running a command in a Ghostty tab",
+            Duration::from_secs(2),
+        )?;
+        Ok(reply.trim() == "ran")
+    }
 }
 
 fn parse_tab_positions(reply: &str) -> Vec<((u32, u32), String)> {

@@ -369,3 +369,77 @@ fn a_message_lost_before_claude_saved_it_is_sent_again_once() {
         );
     }
 }
+
+#[test]
+fn a_launcher_resumes_its_tool_in_place_only_after_a_kill_once_it_came_up() {
+    for (signal, registers, relaunched) in [
+        ("KILL", true, true),
+        ("KILL", false, false),
+        ("TERM", true, false),
+        ("HUP", true, false),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        let store = root.join(".config/session-guard/active-sessions.json");
+        fs::create_dir_all(root.join(".config/session-guard")).unwrap();
+        fs::create_dir(root.join("bin")).unwrap();
+        fs::write(
+            &store,
+            json!([{
+                "tool":"claude","session_id":ID,"directory":root,"session_name":null,
+                "registered_at":"2020-01-01T00:00:00Z","state":"recoverable","restore_pending":true,
+                "pid":2_147_483_647,"pid_started_at":STARTED
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let register = if registers {
+            format!(
+                "printf '{{\"session_id\":\"{ID}\",\"hook_event_name\":\"SessionStart\",\
+                 \"cwd\":\"{}\"}}' | '{}' register --tool claude --pid $$\n",
+                root.display(),
+                env!("CARGO_BIN_EXE_session-guard")
+            )
+        } else {
+            String::new()
+        };
+        let executable = root.join("bin/claude");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf 'run\\n'\nif [ -e '{0}/crashed' ]; then exit 17; fi\n\
+                 touch '{0}/crashed'\n{register}kill -{signal} $$\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_session-guard"))
+            .args(["launch", "--session-id", ID])
+            .env("HOME", root)
+            .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
+            .env("SHELL", "/bin/sh")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+        let case = format!("{signal} registers={registers}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).lines().count(),
+            if relaunched { 2 } else { 1 },
+            "{case}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).contains("Resuming it here."),
+            relaunched,
+            "{case}"
+        );
+        if relaunched {
+            assert_eq!(output.status.code(), Some(17), "{case}");
+        }
+        let records: Value = serde_json::from_slice(&fs::read(&store).unwrap()).unwrap();
+        assert_eq!(records[0]["state"], "recoverable", "{case}");
+    }
+}

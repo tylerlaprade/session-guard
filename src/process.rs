@@ -51,6 +51,30 @@ pub fn boot_identifier() -> Option<String> {
     }
 }
 
+/// Whether the kernel reports critical memory pressure, the level at which it
+/// kills processes to reclaim memory.
+#[cfg(target_os = "macos")]
+pub fn memory_pressure_is_critical() -> bool {
+    const CRITICAL: libc::c_int = 4;
+    let mut level: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>();
+    (unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_vm_pressure_level".as_ptr(),
+            (&raw mut level).cast(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    }) == 0
+        && level >= CRITICAL
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn memory_pressure_is_critical() -> bool {
+    false
+}
+
 /// The exact argument vector a process was started with, from the kernel:
 /// `ps` joins arguments with spaces, which cannot be replayed faithfully.
 #[cfg(target_os = "macos")]
@@ -261,6 +285,8 @@ pub struct ProcessSnapshot {
     processes: std::collections::HashMap<i32, (String, String)>,
     /// pid -> controlling terminal device, for processes that have one.
     ttys: std::collections::HashMap<i32, String>,
+    /// Processes in their terminal's foreground process group.
+    foreground: std::collections::HashSet<i32>,
 }
 
 impl ProcessSnapshot {
@@ -278,6 +304,7 @@ impl ProcessSnapshot {
 
         let mut processes = std::collections::HashMap::new();
         let mut ttys = std::collections::HashMap::new();
+        let mut foreground = std::collections::HashSet::new();
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let mut parts = line.split_whitespace();
             let Some(pid) = parts.next().and_then(|pid| pid.parse::<i32>().ok()) else {
@@ -294,6 +321,9 @@ impl ProcessSnapshot {
             if state.starts_with('Z') {
                 continue;
             }
+            if state.contains('+') {
+                foreground.insert(pid);
+            }
             let Some(tty) = parts.next() else {
                 continue;
             };
@@ -304,7 +334,17 @@ impl ProcessSnapshot {
             processes.insert(pid, (start.join(" "), comm));
         }
 
-        Ok(Self { processes, ttys })
+        Ok(Self {
+            processes,
+            ttys,
+            foreground,
+        })
+    }
+
+    /// Whether the process is in its terminal's foreground: for a shell, that
+    /// it sits at its prompt rather than running a command.
+    pub fn in_foreground(&self, pid: i32) -> bool {
+        self.foreground.contains(&pid)
     }
 
     pub fn tty(&self, pid: i32) -> Option<&str> {
