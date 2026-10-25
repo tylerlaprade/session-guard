@@ -3,7 +3,7 @@ use crate::{paths, process, sessions};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Seek};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -189,6 +189,15 @@ fn was_interrupted(record: &SessionRecord) -> bool {
 }
 
 pub fn restore_prompt(record: &SessionRecord) -> Option<String> {
+    if let Some(message) = record
+        .tool
+        .spec()
+        .lost_message
+        .filter(|_| was_interrupted(record))
+        .and_then(|lost| lost(record))
+    {
+        return Some(message);
+    }
     if should_continue(record) {
         return Some("continue".to_string());
     }
@@ -237,6 +246,221 @@ pub fn activity_was_working(record: &SessionRecord) -> bool {
             && Some(activity.owner_pid) == record.pid
             && Some(activity.owner_started_at.as_str()) == record.pid_started_at.as_deref()
     })
+}
+
+pub fn claude_was_working(record: &SessionRecord) -> bool {
+    activity_was_working(record) || claude_owes_a_reply(record)
+}
+
+// Claude saves a message before its turn starts, so a crash inside the
+// daemon's one-second busy sample leaves the message last in the transcript.
+// A resume answers it with a synthetic "No response requested." placeholder,
+// which the model then takes for its own reply.
+fn claude_owes_a_reply(record: &SessionRecord) -> bool {
+    record
+        .transcript_path
+        .as_ref()
+        .and_then(|path| judge_backward(path, claude_reply_verdict))
+        .unwrap_or(false)
+}
+
+/// The first verdict `judge` reaches on a JSON-lines file read from its end,
+/// so a long file costs only the lines after the deciding one.
+fn judge_backward<T>(
+    path: &std::path::Path,
+    judge: impl Fn(&serde_json::Value) -> Option<T>,
+) -> Option<T> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let mut window: u64 = 64 * 1024;
+    loop {
+        let start = length.saturating_sub(window);
+        let mut tail = Vec::new();
+        file.seek(io::SeekFrom::Start(start)).ok()?;
+        file.read_to_end(&mut tail).ok()?;
+        let mut lines = tail.split(|byte| *byte == b'\n').rev().collect::<Vec<_>>();
+        if start > 0 {
+            lines.pop();
+        }
+        for line in lines {
+            // A crash can cut the last line short.
+            let Ok(entry) = serde_json::from_slice::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let Some(verdict) = judge(&entry) {
+                return Some(verdict);
+            }
+        }
+        if start == 0 {
+            return None;
+        }
+        window *= 2;
+    }
+}
+
+// Claude adds a message to its prompt history as it is sent and saves it to
+// the transcript a moment later, so a crash in between leaves it only in the
+// history: a resume has never seen it, and only sending it again recovers it.
+pub fn claude_lost_message(record: &SessionRecord) -> Option<String> {
+    claude_lost_message_in(record, &paths::tool_home(record.tool).ok()?)
+}
+
+fn claude_lost_message_in(record: &SessionRecord, home: &std::path::Path) -> Option<String> {
+    let saved_until = judge_backward(record.transcript_path.as_ref()?, |entry| {
+        chrono::DateTime::parse_from_rfc3339(entry["timestamp"].as_str()?)
+            .ok()
+            .map(|saved| saved.timestamp_millis())
+    })?;
+    let entry = judge_backward(&home.join("history.jsonl"), |entry| {
+        if entry["timestamp"].as_i64()? <= saved_until {
+            return Some(None);
+        }
+        (entry["sessionId"] == record.session_id.as_str()).then(|| Some(entry.clone()))
+    })??;
+    let display = entry["display"].as_str()?;
+    if display.starts_with('/') || display.starts_with('!') {
+        return None;
+    }
+    let pieces = claude_message_pieces(display, &entry["pastedContents"], home);
+    // The transcript saves a message within moments of its history entry but
+    // writes nothing more until the reply starts.
+    let last_message = judge_backward(record.transcript_path.as_ref()?, |entry| {
+        let skipped = entry["isMeta"] == true || entry["isCompactSummary"] == true;
+        (entry["type"] == "user" && !skipped)
+            .then(|| claude_message_text(&entry["message"]["content"]))
+    })?;
+    if last_message.is_some_and(|saved| saved_as(&pieces, &saved)) {
+        return None;
+    }
+    let text: String = pieces
+        .iter()
+        .map(|piece| match piece {
+            MessagePiece::Literal(text)
+            | MessagePiece::Pasted(text)
+            | MessagePiece::Missing(text) => text.as_str(),
+        })
+        .collect();
+    let lead = if display.contains("[Image #") {
+        "A crash cut this message off before it reached you, and its images are lost:"
+    } else {
+        "A crash cut this message off before it reached you:"
+    };
+    Some(format!("{lead}\n\n{text}"))
+}
+
+fn claude_message_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(blocks) => {
+            let texts: Vec<&str> = blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect();
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+/// A history entry's text, split at the paste and image markers that the
+/// transcript expands in place.
+enum MessagePiece {
+    Literal(String),
+    Pasted(String),
+    /// A marker whose content the history does not keep, such as an image.
+    Missing(String),
+}
+
+fn claude_message_pieces(
+    display: &str,
+    pastes: &serde_json::Value,
+    home: &std::path::Path,
+) -> Vec<MessagePiece> {
+    let mut pieces = Vec::new();
+    let mut remaining = display;
+    while let Some((at, end)) = ["[Pasted text #", "[Image #"]
+        .iter()
+        .filter_map(|marker| remaining.find(marker))
+        .min()
+        .and_then(|at| Some((at, at + remaining[at..].find(']')? + 1)))
+    {
+        pieces.push(MessagePiece::Literal(remaining[..at].to_string()));
+        let marker = &remaining[at..end];
+        let paste = marker
+            .strip_prefix("[Pasted text #")
+            .and_then(|rest| {
+                rest.split(|character: char| !character.is_ascii_digit())
+                    .next()
+            })
+            .map(|id| &pastes[id]);
+        let content = paste.and_then(|paste| {
+            paste["content"].as_str().map(str::to_string).or_else(|| {
+                let hash = paste["contentHash"].as_str()?;
+                std::fs::read_to_string(home.join("paste-cache").join(format!("{hash}.txt"))).ok()
+            })
+        });
+        pieces.push(content.map_or_else(
+            || MessagePiece::Missing(marker.to_string()),
+            MessagePiece::Pasted,
+        ));
+        remaining = &remaining[end..];
+    }
+    pieces.push(MessagePiece::Literal(remaining.to_string()));
+    pieces
+}
+
+/// Whether `saved` is the message the pieces describe: its literal text at
+/// both ends, with the pasted text and inner literals in order between.
+fn saved_as(pieces: &[MessagePiece], saved: &str) -> bool {
+    let [
+        MessagePiece::Literal(first),
+        middle @ ..,
+        MessagePiece::Literal(last),
+    ] = pieces
+    else {
+        return matches!(pieces, [MessagePiece::Literal(only)] if saved == only);
+    };
+    let Some(mut rest) = saved.strip_prefix(first.as_str()) else {
+        return false;
+    };
+    for piece in middle {
+        let (MessagePiece::Literal(text) | MessagePiece::Pasted(text)) = piece else {
+            continue;
+        };
+        let Some(at) = rest.find(text.as_str()) else {
+            return false;
+        };
+        rest = &rest[at + text.len()..];
+    }
+    rest.ends_with(last.as_str())
+}
+
+fn claude_reply_verdict(entry: &serde_json::Value) -> Option<bool> {
+    if entry["isMeta"] == true || entry["isCompactSummary"] == true || entry["isSidechain"] == true
+    {
+        return None;
+    }
+    match entry["type"].as_str() {
+        Some("user") => Some(claude_message_wants_reply(&entry["message"]["content"])),
+        Some("assistant")
+            if entry["message"]["model"] != "<synthetic>" || entry["isApiErrorMessage"] == true =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn claude_message_wants_reply(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::String(text) => !text.starts_with("<local-command-"),
+        serde_json::Value::Array(blocks) => !blocks.iter().any(|block| {
+            block["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("[Request interrupted by user"))
+        }),
+        _ => false,
+    }
 }
 
 /// Claude deletes its status file as it exits, before its `SessionEnd` hook
@@ -448,6 +672,119 @@ mod tests {
         idle["status"] = json!("idle");
         record.activity = claude_native_activity(&record, &idle);
         assert!(!should_continue(&record));
+    }
+
+    #[test]
+    fn a_claude_message_left_without_a_reply_continues_unsampled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut record = record("claude");
+        record.activity = None;
+        record.transcript_path = Some(path.clone());
+        let prompt = json!({"type":"user","message":{"role":"user","content":"Name a fish."}});
+        let reply = json!({"type":"assistant","message":{"model":"claude-opus-5-5",
+            "content":[{"type":"text","text":"Marlin."}]}});
+        let placeholder = json!({"type":"assistant","isApiErrorMessage":false,"message":{
+            "model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}});
+        let api_error = json!({"type":"assistant","isApiErrorMessage":true,"message":{
+            "model":"<synthetic>","content":[{"type":"text","text":"API Error"}]}});
+        let tool_result = json!({"type":"user","message":{"role":"user",
+            "content":[{"type":"tool_result","tool_use_id":"tool","content":"done"}]}});
+        let interrupted = json!({"type":"user","message":{"role":"user",
+            "content":[{"type":"text","text":"[Request interrupted by user]"}]}});
+        let command = json!({"type":"user","message":{"role":"user",
+            "content":"<command-name>/model</command-name>"}});
+        let command_output = json!({"type":"user","message":{"role":"user",
+            "content":"<local-command-stdout>Set model</local-command-stdout>"}});
+        let meta =
+            json!({"type":"user","isMeta":true,"message":{"role":"user","content":"Caveat"}});
+        let turn_end = json!({"type":"system","subtype":"turn_duration"});
+        let large = json!({"type":"attachment","content":"x".repeat(300 * 1024)});
+        let owed = |record: &SessionRecord, entries: &[&serde_json::Value], tail: &str| {
+            let mut lines: Vec<String> = entries.iter().map(ToString::to_string).collect();
+            lines.push(tail.to_string());
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            should_continue(record)
+        };
+        assert!(!owed(&record, &[&prompt, &reply, &turn_end], ""));
+        assert!(owed(&record, &[&prompt, &reply, &prompt], ""));
+        assert!(owed(&record, &[&prompt, &placeholder, &meta], ""));
+        assert!(owed(&record, &[&prompt], r#"{"type":"assistant","mess"#));
+        assert!(owed(&record, &[&prompt, &reply, &tool_result], ""));
+        assert!(owed(&record, &[&reply, &prompt, &large, &large], ""));
+        assert!(!owed(&record, &[&prompt, &reply, &large, &large], ""));
+        assert!(!owed(&record, &[&prompt, &api_error], ""));
+        assert!(!owed(&record, &[&prompt, &interrupted], ""));
+        assert!(!owed(&record, &[&command, &command_output], ""));
+        record.restore_pending = false;
+        assert!(!owed(&record, &[&prompt], ""));
+    }
+
+    #[test]
+    fn only_a_message_sent_after_the_transcript_last_saved_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        let mut record = record("claude");
+        record.transcript_path = Some(transcript.clone());
+        let saved = 1_577_836_805_000_i64;
+        let lost = |display: &str, pastes: serde_json::Value, sent: i64, last_saved: &str| {
+            let mut lines = vec![json!({"type":"user","timestamp":"2020-01-01T00:00:00.000Z",
+                "message":{"role":"user","content":last_saved}})];
+            lines.push(json!({"type":"assistant","timestamp":"2020-01-01T00:00:05.000Z"}));
+            std::fs::write(&transcript, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+            std::fs::write(
+                dir.path().join("history.jsonl"),
+                format!(
+                    "{}\n",
+                    json!({"display":display,"pastedContents":pastes,"sessionId":"session",
+                        "timestamp":sent})
+                ),
+            )
+            .unwrap();
+            claude_lost_message_in(&record, dir.path())
+        };
+        let lead = "A crash cut this message off before it reached you:";
+        assert_eq!(
+            lost("ok", json!({}), saved + 1, "is it ok?").as_deref(),
+            Some(format!("{lead}\n\nok").as_str())
+        );
+        assert_eq!(lost("ok", json!({}), saved + 1, "ok"), None);
+        assert_eq!(lost("ok", json!({}), saved, "something else"), None);
+        let paste = json!({"1":{"id":1,"type":"text","content":"the log"}});
+        let wrapped =
+            "Read \n\n<pasted_content id=\"d4a6\">\nthe log\n</pasted_content id=\"d4a6\">\n now";
+        assert_eq!(
+            lost(
+                "Read [Pasted text #1 +2 lines] now",
+                paste.clone(),
+                saved + 1,
+                wrapped
+            ),
+            None
+        );
+        assert_eq!(
+            lost(
+                "Read [Pasted text #1 +2 lines] now",
+                paste.clone(),
+                saved + 1,
+                "Read now"
+            )
+            .as_deref(),
+            Some(format!("{lead}\n\nRead the log now").as_str())
+        );
+        assert_eq!(
+            lost("[Pasted text #1 +2 lines]", paste, saved + 1, "unrelated").as_deref(),
+            Some(format!("{lead}\n\nthe log").as_str())
+        );
+        assert_eq!(
+            lost("What is [Image #1]?", json!({}), saved + 1, "unrelated").as_deref(),
+            Some(
+                "A crash cut this message off before it reached you, and its images are \
+                 lost:\n\nWhat is [Image #1]?"
+            )
+        );
+        assert_eq!(lost("/model", json!({}), saved + 1, "unrelated"), None);
+        assert_eq!(lost("!git status", json!({}), saved + 1, "unrelated"), None);
     }
 
     #[test]

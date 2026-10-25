@@ -281,6 +281,9 @@ pub struct Harness {
     /// harness whose state is gone once its process exits.
     pub observe_activity:
         Option<fn(&crate::sessions::SessionRecord) -> Option<crate::continuation::Activity>>,
+    /// Rebuilds a message the user sent that never reached the transcript, so
+    /// the restore can send it again.
+    pub lost_message: Option<fn(&crate::sessions::SessionRecord) -> Option<String>>,
     /// Wire name: the `--tool` value, and how sessions are stored on disk.
     pub id: &'static str,
     /// Name for human-facing output.
@@ -311,8 +314,9 @@ pub static HARNESSES: &[Harness] = &[
     Harness {
         id: "claude",
         activity_hooks: &[],
-        was_working: Some(crate::continuation::activity_was_working),
+        was_working: Some(crate::continuation::claude_was_working),
         observe_activity: Some(crate::continuation::claude_activity),
+        lost_message: Some(crate::continuation::claude_lost_message),
         display_name: "Claude Code",
         binary: "claude",
         home: ToolPath {
@@ -348,6 +352,7 @@ pub static HARNESSES: &[Harness] = &[
         activity_hooks: CODEX_ACTIVITY_HOOKS,
         was_working: Some(crate::continuation::codex_was_working),
         observe_activity: None,
+        lost_message: None,
         display_name: "Codex",
         binary: "codex",
         home: ToolPath {
@@ -395,6 +400,7 @@ pub static HARNESSES: &[Harness] = &[
         activity_hooks: GROK_ACTIVITY_HOOKS,
         was_working: Some(crate::continuation::activity_was_working),
         observe_activity: None,
+        lost_message: None,
         display_name: "Grok",
         binary: "grok",
         home: ToolPath {
@@ -432,6 +438,7 @@ pub static HARNESSES: &[Harness] = &[
         activity_hooks: &[],
         was_working: None,
         observe_activity: None,
+        lost_message: None,
         display_name: "OpenCode",
         binary: "opencode",
         // OpenCode splits config (~/.config/opencode) from state; the state
@@ -486,6 +493,7 @@ pub static EDITOR: Harness = Harness {
     activity_hooks: &[],
     was_working: None,
     observe_activity: None,
+    lost_message: None,
     display_name: "editor",
     binary: "hx",
     home: ToolPath {

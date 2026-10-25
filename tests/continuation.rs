@@ -278,3 +278,94 @@ fn registration_without_a_shell_pid_takes_the_owning_shell_from_the_tool_process
     assert_eq!(register(typed.id()), json!(std::process::id()));
     stop(typed);
 }
+
+#[test]
+fn a_message_lost_before_claude_saved_it_is_sent_again_once() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let store = root.join(".config/session-guard/active-sessions.json");
+    let claude_home = root.join(".claude");
+    fs::create_dir_all(root.join(".config/session-guard")).unwrap();
+    fs::create_dir_all(claude_home.join("paste-cache")).unwrap();
+    fs::create_dir(root.join("bin")).unwrap();
+    let transcript = root.join("transcript.jsonl");
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n{}\n",
+            json!({"type":"user","timestamp":"2020-01-01T00:00:00.000Z",
+                "message":{"role":"user","content":"Name a bird."}}),
+            json!({"type":"assistant","timestamp":"2020-01-01T00:00:05.000Z",
+                "message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"Heron."}]}})
+        ),
+    )
+    .unwrap();
+    fs::write(
+        claude_home.join("paste-cache/0123abcd.txt"),
+        "the pasted log",
+    )
+    .unwrap();
+    let saved = 1_577_836_805_000_i64;
+    fs::write(
+        claude_home.join("history.jsonl"),
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"display":"Name a bird.","pastedContents":{},"sessionId":ID,
+                "timestamp":saved - 5_000}),
+            json!({"display":"Read this: [Pasted text #1 +3 lines] and fix it.",
+                "pastedContents":{"1":{"id":1,"type":"text","contentHash":"0123abcd"}},
+                "sessionId":ID,"timestamp":saved + 1}),
+            json!({"display":"Another session's message.","pastedContents":{},
+                "sessionId":"other-session","timestamp":saved + 2})
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &store,
+        json!([{
+            "tool":"claude","session_id":ID,"directory":root,"session_name":null,
+            "registered_at":"2020-01-01T00:00:00Z","state":"recoverable","restore_pending":true,
+            "pid":2_147_483_647,"pid_started_at":STARTED,"transcript_path":transcript
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let executable = root.join("bin/claude");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf '{{\"type\":\"user\",\"timestamp\":\"%s\"}}\\n' \
+             \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\" >> '{}'\nexit 17\n",
+            transcript.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    for attempt in 0..2 {
+        let output = Command::new(env!("CARGO_BIN_EXE_session-guard"))
+            .args(["launch", "--session-id", ID])
+            .env("HOME", root)
+            .env("CLAUDE_CONFIG_DIR", &claude_home)
+            .env("SHELL", "/bin/sh")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        let expected = if attempt == 0 {
+            format!(
+                "--resume\n{ID}\nA crash cut this message off before it reached you:\n\n\
+                 Read this: the pasted log and fix it.\n"
+            )
+        } else {
+            format!("--resume\n{ID}\n")
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "attempt {attempt}"
+        );
+    }
+}

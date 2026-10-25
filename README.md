@@ -290,6 +290,29 @@ interrupted owner, the frontend must be an interactive CLI, and the status must
 be `busy` without a waiting reason. A missing, unreadable, or unfamiliar native
 record reads as idle, so it means no continuation.
 
+A crash between two samples can still leave a message unanswered. Claude saves
+a message to its transcript before its turn starts, and on resume it answers a
+message that has no reply with a synthetic "No response requested." placeholder,
+which the model then reads as its own answer. The restore therefore also
+continues a Claude session whose transcript ends in a user record: a message,
+task notification, or tool result, with meta and compaction records and that
+placeholder skipped. An Esc interrupt or a local command's output ends a turn,
+so it means no continuation. The restore reads the transcript backward from its
+end, so a long transcript costs only its last records.
+
+A crash can also come after Claude adds a message to its prompt history,
+`~/.claude/history.jsonl`, and before it saves the message to the transcript.
+The resumed session has then never seen the message. When the session's latest
+history entry is newer than the transcript's last record, and the transcript's
+last message is not that entry's text (the transcript saves a message within
+moments of its entry, then nothing until the reply starts), the restore sends
+that message again as its prompt, rebuilt with its pasted text from the entry or
+`paste-cache`, and says that a crash cut it off. Images are not kept in the
+history, so the resend says they are lost. Slash commands and `!` shell
+commands are not sent again. Once the resumed session saves the resent message,
+the transcript is newer than the entry, so a later restore does not send it
+again.
+
 Codex and Grok use observation-only lifecycle hooks, keyed by turn ID and exact
 process owner. A prompt submission starts as unknown because another hook can
 reject it. An observed tool start/completion pair confirms work; outstanding
