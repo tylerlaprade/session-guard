@@ -299,9 +299,23 @@ it knows. A pass that cannot know, because the watcher is not running, holds as
 well and says why.
 
 AppKit logs nothing for a terminal that launches unlocked, and logs `engaged`
-about a second and a half after launch for one that launches locked out. A
-terminal launched after the daemon started counts as unlocked until it logs, so
-that first moment after a launch is not covered.
+about a second and a half after launch for one that launches locked out. To
+know a launch was not locked out, the daemon also follows Screen Time's lockout
+agent, which asks for each launched app's policy and logs any lockout inside
+the answer that decides it. The agent redacts the app's name unless
+`profiles/lockout-agent-names.mobileconfig` is installed, which makes its lines
+name the app for the `com.apple.LockoutAgent` subsystem only. With the profile,
+a terminal launched after the daemon started is undecided until the agent has
+answered for it: `session-guard lockout` answers 2, `--wait` waits, and a
+restore that has to launch the terminal launches it with no tab and opens tabs
+once the answer is in. Without the profile, a just-launched terminal counts as
+unlocked until it logs, so a tab opened in its first second and a half is not
+covered.
+
+To install the profile, open it (`open profiles/lockout-agent-names.mobileconfig`),
+then approve it in System Settings under General → Device Management. The
+daemon notices on the next app launch; lines the agent logged before the
+profile stay redacted.
 
 A Claude session needs no tab to keep working, so a pass that finds the
 terminal locked out resumes it at once with `claude --bg --resume`, sending the

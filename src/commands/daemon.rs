@@ -598,10 +598,31 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
     let mut to_open = to_open.into_iter();
     while let Some(session) = to_open.next() {
         let kind = configured_terminal()?;
-        let lockout = lockout::lockout(kind);
+        let adapter = adapter.get_or_insert_with(|| adapter_for(kind));
+        // A terminal launched together with its first tab gives Screen Time no
+        // moment to lock it out before the tab; launch it alone and wait for
+        // the answer.
+        let lockout = if adapter.is_running() {
+            lockout::lockout(kind)
+        } else if let Err(error) = adapter.launch() {
+            for session in std::iter::once(session).chain(to_open) {
+                summary.failed += 1;
+                summary.errors.push(format!(
+                    "failed to restore {}: could not launch {kind}: {error:#}",
+                    session.session_id
+                ));
+            }
+            break;
+        } else {
+            log_line(&format!("launched {kind} for a restore"))?;
+            Lockout::Deciding
+        };
         let held_reason = match &lockout {
             Lockout::Clear => None,
             Lockout::Engaged => Some(format!("{kind} is locked out by Screen Time")),
+            Lockout::Deciding => Some(format!(
+                "Screen Time has not answered for {kind}'s launch yet"
+            )),
             Lockout::Reading => Some(format!(
                 "the lockout watcher is still reading {kind}'s state from the log"
             )),
@@ -644,7 +665,6 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
             summary.held_lockout = Some(lockout);
             break;
         }
-        let adapter = adapter.get_or_insert_with(|| adapter_for(kind));
         attempted.push(session.session_id.clone());
 
         match adapter

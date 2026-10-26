@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadDisplayName</key>
+			<string>Screen Time lockout agent: app names</string>
+			<key>PayloadIdentifier</key>
+			<string>com.tylerlaprade.session-guard.lockout-agent-names.logging</string>
+			<key>PayloadType</key>
+			<string>com.apple.system.logging</string>
+			<key>PayloadUUID</key>
+			<string>058C5EBF-2E9C-472B-BC6B-4ECE6F39A12E</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>Subsystems</key>
+			<dict>
+				<key>com.apple.LockoutAgent</key>
+				<dict>
+					<key>DEFAULT-OPTIONS</key>
+					<dict>
+						<key>Enable-Private-Data</key>
+						<true/>
+					</dict>
+				</dict>
+			</dict>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>Lets the unified log show which app Screen Time's lockout agent is deciding about, for the com.apple.LockoutAgent subsystem only, so session-guard can tell when a terminal it just launched is not locked out.</string>
+	<key>PayloadDisplayName</key>
+	<string>session-guard: Screen Time lockout names</string>
+	<key>PayloadIdentifier</key>
+	<string>com.tylerlaprade.session-guard.lockout-agent-names</string>
+	<key>PayloadScope</key>
+	<string>System</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>F6384BC1-4178-48DD-A5EB-84B85511C637</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>

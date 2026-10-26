@@ -145,6 +145,19 @@ impl TerminalKind {
         }
     }
 
+    /// The app's bundle identifier, as Screen Time names it.
+    #[must_use]
+    pub fn bundle_id(self) -> &'static str {
+        match self {
+            Self::Ghostty => "com.mitchellh.ghostty",
+            Self::Iterm2 => "com.googlecode.iterm2",
+            Self::Terminal => "com.apple.Terminal",
+            Self::Kitty => "net.kovidgoyal.kitty",
+            Self::Wezterm => "com.github.wez.wezterm",
+            Self::Alacritty => "org.alacritty",
+        }
+    }
+
     /// Executable name as `ps -o comm=` reports it, lowercased.
     #[must_use]
     pub fn process_name(self) -> &'static str {

@@ -26,9 +26,35 @@ echo "{\"processID\":$TERMINAL_PID,\"eventMessage\":\"LockoutUI changed state: d
 exec sleep 600
 "#;
 
-// Stands in for `alacritty --working-directory DIR -e sh -lc COMMAND`.
+// Stands in for `log` when the test supplies the lockout agent's lines: each
+// file dropped in `emit/` is delivered once, in name order. The stored log
+// shows the agent naming apps, as it does once its logging profile is in.
+const CUED_LOG: &str = r#"#!/bin/sh
+if [ "$1" = show ]; then
+    echo '{"eventMessage":"Requesting policy for bundle IDs: com.apple.calculator","processID":762}'
+    echo '{"count":1,"finished":1}'
+    exit 0
+fi
+echo $$ > "$HOME/stream.pid"
+echo 'Filtering the log data using "stand-in"'
+mkdir -p "$HOME/emit"
+while :; do
+    for line in "$HOME"/emit/*; do
+        [ -e "$line" ] || continue
+        cat "$line"
+        rm -f "$line"
+    done
+    sleep 0.05
+done
+"#;
+
+// Stands in for `alacritty`: with no arguments it launches the terminal, and
+// `alacritty --working-directory DIR -e sh -lc COMMAND` opens a window.
 const OPEN_WINDOW: &str = r#"#!/usr/bin/env python3
 import os, pathlib, subprocess, sys
+if len(sys.argv) == 1:
+    pathlib.Path(os.environ["HOME"], "terminal.pid").write_text(str(os.getpid()))
+    os.execv(os.environ["STAND_IN"], [os.environ["STAND_IN"]])
 child = subprocess.Popen(sys.argv[4:], cwd=sys.argv[2], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
@@ -69,7 +95,7 @@ static ONE_TERMINAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Fixture {
     home: tempfile::TempDir,
-    terminal: Child,
+    terminal: Option<Child>,
     daemon: Option<Child>,
     _one_terminal: std::sync::MutexGuard<'static, ()>,
 }
@@ -80,9 +106,15 @@ impl Drop for Fixture {
             let _ = daemon.kill();
             let _ = daemon.wait();
         }
-        let _ = self.terminal.kill();
-        let _ = self.terminal.wait();
-        for (file, group) in [("launcher.pid", true), ("stream.pid", false)] {
+        if let Some(terminal) = self.terminal.as_mut() {
+            let _ = terminal.kill();
+            let _ = terminal.wait();
+        }
+        for (file, group) in [
+            ("launcher.pid", true),
+            ("stream.pid", false),
+            ("terminal.pid", false),
+        ] {
             if let Some(pid) = self.pid_in(file) {
                 unsafe {
                     libc::kill(if group { -pid } else { pid }, libc::SIGKILL);
@@ -103,6 +135,15 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new(tool: &str) -> Self {
+        Self::build(tool, LOG, true)
+    }
+
+    /// No terminal is running, so the daemon launches one for its restore.
+    fn launching(tool: &str) -> Self {
+        Self::build(tool, CUED_LOG, false)
+    }
+
+    fn build(tool: &str, log: &str, terminal_running: bool) -> Self {
         let one_terminal = ONE_TERMINAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -113,7 +154,7 @@ impl Fixture {
         fs::create_dir_all(&config).unwrap();
         fs::create_dir(&bin).unwrap();
         for (name, contents) in [
-            ("log", LOG),
+            ("log", log),
             ("alacritty", OPEN_WINDOW),
             ("claude", CLAUDE),
             ("codex", "#!/bin/sh\nexec sleep 30\n"),
@@ -121,7 +162,8 @@ impl Fixture {
             fs::write(bin.join(name), contents).unwrap();
             fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let terminal = Command::new(stand_in_terminal_path()).spawn().unwrap();
+        let terminal =
+            terminal_running.then(|| Command::new(stand_in_terminal_path()).spawn().unwrap());
 
         let idle_since = Utc::now() - Age::days(1);
         fs::write(config.join("terminal"), "alacritty\n").unwrap();
@@ -164,7 +206,8 @@ impl Fixture {
             .env("CODEX_HOME", root.join(".codex"))
             .env("SHELL", "/bin/sh")
             .env("TEST_BINARY", env!("CARGO_BIN_EXE_session-guard"))
-            .env("TERMINAL_PID", self.terminal.id().to_string())
+            .env("TERMINAL_PID", self.terminal_pid().to_string())
+            .env("STAND_IN", stand_in_terminal_path())
             .env(
                 "PATH",
                 format!(
@@ -174,6 +217,23 @@ impl Fixture {
             )
             .stdin(Stdio::null());
         command
+    }
+
+    fn terminal_pid(&self) -> i32 {
+        self.terminal.as_ref().map_or_else(
+            || self.pid_in("terminal.pid").unwrap_or_default(),
+            |terminal| i32::try_from(terminal.id()).unwrap(),
+        )
+    }
+
+    /// Has the cued `log` stand-in deliver `line`, after anything named before
+    /// `name`.
+    fn emit(&self, name: &str, line: &Value) {
+        let cues = self.root().join("emit");
+        fs::create_dir_all(&cues).unwrap();
+        let staged = cues.join(format!(".{name}"));
+        fs::write(&staged, format!("{line}\n")).unwrap();
+        fs::rename(staged, cues.join(name)).unwrap();
     }
 
     fn lockout(&self) -> Output {
@@ -411,5 +471,85 @@ fn a_failed_background_start_keeps_the_work_it_would_have_resumed() {
     assert_eq!(record["background_tasks"][0]["id"], "t1", "{record}");
     assert_eq!(record["restore_pending"], true);
     assert_eq!(record["attach_after_lockout"], false);
+    fixture.stop_daemon();
+}
+
+fn agent_line(message: &str) -> Value {
+    json!({"eventMessage": message, "processID": 762})
+}
+
+#[test]
+fn a_launched_terminal_gets_no_tab_until_screen_time_answers_for_it() {
+    let mut fixture = Fixture::launching("codex");
+    fixture.start_daemon();
+    fixture.wait_for("the launch", || {
+        fixture
+            .daemon_log()
+            .contains("launched alacritty for a restore")
+    });
+    fixture.wait_for("the launched terminal", || {
+        fixture.pid_in("terminal.pid").is_some_and(alive)
+    });
+    fixture.wait_for("the answer to be awaited", || {
+        String::from_utf8_lossy(&fixture.lockout().stderr).contains("has not answered")
+    });
+    thread::sleep(Duration::from_millis(1500));
+    assert!(!fixture.root().join("launcher.pid").exists());
+    assert!(
+        fixture
+            .daemon_log()
+            .contains("Held 1 sessions: Screen Time has not answered for alacritty's launch yet.")
+    );
+
+    fixture.emit(
+        "1",
+        &agent_line("Requesting policy for bundle IDs: org.alacritty"),
+    );
+    fixture.emit(
+        "2",
+        &agent_line("Successfully requested policies for 1 bundleIdentifiers"),
+    );
+    fixture.wait_for("the held restore", || {
+        fixture
+            .daemon_log()
+            .contains("held restore: Restored 1 sessions")
+    });
+    assert_eq!(fixture.lockout().status.code(), Some(0));
+    fixture.stop_daemon();
+}
+
+#[test]
+fn a_terminal_locked_out_at_launch_gets_no_tab_until_the_lockout_lifts() {
+    let mut fixture = Fixture::launching("codex");
+    fixture.start_daemon();
+    fixture.wait_for("the launched terminal", || {
+        fixture.pid_in("terminal.pid").is_some_and(alive)
+    });
+    fixture.emit(
+        "1",
+        &agent_line("Requesting policy for bundle IDs: org.alacritty"),
+    );
+    fixture.emit(
+        "2",
+        &agent_line("Successfully requested policies for 1 bundleIdentifiers"),
+    );
+    fixture.emit("3", &agent_line("Begin lockout on app: org.alacritty"));
+    fixture.wait_for("the lockout to be known", || {
+        fixture.lockout().status.code() == Some(1)
+    });
+    thread::sleep(Duration::from_millis(1500));
+    assert!(!fixture.root().join("launcher.pid").exists());
+    assert!(!fixture.daemon_log().contains("Restored 1"));
+
+    let disengaged = json!({
+        "eventMessage": "LockoutUI changed state: disengaged",
+        "processID": fixture.terminal_pid(),
+    });
+    fixture.emit("4", &disengaged);
+    fixture.wait_for("the held restore", || {
+        fixture
+            .daemon_log()
+            .contains("held restore: Restored 1 sessions")
+    });
     fixture.stop_daemon();
 }
