@@ -40,6 +40,9 @@ pathlib.Path(os.environ["HOME"], "launcher.pid").write_text(str(child.pid))
 // is recorded and then waits like an interactive session.
 const CLAUDE: &str = r#"#!/bin/sh
 echo "$*" >> "$HOME/claude.args"
+if [ "$1" = --bg ] && [ -e "$HOME/background-fails" ]; then
+    exit 1
+fi
 if [ "$1" = --bg ]; then
     sleep 60 </dev/null >/dev/null 2>&1 &
     echo $! >> "$HOME/background.pids"
@@ -383,4 +386,30 @@ fn attach_after_lockout_refuses_a_tool_without_a_background_mode() {
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("has no background mode"));
     assert_eq!(fixture.record()["attach_after_lockout"], Value::Null);
+}
+
+#[test]
+fn a_failed_background_start_keeps_the_work_it_would_have_resumed() {
+    let mut fixture = Fixture::new("claude");
+    let registry = fixture
+        .root()
+        .join(".config/session-guard/active-sessions.json");
+    let mut records: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+    records[0]["background_tasks"] =
+        json!([{"id": "t1", "type": "local_bash", "description": "build"}]);
+    fs::write(&registry, records.to_string()).unwrap();
+    fs::write(fixture.root().join("background-fails"), "").unwrap();
+
+    fixture.start_daemon();
+    fixture.wait_for("the failed background start", || {
+        fixture.daemon_log().contains("failed to resume")
+    });
+    fixture.wait_for("the session to be held", || {
+        fixture.record()["held_for_lockout"] == true
+    });
+    let record = fixture.record();
+    assert_eq!(record["background_tasks"][0]["id"], "t1", "{record}");
+    assert_eq!(record["restore_pending"], true);
+    assert_eq!(record["attach_after_lockout"], false);
+    fixture.stop_daemon();
 }

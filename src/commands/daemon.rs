@@ -673,7 +673,9 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
 }
 
 // The session runs at once with no tab; `attach_backgrounded` gives it one when
-// the lockout lifts. Taking the prompt marks it sent, as a launch does.
+// the lockout lifts. The prompt is taken, marking it sent as a launch does,
+// only once the background session is up, so a failed start keeps it for the
+// next restore.
 fn start_in_background(
     path: &std::path::Path,
     session: &SessionRecord,
@@ -686,7 +688,7 @@ fn start_in_background(
             .context("the session left the registry before it could resume")?;
         record.held_for_lockout = false;
         record.attach_after_lockout = true;
-        Ok(crate::continuation::take_restore_prompt(record))
+        Ok(crate::continuation::restore_prompt(record))
     })?;
     let mut command = background
         .resume
@@ -706,18 +708,19 @@ fn start_in_background(
         BACKGROUND_START_TIMEOUT,
     )
     .and_then(|_| wait_for_restore_owner(path, &session.session_id));
-    if started.is_err() {
-        sessions::with_sessions_mut(path, |sessions| {
-            if let Some(record) = sessions
-                .iter_mut()
-                .find(|record| record.session_id == session.session_id)
-            {
+    sessions::with_sessions_mut(path, |sessions| {
+        if let Some(record) = sessions
+            .iter_mut()
+            .find(|record| record.session_id == session.session_id)
+        {
+            if started.is_ok() {
+                crate::continuation::take_restore_prompt(record);
+            } else {
                 record.attach_after_lockout = false;
-                record.mark_recoverable();
             }
-            Ok(())
-        })?;
-    }
+        }
+        Ok(())
+    })?;
     started
 }
 
