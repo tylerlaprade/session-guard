@@ -32,8 +32,9 @@ const REDACTED: &str = "<private>";
 // lockout agent names apps; it logs at every app launch, so the last hour of
 // its lines says.
 const AGENT_NAMES_LOOKBACK: chrono::TimeDelta = chrono::TimeDelta::hours(1);
-// The lockout agent logs a lockout in the same millisecond as the answer that
-// decided it; this is how long the stream gets to deliver that line.
+// The lockout agent logs each lockout right after the answer that decided it,
+// on the same thread: nine locked apps took about 10 ms at a Downtime start.
+// This is how long the stream gets to deliver those lines.
 const BEGIN_GRACE: Duration = Duration::from_millis(250);
 const WAIT_INTERVAL: Duration = Duration::from_millis(500);
 // A stream can die a moment before its follower sees the end of it, so a
