@@ -330,6 +330,13 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn held_lockout(summary: &RestoreSummary) -> Option<Lockout> {
+    summary
+        .held_lockout
+        .clone()
+        .filter(|_| !summary.held.is_empty())
+}
+
 fn start_lockout_watcher() -> Option<lockout::Watcher> {
     let terminal = configured_terminal().ok()?;
     lockout::Watcher::start(terminal)
