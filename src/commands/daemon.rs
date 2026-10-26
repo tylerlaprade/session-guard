@@ -40,6 +40,10 @@ pub struct RestoreSummary {
     /// Sessions left unopened because the terminal could not take a tab yet.
     pub held: Vec<SessionRecord>,
     pub held_reason: Option<String>,
+    /// Sessions resumed in the background instead, to get a tab later.
+    pub backgrounded: usize,
+    /// The terminal's lockout state when the pass held its sessions.
+    pub held_lockout: Option<Lockout>,
 }
 
 impl RestoreSummary {
@@ -116,6 +120,14 @@ impl RestoreSummary {
         if self.restored_total() > 0 && !self.held.is_empty() {
             let _ = write!(message, " {held}");
         }
+        if self.backgrounded > 0 {
+            let _ = write!(
+                message,
+                " Resumed {} in the background: {}.",
+                self.backgrounded,
+                self.held_reason.as_deref().unwrap_or_default()
+            );
+        }
         message
     }
 }
@@ -168,7 +180,7 @@ pub fn run() -> Result<()> {
     for error in &summary.errors {
         log_line(error)?;
     }
-    let mut holding = !summary.held.is_empty();
+    let mut held_under = held_lockout(&summary);
 
     let added = reconcile_from_scan()?;
     if added > 0 {
@@ -192,7 +204,7 @@ pub fn run() -> Result<()> {
             for error in &summary.errors {
                 log_line(error)?;
             }
-            holding |= !summary.held.is_empty();
+            held_under = held_lockout(&summary).or(held_under);
         }
         if restore_all_requested.swap(false, Ordering::Relaxed) {
             let summary = restore_once(RestoreMode::All)?;
@@ -200,18 +212,23 @@ pub fn run() -> Result<()> {
             for error in &summary.errors {
                 log_line(error)?;
             }
-            holding |= !summary.held.is_empty();
+            held_under = held_lockout(&summary).or(held_under);
         }
-        if holding
-            && configured_terminal()
-                .is_ok_and(|terminal| lockout::lockout(terminal) == Lockout::Clear)
+        // A pass held while the state was unknown reruns once the terminal is
+        // known to be locked out, so its Claude sessions resume in the
+        // background, and again once the lockout lifts.
+        if let Some(seen) = &held_under
+            && let Ok(terminal) = configured_terminal()
         {
-            let summary = restore_once(RestoreMode::Held)?;
-            log_line(&format!("held restore: {}", summary.message()))?;
-            for error in &summary.errors {
-                log_line(error)?;
+            let now = lockout::lockout(terminal);
+            if now == Lockout::Clear || (now == Lockout::Engaged && *seen != Lockout::Engaged) {
+                let summary = restore_once(RestoreMode::Held)?;
+                log_line(&format!("held restore: {}", summary.message()))?;
+                for error in &summary.errors {
+                    log_line(error)?;
+                }
+                held_under = held_lockout(&summary);
             }
-            holding = !summary.held.is_empty();
         }
 
         seconds_until_settle -= 1;
@@ -237,6 +254,7 @@ pub fn run() -> Result<()> {
                         "released {released} sessions that ended under a running terminal"
                     ))?;
                 }
+                attach_backgrounded(&processes)?;
                 let summary = settle_endings(&processes)?;
                 if summary.retired > 0 || summary.marked_recoverable > 0 {
                     log_line(&format!(
@@ -253,7 +271,7 @@ pub fn run() -> Result<()> {
                 for error in &summary.errors {
                     log_line(error)?;
                 }
-                holding |= !summary.held.is_empty();
+                held_under = held_lockout(&summary).or(held_under);
             }
             if tab_offered {
                 crate::fresh_tab::decline()?;
@@ -396,6 +414,8 @@ pub fn reconcile_from_scan() -> Result<usize> {
 }
 
 const RESTORE_RECEIPT_TIMEOUT: Duration = Duration::from_secs(15);
+// `claude --bg` starts its background service on first use.
+const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(60);
 // A terminal quitting gracefully closes tabs one by one and can still be
 // running when a tab's SessionEnd fires; a crashed one is gone before the hooks
 // run and may already be back (2026-09-03: Ghostty died at :51, the hooks
@@ -548,7 +568,8 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
     let mut to_open = to_open.into_iter();
     while let Some(session) = to_open.next() {
         let kind = configured_terminal()?;
-        let held_reason = match lockout::lockout(kind) {
+        let lockout = lockout::lockout(kind);
+        let held_reason = match &lockout {
             Lockout::Clear => None,
             Lockout::Engaged => Some(format!("{kind} is locked out by Screen Time")),
             Lockout::Reading => Some(format!(
@@ -559,9 +580,38 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
             )),
         };
         if let Some(reason) = held_reason {
-            summary.held.push(session);
-            summary.held.extend(to_open);
+            for session in std::iter::once(session).chain(to_open) {
+                // Only a lockout is worth a detour through the background; a
+                // state still being read or unknown is held as it is.
+                let Some(background) = session
+                    .tool
+                    .spec()
+                    .background
+                    .as_ref()
+                    .filter(|_| lockout == Lockout::Engaged)
+                else {
+                    summary.held.push(session);
+                    continue;
+                };
+                match start_in_background(&path, &session, background) {
+                    Ok(()) => {
+                        log_line(&format!(
+                            "resumed in the background until the terminal can take a tab: {} {}",
+                            session.tool, session.session_id
+                        ))?;
+                        summary.backgrounded += 1;
+                    }
+                    Err(error) => {
+                        summary.errors.push(format!(
+                            "failed to resume {} in the background: {error:#}",
+                            session.session_id
+                        ));
+                        summary.held.push(session);
+                    }
+                }
+            }
             summary.held_reason = Some(reason);
+            summary.held_lockout = Some(lockout);
             break;
         }
         let adapter = adapter.get_or_insert_with(|| adapter_for(kind));
@@ -590,6 +640,115 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
     }
 
     record_holds(&path, &attempted, &summary.held)
+}
+
+// The session runs at once with no tab; `attach_backgrounded` gives it one when
+// the lockout lifts. Taking the prompt marks it sent, as a launch does.
+fn start_in_background(
+    path: &std::path::Path,
+    session: &SessionRecord,
+    background: &crate::harness::Background,
+) -> Result<()> {
+    let prompt = sessions::with_sessions_mut(path, |sessions| {
+        let record = sessions
+            .iter_mut()
+            .find(|record| record.session_id == session.session_id)
+            .context("the session left the registry before it could resume")?;
+        record.held_for_lockout = false;
+        record.attach_after_lockout = true;
+        Ok(crate::continuation::take_restore_prompt(record))
+    })?;
+    let mut command = background
+        .resume
+        .replace("{session_id}", &shell_quote(&session.session_id));
+    if let Some(prompt) = &prompt {
+        command.push(' ');
+        command.push_str(&shell_quote(prompt));
+    }
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+    let mut start = std::process::Command::new(shell);
+    start
+        .args(["-ic", &command])
+        .current_dir(&session.directory);
+    let started = crate::adapters::run_capture_timeout(
+        &mut start,
+        "starting a background session",
+        BACKGROUND_START_TIMEOUT,
+    )
+    .and_then(|_| wait_for_restore_owner(path, &session.session_id));
+    if started.is_err() {
+        sessions::with_sessions_mut(path, |sessions| {
+            if let Some(record) = sessions
+                .iter_mut()
+                .find(|record| record.session_id == session.session_id)
+            {
+                record.attach_after_lockout = false;
+                record.mark_recoverable();
+            }
+            Ok(())
+        })?;
+    }
+    started
+}
+
+/// Opens a tab for each session resumed in the background, once the terminal
+/// can take one. A session that ended meanwhile needs none.
+fn attach_backgrounded(processes: &ProcessSnapshot) -> Result<()> {
+    let Ok(kind) = configured_terminal() else {
+        return Ok(());
+    };
+    let path = paths::sessions_file()?;
+    let waiting: Vec<SessionRecord> = sessions::read_sessions(&path)?
+        .into_iter()
+        .filter(|session| session.attach_after_lockout)
+        .collect();
+    if waiting.is_empty() || lockout::lockout(kind) != Lockout::Clear {
+        return Ok(());
+    }
+    let restore_lock = crate::commands::restore::lock()?;
+    restore_lock.lock_exclusive()?;
+    let adapter = adapter_for(kind);
+    let mut settled = Vec::new();
+    for session in waiting {
+        let attach = session
+            .tool
+            .spec()
+            .background
+            .as_ref()
+            .filter(|_| session_is_alive(&session, processes));
+        match attach.map(|background| {
+            adapter.open_tab(
+                &session.directory,
+                &(background.attach)(&session.session_id),
+            )
+        }) {
+            Some(Ok(())) => log_line(&format!(
+                "opened a tab for a background session: {} {}",
+                session.tool, session.session_id
+            ))?,
+            Some(Err(error)) => {
+                log_line(&format!(
+                    "failed to open a tab for background session {}: {error:#}",
+                    session.session_id
+                ))?;
+                continue;
+            }
+            None => log_line(&format!(
+                "background session ended before its tab: {} {}",
+                session.tool, session.session_id
+            ))?,
+        }
+        settled.push(session.session_id);
+    }
+    sessions::with_sessions_mut(&path, |sessions| {
+        for session in sessions
+            .iter_mut()
+            .filter(|session| settled.contains(&session.session_id))
+        {
+            session.attach_after_lockout = false;
+        }
+        Ok(())
+    })
 }
 
 fn launch_command(session_id: &str) -> Result<String> {
@@ -1812,6 +1971,8 @@ mod tests {
             errors: vec![],
             held: vec![],
             held_reason: None,
+            backgrounded: 0,
+            held_lockout: None,
         };
         let message = summary.message();
         assert!(message.contains("Restored 5 sessions"));
@@ -1819,6 +1980,30 @@ mod tests {
         assert!(message.contains("Pruned 1 duplicate"));
         assert!(message.contains("Pruned 1 that never started a conversation."));
         assert!(message.contains("Retired 2 ended sessions"));
+    }
+
+    #[test]
+    fn a_pass_says_what_it_resumed_in_the_background() {
+        let summary = RestoreSummary {
+            backgrounded: 2,
+            held_reason: Some("ghostty is locked out by Screen Time".into()),
+            ..RestoreSummary::default()
+        };
+        assert!(
+            summary
+                .message()
+                .ends_with("Resumed 2 in the background: ghostty is locked out by Screen Time.")
+        );
+    }
+
+    #[test]
+    fn a_background_session_is_attached_by_its_short_id() {
+        let background = crate::tool("claude").spec().background.as_ref().unwrap();
+        assert_eq!(
+            (background.attach)("5f0c2b48-865f-4829-af1b-7a248d2c2bee"),
+            "claude attach 5f0c2b48"
+        );
+        assert!(crate::tool("codex").spec().background.is_none());
     }
 
     #[test]

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -325,6 +326,7 @@ fn follow(
     stream: ChildStdout,
     reading: &Mutex<Option<Child>>,
 ) -> Result<()> {
+    let mut stream = BufReader::new(stream);
     let current = current_instance(terminal);
     if let Some(instance) = &current {
         let resumed = previous.and_then(|previous| previous.resume(instance));
@@ -335,23 +337,53 @@ fn follow(
             record.engaged.insert(instance.clone());
         }
     }
+    // A change the stream delivered while the stored log was being read is
+    // newer than what that read found.
+    while delivered(&stream)? {
+        apply_next(&mut stream, record)?;
+    }
     record.seed = Seed::Read { terminal: current };
     write_record(path, record)?;
 
-    for line in BufReader::new(stream).lines() {
-        let Some((pid, engaged)) = parse_event(&line?)? else {
-            continue;
-        };
-        let instance = Instance::of(pid)?;
-        record.engaged.retain(Instance::is_running);
-        if engaged {
-            record.engaged.insert(instance);
-        } else {
-            record.engaged.remove(&instance);
-        }
+    loop {
+        apply_next(&mut stream, record)?;
         write_record(path, record)?;
     }
-    anyhow::bail!("the lockout log stream ended")
+}
+
+fn delivered(stream: &BufReader<ChildStdout>) -> Result<bool> {
+    if !stream.buffer().is_empty() {
+        return Ok(true);
+    }
+    let mut ready = libc::pollfd {
+        fd: stream.get_ref().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    match unsafe { libc::poll(&raw mut ready, 1, 0) } {
+        -1 => Err(std::io::Error::last_os_error()).context("failed to poll the lockout log stream"),
+        0 => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+/// Reads the stream's next line and applies it if it is a lockout change.
+fn apply_next(stream: &mut BufReader<ChildStdout>, record: &mut Record) -> Result<()> {
+    let mut line = String::new();
+    if stream.read_line(&mut line)? == 0 {
+        anyhow::bail!("the lockout log stream ended");
+    }
+    let Some((pid, engaged)) = parse_event(line.trim_end())? else {
+        return Ok(());
+    };
+    let instance = Instance::of(pid)?;
+    record.engaged.retain(Instance::is_running);
+    if engaged {
+        record.engaged.insert(instance);
+    } else {
+        record.engaged.remove(&instance);
+    }
+    Ok(())
 }
 
 /// `instance`'s state after its last change in the stored log since `from`,

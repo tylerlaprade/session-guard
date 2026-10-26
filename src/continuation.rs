@@ -188,6 +188,16 @@ fn was_interrupted(record: &SessionRecord) -> bool {
     record.restore_pending || record.state != SessionState::Recoverable
 }
 
+/// The prompt a restore sends, taken from the record along with the state it
+/// came from, so no later restore sends it again.
+pub fn take_restore_prompt(record: &mut SessionRecord) -> Option<String> {
+    let prompt = restore_prompt(record);
+    record.mark_active();
+    record.activity = None;
+    record.background_tasks = None;
+    prompt
+}
+
 pub fn restore_prompt(record: &SessionRecord) -> Option<String> {
     if let Some(message) = record
         .tool

@@ -274,6 +274,15 @@ pub struct ServedThread<'a> {
     pub session_id: &'a str,
 }
 
+/// A harness that can run a session with no terminal and show it in a tab
+/// later.
+pub struct Background {
+    /// Resumes a session in the background; `{session_id}` is substituted.
+    pub resume: &'static str,
+    /// What a tab runs to show a background session, from its session id.
+    pub attach: fn(&str) -> String,
+}
+
 pub struct Harness {
     pub activity_hooks: &'static [HookEvent],
     pub was_working: Option<fn(&crate::sessions::SessionRecord) -> bool>,
@@ -308,6 +317,8 @@ pub struct Harness {
     pub identifies_process: Option<fn(&ProcInfo) -> bool>,
     /// Printed after a successful hook install, when the harness needs a word.
     pub install_note: Option<&'static str>,
+    /// Restores into the background while the terminal cannot take a tab.
+    pub background: Option<Background>,
 }
 
 pub static HARNESSES: &[Harness] = &[
@@ -346,6 +357,10 @@ pub static HARNESSES: &[Harness] = &[
         session_id_from_process: Some(crate::scan::claude_session_id_from_process),
         is_unused_spare: Some(crate::scan::claude_is_unused_spare),
         install_note: None,
+        background: Some(Background {
+            resume: "claude --bg --resume {session_id}",
+            attach: claude_attach,
+        }),
     },
     Harness {
         id: "codex",
@@ -394,6 +409,7 @@ pub static HARNESSES: &[Harness] = &[
         install_note: Some(
             "Codex asks once to trust new or changed hooks on the next interactive launch; they do not run until approved.",
         ),
+        background: None,
     },
     Harness {
         id: "grok",
@@ -432,6 +448,7 @@ pub static HARNESSES: &[Harness] = &[
         session_id_from_process: None,
         is_unused_spare: None,
         install_note: None,
+        background: None,
     },
     Harness {
         id: "opencode",
@@ -466,6 +483,7 @@ pub static HARNESSES: &[Harness] = &[
         session_id_from_process: None,
         is_unused_spare: None,
         install_note: None,
+        background: None,
     },
 ];
 
@@ -510,7 +528,16 @@ pub static EDITOR: Harness = Harness {
     session_id_from_process: None,
     is_unused_spare: None,
     install_note: None,
+    background: None,
 };
+
+// `claude --bg` names a session by the first eight characters of its id.
+fn claude_attach(session_id: &str) -> String {
+    format!(
+        "claude attach {}",
+        session_id.get(..8).unwrap_or(session_id)
+    )
+}
 
 pub fn find(id: &str) -> Option<&'static Harness> {
     HARNESSES

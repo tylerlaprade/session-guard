@@ -32,6 +32,7 @@ session-guard restore
 session-guard restore --all
 session-guard lockout
 session-guard lockout --wait
+session-guard attach-after-lockout <id>
 session-guard daemon
 session-guard cargo-target -- cargo test -p my-crate
 session-guard uninstall
@@ -293,6 +294,17 @@ AppKit logs nothing for a terminal that launches unlocked, and logs `engaged`
 about a second and a half after launch for one that launches locked out. A
 terminal launched after the daemon started counts as unlocked until it logs, so
 that first moment after a launch is not covered.
+
+A Claude session needs no tab to keep working, so a pass that finds the
+terminal locked out resumes it at once with `claude --bg --resume`, sending the
+same prompt a tab would, and the daemon opens a tab running `claude attach`
+once the lockout lifts. Codex, Grok and OpenCode have no background mode, so
+their sessions wait for the lockout to lift. A script that starts a session
+with `claude --bg` itself can hand it to the daemon the same way:
+
+```sh
+session-guard attach-after-lockout 1499f9ac   # the short id `claude --bg` prints
+```
 
 Scripts that open terminal tabs can ask the same question:
 

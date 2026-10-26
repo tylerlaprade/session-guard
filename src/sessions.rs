@@ -80,6 +80,11 @@ pub struct SessionRecord {
     // the terminal locked out; later passes open it once the lockout lifts.
     #[serde(default)]
     pub held_for_lockout: bool,
+    // Running in the background until the terminal can take a tab; the daemon
+    // opens one once the lockout lifts. The background session's own
+    // registration replaces the record, so `register` carries this over.
+    #[serde(default)]
+    pub attach_after_lockout: bool,
     #[serde(default)]
     pub activity: Option<crate::continuation::Activity>,
     #[serde(default)]
@@ -134,6 +139,7 @@ impl SessionRecord {
             source,
             restore_pending: false,
             held_for_lockout: false,
+            attach_after_lockout: false,
             activity: None,
             background_tasks: None,
             command: None,
@@ -170,6 +176,7 @@ impl SessionRecord {
             source: Some("transcript-fallback".to_string()),
             restore_pending: false,
             held_for_lockout: false,
+            attach_after_lockout: false,
             activity: None,
             background_tasks: None,
             command: None,
@@ -343,6 +350,7 @@ pub fn register(path: &Path, mut record: SessionRecord) -> Result<()> {
             .find(|previous| previous.session_id == record.session_id)
         {
             record.tab_position = record.tab_position.or(previous.tab_position);
+            record.attach_after_lockout = previous.attach_after_lockout;
         }
         sessions.retain(|session| session.session_id != record.session_id);
         sessions.push(record);

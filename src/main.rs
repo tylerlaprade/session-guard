@@ -257,6 +257,12 @@ enum Command {
         #[arg(long, help = "Wait while the terminal is locked out")]
         wait: bool,
     },
+    /// Give a session started with `claude --bg` a terminal tab once Screen
+    /// Time no longer has the terminal locked out.
+    AttachAfterLockout {
+        #[arg(help = "Session id, or the short id `claude --bg` prints")]
+        id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -284,5 +290,6 @@ fn main() -> Result<()> {
         Command::Deregister { session_id } => commands::deregister::run(session_id),
         Command::Restore { all } => commands::restore::run(all),
         Command::Lockout { wait } => lockout::run(wait),
+        Command::AttachAfterLockout { id } => commands::attach_after_lockout::run(&id),
     }
 }

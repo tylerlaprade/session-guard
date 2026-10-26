@@ -1,3 +1,4 @@
+pub mod attach_after_lockout;
 pub mod daemon;
 pub mod deregister;
 pub mod install;

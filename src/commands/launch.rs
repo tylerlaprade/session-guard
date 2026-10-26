@@ -98,17 +98,14 @@ fn wait_out_critical_memory_pressure() {
 }
 
 fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchRequest {
-    let prompt = crate::continuation::restore_prompt(session);
+    let prompt = crate::continuation::take_restore_prompt(session);
     session.pid = Some(owner);
     session.shell_pid = Some(owner);
     session.pid_started_at = Some(started.to_string());
     session.shell_pid_started_at = Some(started.to_string());
     session.server_pid = None;
     session.server_pid_started_at = None;
-    session.mark_active();
     session.source = Some("restore-launch".to_string());
-    session.activity = None;
-    session.background_tasks = None;
     LaunchRequest {
         record: session.clone(),
         prompt,

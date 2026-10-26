@@ -35,6 +35,21 @@ child = subprocess.Popen(sys.argv[4:], cwd=sys.argv[2], stdin=subprocess.DEVNULL
 pathlib.Path(os.environ["HOME"], "launcher.pid").write_text(str(child.pid))
 "#;
 
+// Stands in for `claude`. `--bg --resume ID` starts a background session and
+// registers it the way Claude's hooks do; anything else, such as `attach ID`,
+// is recorded and then waits like an interactive session.
+const CLAUDE: &str = r#"#!/bin/sh
+echo "$*" >> "$HOME/claude.args"
+if [ "$1" = --bg ]; then
+    sleep 60 </dev/null >/dev/null 2>&1 &
+    echo $! >> "$HOME/background.pids"
+    "$TEST_BINARY" register --tool claude --session-id "$3" --pid $! --shell-pid $! --directory "$PWD" </dev/null >/dev/null
+    echo "backgrounded · $(echo "$3" | cut -c1-8) · stand-in"
+    exit 0
+fi
+exec sleep 30
+"#;
+
 fn stand_in_terminal_path() -> PathBuf {
     std::env::current_exe()
         .unwrap()
@@ -45,10 +60,15 @@ fn stand_in_terminal_path() -> PathBuf {
         .join("examples/alacritty")
 }
 
+// The terminal is the oldest process with its name, so two stand-ins running at
+// once would read each other's lockout.
+static ONE_TERMINAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fixture {
     home: tempfile::TempDir,
     terminal: Child,
     daemon: Option<Child>,
+    _one_terminal: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Drop for Fixture {
@@ -66,11 +86,23 @@ impl Drop for Fixture {
                 }
             }
         }
+        for pid in fs::read_to_string(self.root().join("background.pids"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|pid| pid.parse::<i32>().ok())
+        {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
     }
 }
 
 impl Fixture {
-    fn new() -> Self {
+    fn new(tool: &str) -> Self {
+        let one_terminal = ONE_TERMINAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = tempfile::tempdir().unwrap();
         let root = home.path();
         let config = root.join(".config/session-guard");
@@ -80,7 +112,8 @@ impl Fixture {
         for (name, contents) in [
             ("log", LOG),
             ("alacritty", OPEN_WINDOW),
-            ("claude", "#!/bin/sh\nexec sleep 30\n"),
+            ("claude", CLAUDE),
+            ("codex", "#!/bin/sh\nexec sleep 30\n"),
         ] {
             fs::write(bin.join(name), contents).unwrap();
             fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
@@ -92,7 +125,7 @@ impl Fixture {
         fs::write(
             config.join("active-sessions.json"),
             json!([{
-                "session_id": SESSION, "tool": "claude", "pid": 2_147_483_647,
+                "session_id": SESSION, "tool": tool, "pid": 2_147_483_647,
                 "shell_pid": 2_147_483_646, "directory": root, "session_name": null,
                 "registered_at": idle_since, "last_seen_at": idle_since, "state": "recoverable",
                 "dead_at": idle_since, "restore_pending": true, "transcript_path": null
@@ -109,6 +142,7 @@ impl Fixture {
             home,
             terminal,
             daemon: None,
+            _one_terminal: one_terminal,
         }
     }
 
@@ -124,7 +158,9 @@ impl Fixture {
             .env("HOME", root)
             .env("TMPDIR", root)
             .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
+            .env("CODEX_HOME", root.join(".codex"))
             .env("SHELL", "/bin/sh")
+            .env("TEST_BINARY", env!("CARGO_BIN_EXE_session-guard"))
             .env("TERMINAL_PID", self.terminal.id().to_string())
             .env(
                 "PATH",
@@ -215,7 +251,7 @@ fn alive(pid: i32) -> bool {
 
 #[test]
 fn a_locked_out_terminal_gets_no_tab_until_the_lockout_lifts() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::new("codex");
     fixture.start_daemon();
     fixture.wait_for("the watcher to start", || fixture.state_file().exists());
     let mut waiter = fixture.command(&["lockout", "--wait"]).spawn().unwrap();
@@ -275,4 +311,76 @@ fn a_locked_out_terminal_gets_no_tab_until_the_lockout_lifts() {
     assert_eq!(fixture.record()["held_for_lockout"], false);
 
     fixture.stop_daemon();
+}
+
+#[test]
+fn a_claude_session_resumes_in_the_background_and_gets_its_tab_after_the_lockout() {
+    let mut fixture = Fixture::new("claude");
+    fixture.start_daemon();
+    fixture.wait_for("the background resume", || {
+        fixture.daemon_log().contains("Resumed 1 in the background")
+    });
+    let claude_args = || fs::read_to_string(fixture.root().join("claude.args")).unwrap_or_default();
+    assert!(claude_args().contains(&format!("--bg --resume {SESSION}")));
+    assert_eq!(fixture.record()["attach_after_lockout"], true);
+    assert_eq!(fixture.record()["state"], "active");
+
+    // The attach pass runs every five seconds and must open nothing while the
+    // terminal is still locked out.
+    fixture.wait_for("the lockout to be known", || {
+        fixture.lockout().status.code() == Some(1)
+    });
+    thread::sleep(Duration::from_secs(6));
+    assert!(
+        !claude_args().contains("attach"),
+        "{}\n{}",
+        claude_args(),
+        fixture.daemon_log()
+    );
+
+    fs::write(fixture.root().join("lift"), "").unwrap();
+    fixture.wait_for("the attach tab", || {
+        claude_args().contains(&format!("attach {}", &SESSION[..8]))
+    });
+    fixture.wait_for("the attach flag to clear", || {
+        fixture.record()["attach_after_lockout"] == false
+    });
+    // The startup pass ran while the watcher was still reading the state, so
+    // it held the session; the lockout, once known, sent it to the background.
+    assert!(fixture.daemon_log().contains(
+        "held restore: Restored 0 sessions (0 Claude Code, 0 Codex, 0 Grok, 0 OpenCode). Pruned 0 (directory gone). Resumed 1 in the background: alacritty is locked out by Screen Time."
+    ), "{}", fixture.daemon_log());
+    fixture.stop_daemon();
+}
+
+#[test]
+fn attach_after_lockout_marks_the_one_session_its_prefix_names() {
+    let fixture = Fixture::new("claude");
+    let too_short = fixture
+        .command(&["attach-after-lockout", &SESSION[..6]])
+        .output()
+        .unwrap();
+    assert!(!too_short.status.success());
+    let marked = fixture
+        .command(&["attach-after-lockout", &SESSION[..8]])
+        .output()
+        .unwrap();
+    assert!(
+        marked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&marked.stderr)
+    );
+    assert_eq!(fixture.record()["attach_after_lockout"], true);
+}
+
+#[test]
+fn attach_after_lockout_refuses_a_tool_without_a_background_mode() {
+    let fixture = Fixture::new("codex");
+    let refused = fixture
+        .command(&["attach-after-lockout", &SESSION[..8]])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("has no background mode"));
+    assert_eq!(fixture.record()["attach_after_lockout"], Value::Null);
 }
