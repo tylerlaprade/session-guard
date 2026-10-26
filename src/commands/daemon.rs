@@ -165,6 +165,7 @@ pub fn run() -> Result<()> {
     write_pid_file()?;
     log_line("daemon started")?;
     let mut lockout_watcher = start_lockout_watcher();
+    let mut exit_watcher = start_exit_watcher();
     update_installed_hooks()?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -312,6 +313,17 @@ pub fn run() -> Result<()> {
                 log_line("restarting the lockout watcher")?;
                 lockout_watcher = start_lockout_watcher();
             }
+            if exit_watcher
+                .as_ref()
+                .is_some_and(|watcher| !watcher.is_running())
+            {
+                if let Some(Err(error)) = exit_watcher.take().map(crate::exit_watch::Watcher::reap)
+                {
+                    log_line(&format!("exit watcher stopped: {error:#}"))?;
+                }
+                log_line("restarting the exit watcher")?;
+                exit_watcher = start_exit_watcher();
+            }
 
             monitor_cycles_until_cleanup -= 1;
             if monitor_cycles_until_cleanup == 0 {
@@ -325,9 +337,20 @@ pub fn run() -> Result<()> {
     if let Some(Err(error)) = lockout_watcher.map(lockout::Watcher::stop) {
         log_line(&format!("lockout watcher did not stop cleanly: {error:#}"))?;
     }
+    if let Some(Err(error)) = exit_watcher.map(crate::exit_watch::Watcher::reap) {
+        log_line(&format!("exit watcher did not stop cleanly: {error:#}"))?;
+    }
     log_line("daemon stopped")?;
     remove_pid_file_if_current()?;
     Ok(())
+}
+
+fn start_exit_watcher() -> Option<crate::exit_watch::Watcher> {
+    crate::exit_watch::Watcher::start()
+        .map_err(|error| {
+            let _ = log_line(&format!("exit watcher failed to start: {error:#}"));
+        })
+        .ok()
 }
 
 fn held_lockout(summary: &RestoreSummary) -> Option<Lockout> {

@@ -51,6 +51,102 @@ pub fn boot_identifier() -> Option<String> {
     }
 }
 
+/// Kernel notice of watched processes' exits, each with its wait status.
+// Apple's kqueue(2) calls NOTE_EXITSTATUS valid only for children, but the
+// kernel reports it for any process the user may signal; a test pins that.
+#[cfg(target_os = "macos")]
+pub struct ExitWatch {
+    queue: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "macos")]
+impl ExitWatch {
+    pub fn new() -> std::io::Result<Self> {
+        let queue = unsafe { libc::kqueue() };
+        if queue < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            queue: unsafe { std::os::fd::FromRawFd::from_raw_fd(queue) },
+        })
+    }
+
+    /// Starts watching `pid`; false when it has already exited.
+    pub fn watch(&self, pid: i32) -> bool {
+        let Ok(ident) = usize::try_from(pid) else {
+            return false;
+        };
+        let change = libc::kevent {
+            ident,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT | libc::NOTE_EXITSTATUS,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        (unsafe {
+            libc::kevent(
+                std::os::fd::AsRawFd::as_raw_fd(&self.queue),
+                &raw const change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        }) == 0
+    }
+
+    /// Watched processes that exited, as (pid, wait status), waiting up to
+    /// `timeout` for the first.
+    pub fn exits(&self, timeout: std::time::Duration) -> Vec<(i32, i32)> {
+        let mut events: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+        let wait = libc::timespec {
+            tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+            tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+        };
+        let count = unsafe {
+            libc::kevent(
+                std::os::fd::AsRawFd::as_raw_fd(&self.queue),
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                libc::c_int::try_from(events.len()).unwrap_or(libc::c_int::MAX),
+                &raw const wait,
+            )
+        };
+        events
+            .iter()
+            .take(usize::try_from(count).unwrap_or(0))
+            .filter(|event| event.fflags & libc::NOTE_EXIT != 0)
+            .filter_map(|event| {
+                Some((
+                    i32::try_from(event.ident).ok()?,
+                    i32::try_from(event.data).ok()?,
+                ))
+            })
+            .collect()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub struct ExitWatch;
+
+#[cfg(not(target_os = "macos"))]
+impl ExitWatch {
+    pub fn new() -> std::io::Result<Self> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    pub fn watch(&self, _pid: i32) -> bool {
+        false
+    }
+
+    pub fn exits(&self, timeout: std::time::Duration) -> Vec<(i32, i32)> {
+        std::thread::sleep(timeout);
+        Vec::new()
+    }
+}
+
 /// Whether the kernel reports critical memory pressure, the level at which it
 /// kills processes to reclaim memory.
 #[cfg(target_os = "macos")]
@@ -871,5 +967,38 @@ mod tests {
         assert!(snapshot.instance_running_since(&executable, Some("Fri Jan 1 00:00:00 2100")));
         assert!(!snapshot.instance_running_since(&executable, Some("Wed Jan 1 00:00:00 2020")));
         assert!(!snapshot.instance_running_since("no-such-terminal-xyz", None));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_exit_watch_reads_the_status_of_a_process_it_did_not_start() {
+        // The subshell exits at once, so launchd adopts the sleeper: the
+        // process this test watches is not its child.
+        let orphan = |script: &str| {
+            let output = Command::new("/bin/sh")
+                .args(["-c", &format!("({script}) >/dev/null 2>&1 & echo $!")])
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap()
+        };
+        let watch = ExitWatch::new().unwrap();
+        let exits = orphan("sleep 1; exit 3");
+        let killed = orphan("sleep 30");
+        assert_ne!(parent_pid(exits), Some(std::process::id() as i32));
+        assert!(watch.watch(exits));
+        assert!(watch.watch(killed));
+        assert_eq!(unsafe { libc::kill(killed, libc::SIGKILL) }, 0);
+        let mut statuses = std::collections::HashMap::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while statuses.len() < 2 && std::time::Instant::now() < deadline {
+            statuses.extend(watch.exits(std::time::Duration::from_secs(1)));
+        }
+        assert_eq!(statuses.get(&exits), Some(&(3 << 8)));
+        assert_eq!(statuses.get(&killed), Some(&libc::SIGKILL));
+        assert!(!watch.watch(exits));
     }
 }

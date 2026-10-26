@@ -176,14 +176,22 @@ TUI.
 A TUI on the shared server fires no SessionEnd when it quits. It only
 unsubscribes from its thread, and the server runs the thread's SessionEnd when
 it unloads the idle thread, `thread_unload_delay_secs` later (30 minutes by
-default). Until then the quit looks like a crash, so the record stays
-recoverable while the tab's shell lives; the daemon still never types a restore
-into that tab, since a missing SessionEnd proves nothing for a served TUI.
-Closing the tab releases the record, and the late SessionEnd retires it, but a
-terminal crash or reboot within those 30 minutes reopens the thread. Codex
-reports a crash and a quit differently only through the TUI's exit status
-(`/quit` exits 0; a kill or a closed tab ends it by signal), and the gap is
-reported upstream.
+default). The TUI's exit status tells the two endings apart: `/quit` exits 0,
+while a kill, a crash, or a closed tab ends it by a signal. So the daemon
+watches each served TUI's process through the kernel's process events
+(kqueue, with `NOTE_EXITSTATUS`), and an exit with status 0 ends the record
+as a SessionEnd would. A TUI ended by a signal is handled like any death
+without a SessionEnd, except that the daemon never types a restore into its
+tab.
+
+Two limits remain. The watch is macOS-only: Linux reports a process's exit
+status only to its parent. And the daemon starts watching a TUI within about
+a second of seeing it register, so a TUI that quits sooner than that, or while
+the daemon is restarting, is missed. Its record then behaves as before the
+watch: it stays recoverable while the tab's shell lives, closing the tab
+releases it, the server's late SessionEnd retires it, and a terminal crash or
+reboot in between reopens the thread. The missing SessionEnd is reported
+upstream.
 
 The daemon records the operating system's boot identifier in its heartbeat.
 A reboot restores confirmed pending interruptions, including sessions whose

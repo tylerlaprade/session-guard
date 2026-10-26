@@ -3,6 +3,7 @@ mod cargo_targets;
 mod codex_server;
 mod commands;
 mod continuation;
+mod exit_watch;
 mod fresh_tab;
 mod harness;
 mod hooks;
