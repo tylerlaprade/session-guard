@@ -172,10 +172,17 @@ runtime the dead TUI left loaded, leaves it alone. Codex fires the resumed
 thread's `SessionStart` only with that first prompt, which admits the restored
 TUI.
 
-A TUI on the shared server fires no SessionEnd when it quits: it unsubscribes
-from its thread, and the server keeps the thread without running a hook. Its
-record therefore stays recoverable while the tab's shell lives. Closing the tab
-releases it, but a terminal crash or reboot before then reopens the thread.
+A TUI on the shared server fires no SessionEnd when it quits. It only
+unsubscribes from its thread, and the server runs the thread's SessionEnd when
+it unloads the idle thread, `thread_unload_delay_secs` later (30 minutes by
+default). Until then the quit looks like a crash, so the record stays
+recoverable while the tab's shell lives; the daemon still never types a restore
+into that tab, since a missing SessionEnd proves nothing for a served TUI.
+Closing the tab releases the record, and the late SessionEnd retires it, but a
+terminal crash or reboot within those 30 minutes reopens the thread. Codex
+reports a crash and a quit differently only through the TUI's exit status
+(`/quit` exits 0; a kill or a closed tab ends it by signal), and the gap is
+reported upstream.
 
 The daemon records the operating system's boot identifier in its heartbeat.
 A reboot restores confirmed pending interruptions, including sessions whose
@@ -196,7 +203,9 @@ through `restore --all` until it expires.
 
 A tool can also die alone, killed for memory or crashed, while its tab stays
 open. Closing a tab takes its shell down with the tool, so a shell that outlives
-a tool that fired no SessionEnd tells the two apart. Once the grace has passed,
+a tool that fired no SessionEnd tells the two apart, for every tool whose clean
+exit always ends its record: not a Codex TUI on the shared server, and not an
+editor, which has no hooks. Once the grace has passed,
 the daemon types the session's `session-guard launch` into that shell's own tab,
 found by its tty, when the shell sits idle at its prompt; a shell the user has
 already put to other work is released like a closed tab. Typing into a tab

@@ -886,14 +886,8 @@ fn release_closed_tabs(processes: &ProcessSnapshot) -> Result<usize> {
 fn reopen_in_living_tabs(processes: &ProcessSnapshot) -> Result<Vec<SessionRecord>> {
     let path = paths::sessions_file()?;
     let now = chrono::Utc::now();
-    let crashed_in_living_tab = |session: &SessionRecord| {
-        session.state == SessionState::Recoverable
-            && session.restore_pending
-            && session
-                .dead_at
-                .is_some_and(|dead_at| (now - dead_at).num_seconds() >= SESSION_END_GRACE_SECS)
-            && session_shell_is_alive(session, processes)
-    };
+    let crashed_in_living_tab =
+        |session: &SessionRecord| crashed_in_living_tab(session, processes, now);
     let crashed: Vec<SessionRecord> = sessions::read_sessions(&path)?
         .into_iter()
         .filter(crashed_in_living_tab)
@@ -932,6 +926,34 @@ fn reopen_in_living_tabs(processes: &ProcessSnapshot) -> Result<Vec<SessionRecor
         })?;
     }
     Ok(reopened)
+}
+
+fn crashed_in_living_tab(
+    session: &SessionRecord,
+    processes: &ProcessSnapshot,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    session.state == SessionState::Recoverable
+        && session.restore_pending
+        && session
+            .dead_at
+            .is_some_and(|dead_at| (now - dead_at).num_seconds() >= SESSION_END_GRACE_SECS)
+        && ends_its_record_on_every_exit(session)
+        && session_shell_is_alive(session, processes)
+}
+
+// A missing end means a crash only for a tool whose every clean exit ends its
+// record. A TUI on a shared thread server quits without a SessionEnd, and an
+// editor has no hooks at all.
+fn ends_its_record_on_every_exit(session: &SessionRecord) -> bool {
+    session.server_pid.is_none()
+        && match session.tool.spec().integration {
+            Integration::JsonSettings { .. }
+            | Integration::TomlConfig { .. }
+            | Integration::ScriptDir { .. }
+            | Integration::PluginFile { .. } => true,
+            Integration::ProcessScan => false,
+        }
 }
 
 // The terminal's tab order, recorded on each live session so a restore can
@@ -1529,6 +1551,49 @@ mod tests {
             &processes,
             Some(&terminal),
             settled
+        ));
+    }
+
+    #[test]
+    fn only_a_tool_that_always_ends_its_record_counts_as_crashed_in_its_tab() {
+        let processes = ProcessSnapshot::capture().unwrap();
+        let pid = std::process::id() as i32;
+        let shell_started = process::process_start_identity(pid).unwrap();
+        let crashed = |tool: Tool| {
+            let mut session = ended_session(pid, &shell_started);
+            session.tool = tool;
+            session.mark_recoverable();
+            session
+        };
+        let settled = |session: &SessionRecord| {
+            session.dead_at.unwrap() + chrono::Duration::seconds(SESSION_END_GRACE_SECS)
+        };
+        let claude = crashed(crate::tool("claude"));
+        assert!(crashed_in_living_tab(&claude, &processes, settled(&claude)));
+        assert!(!crashed_in_living_tab(
+            &claude,
+            &processes,
+            claude.dead_at.unwrap()
+        ));
+        let mut served = crashed(crate::tool("codex"));
+        served.server_pid = Some(pid);
+        assert!(!crashed_in_living_tab(
+            &served,
+            &processes,
+            settled(&served)
+        ));
+        let editor = crashed(Tool::editor());
+        assert!(!crashed_in_living_tab(
+            &editor,
+            &processes,
+            settled(&editor)
+        ));
+        let mut closed = crashed(crate::tool("claude"));
+        closed.shell_pid = Some(i32::MAX);
+        assert!(!crashed_in_living_tab(
+            &closed,
+            &processes,
+            settled(&closed)
         ));
     }
 
