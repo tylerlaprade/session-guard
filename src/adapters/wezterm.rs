@@ -1,4 +1,4 @@
-use super::{TerminalAdapter, run_checked};
+use super::{TerminalAdapter, launch_until_running, run_checked};
 use crate::process;
 use anyhow::Result;
 use std::path::Path;
@@ -20,7 +20,6 @@ impl TerminalAdapter for Wezterm {
     }
 
     fn launch(&self) -> Result<()> {
-        Command::new("wezterm").spawn()?;
-        Ok(())
+        launch_until_running("wezterm", || self.is_running())
     }
 }

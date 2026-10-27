@@ -52,12 +52,16 @@ while :; do
 done
 "#;
 
-// Stands in for `alacritty`: with no arguments it launches the terminal, and
-// `alacritty --working-directory DIR -e sh -lc COMMAND` opens a window.
+// Stands in for `alacritty`: with no arguments it launches the terminal, which
+// takes a moment to start, and `alacritty --working-directory DIR -e sh -lc
+// COMMAND` opens a window.
 const OPEN_WINDOW: &str = r#"#!/usr/bin/env python3
-import os, pathlib, subprocess, sys
+import os, pathlib, subprocess, sys, time
 if len(sys.argv) == 1:
+    with open(pathlib.Path(os.environ["HOME"], "launches"), "a") as launches:
+        launches.write(f"{os.getpid()}\n")
     pathlib.Path(os.environ["HOME"], "terminal.pid").write_text(str(os.getpid()))
+    time.sleep(2)
     os.execv(os.environ["STAND_IN"], [os.environ["STAND_IN"]])
 child = subprocess.Popen(sys.argv[4:], cwd=sys.argv[2], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -227,6 +231,13 @@ impl Fixture {
             )
             .stdin(Stdio::null());
         command
+    }
+
+    fn launches(&self) -> usize {
+        fs::read_to_string(self.root().join("launches"))
+            .unwrap_or_default()
+            .lines()
+            .count()
     }
 
     fn terminal_pid(&self) -> i32 {
@@ -527,6 +538,7 @@ fn a_launched_terminal_gets_no_tab_until_screen_time_answers_for_it() {
             .contains("held restore: Restored 1 sessions")
     });
     assert_eq!(fixture.lockout().status.code(), Some(0));
+    assert_eq!(fixture.launches(), 1);
     fixture.stop_daemon();
 }
 
@@ -534,8 +546,10 @@ fn a_launched_terminal_gets_no_tab_until_screen_time_answers_for_it() {
 fn a_terminal_locked_out_at_launch_gets_no_tab_until_the_lockout_lifts() {
     let mut fixture = Fixture::launching("codex");
     fixture.start_daemon();
-    fixture.wait_for("the launched terminal", || {
-        fixture.pid_in("terminal.pid").is_some_and(alive)
+    fixture.wait_for("the launch", || {
+        fixture
+            .daemon_log()
+            .contains("launched alacritty for a restore")
     });
     fixture.emit(
         "1",
@@ -563,5 +577,6 @@ fn a_terminal_locked_out_at_launch_gets_no_tab_until_the_lockout_lifts() {
             .daemon_log()
             .contains("held restore: Restored 1 sessions")
     });
+    assert_eq!(fixture.launches(), 1);
     fixture.stop_daemon();
 }

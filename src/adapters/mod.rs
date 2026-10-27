@@ -61,6 +61,22 @@ pub fn run_checked(mut command: std::process::Command, description: &str) -> Res
     )
 }
 
+/// Launches a terminal by running its binary, and returns once the terminal's
+/// process is running, so a restore pass right after it does not launch a
+/// second one. Fails if the binary exits first.
+pub fn launch_until_running(program: &str, is_running: impl Fn() -> bool) -> Result<()> {
+    let mut child = std::process::Command::new(program)
+        .spawn()
+        .with_context(|| format!("launching {program}"))?;
+    while !is_running() {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("{program} exited ({status}) before it was running");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 /// Run a process with a hard timeout so a stuck AppleScript/osascript cannot
 /// wedge the restore path (and the sessions-file lock) indefinitely.
 pub fn run_checked_timeout(
