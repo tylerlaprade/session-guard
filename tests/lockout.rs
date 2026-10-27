@@ -31,19 +31,22 @@ exec sleep 600
 "#;
 
 // Stands in for `log` when the test supplies the lockout agent's lines: each
-// file dropped in `emit/` is delivered once, in name order. The stored log
-// shows the agent naming apps, as it does once its logging profile is in.
+// file dropped in `emit/` is delivered once, in name order, and the debug-level
+// stream a launch watches reads `emit-launch/` the same way.
 const CUED_LOG: &str = r#"#!/bin/sh
 if [ "$1" = show ]; then
-    echo '{"eventMessage":"Requesting policy for bundle IDs: com.apple.calculator","processID":762}'
-    echo '{"count":1,"finished":1}'
+    echo '{"count":0,"finished":1}'
     exit 0
 fi
-echo $$ > "$HOME/stream.pid"
+case "$*" in
+    *--debug*) name=launch-stream cues="$HOME/emit-launch" ;;
+    *) name=stream cues="$HOME/emit" ;;
+esac
+echo $$ > "$HOME/$name.pid"
 echo 'Filtering the log data using "stand-in"'
-mkdir -p "$HOME/emit"
+mkdir -p "$cues"
 while :; do
-    for line in "$HOME"/emit/*; do
+    for line in "$cues"/*; do
         [ -e "$line" ] || continue
         cat "$line"
         rm -f "$line"
@@ -105,6 +108,8 @@ struct Fixture {
     home: tempfile::TempDir,
     terminal: Option<Child>,
     daemon: Option<Child>,
+    // A launch is answered for only while Screen Time's lockout agent runs.
+    agent: Child,
     _one_terminal: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -118,11 +123,14 @@ impl Drop for Fixture {
             let _ = terminal.kill();
             let _ = terminal.wait();
         }
+        let _ = self.agent.kill();
+        let _ = self.agent.wait();
         // The next fixture finds the terminal by name, so a killed one must be
         // gone before this one lets go of `ONE_TERMINAL`.
         for (file, group) in [
             ("launcher.pid", true),
             ("stream.pid", false),
+            ("launch-stream.pid", false),
             ("terminal.pid", false),
         ] {
             if let Some(pid) = self.pid_in(file) {
@@ -149,15 +157,20 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new(tool: &str) -> Self {
-        Self::build(tool, LOG, true)
+        Self::build(Some(tool), LOG, true)
     }
 
     /// No terminal is running, so the daemon launches one for its restore.
     fn launching(tool: &str) -> Self {
-        Self::build(tool, CUED_LOG, false)
+        Self::build(Some(tool), CUED_LOG, false)
     }
 
-    fn build(tool: &str, log: &str, terminal_running: bool) -> Self {
+    /// No terminal is running and nothing waits to be restored.
+    fn idle() -> Self {
+        Self::build(None, CUED_LOG, false)
+    }
+
+    fn build(tool: Option<&str>, log: &str, terminal_running: bool) -> Self {
         let one_terminal = ONE_TERMINAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -178,18 +191,22 @@ impl Fixture {
         }
         let terminal =
             terminal_running.then(|| Command::new(stand_in_terminal_path()).spawn().unwrap());
+        fs::copy(stand_in_terminal_path(), root.join("lockoutagent")).unwrap();
+        let agent = Command::new(root.join("lockoutagent")).spawn().unwrap();
 
         let idle_since = Utc::now() - Age::days(1);
         fs::write(config.join("terminal"), "alacritty\n").unwrap();
-        fs::write(
-            config.join("active-sessions.json"),
-            json!([{
+        let sessions = tool.map(|tool| {
+            json!({
                 "session_id": SESSION, "tool": tool, "pid": 2_147_483_647,
                 "shell_pid": 2_147_483_646, "directory": root, "session_name": null,
                 "registered_at": idle_since, "last_seen_at": idle_since, "state": "recoverable",
                 "dead_at": idle_since, "restore_pending": true, "transcript_path": null
-            }])
-            .to_string(),
+            })
+        });
+        fs::write(
+            config.join("active-sessions.json"),
+            json!(sessions.into_iter().collect::<Vec<_>>()).to_string(),
         )
         .unwrap();
         fs::write(
@@ -201,6 +218,7 @@ impl Fixture {
             home,
             terminal,
             daemon: None,
+            agent,
             _one_terminal: one_terminal,
         }
     }
@@ -247,10 +265,19 @@ impl Fixture {
         )
     }
 
-    /// Has the cued `log` stand-in deliver `line`, after anything named before
-    /// `name`.
+    /// Has the cued `log` stand-in's stream deliver `line`, after anything
+    /// named before `name`.
     fn emit(&self, name: &str, line: &Value) {
-        let cues = self.root().join("emit");
+        self.cue("emit", name, line);
+    }
+
+    /// The same, for the stream watching a launch.
+    fn emit_launch(&self, name: &str, line: &Value) {
+        self.cue("emit-launch", name, line);
+    }
+
+    fn cue(&self, folder: &str, name: &str, line: &Value) {
+        let cues = self.root().join(folder);
         fs::create_dir_all(&cues).unwrap();
         let staged = cues.join(format!(".{name}"));
         fs::write(&staged, format!("{line}\n")).unwrap();
@@ -501,22 +528,48 @@ fn agent_line(message: &str) -> Value {
     json!({"eventMessage": message, "processID": 762})
 }
 
+fn born_line() -> Value {
+    agent_line(
+        r#"Calling block with kLSNotifyApplicationBirth { "ApplicationType"="Foreground", , "BuildMachineOSBuild"="23A344", "BundleIdentifierLowerCase"="org.alacritty", "CFBundleIdentifier"="org.alacritty"<…> notificationID=<decode: missing data> id=<decode: missing data>"#,
+    )
+}
+
+fn checkin_line(pid: i32) -> Value {
+    json!({"eventMessage": format!("CHECKIN:0x0-0x32e62e3 {pid} org.alacritty"), "processID": 354})
+}
+
+fn requested() -> Value {
+    agent_line("Requesting policy for bundle IDs: <private>")
+}
+
+fn answered() -> Value {
+    agent_line("Successfully requested policies for 1 bundleIdentifiers")
+}
+
+fn began() -> Value {
+    agent_line("Begin lockout on app: <private>")
+}
+
+fn deciding(output: &Output) -> bool {
+    output.status.code() == Some(2)
+        && String::from_utf8_lossy(&output.stderr).contains("has not answered")
+}
+
 #[test]
-fn a_launched_terminal_gets_no_tab_until_screen_time_answers_for_it() {
+fn a_restore_launches_the_terminal_alone_and_opens_tabs_once_screen_time_answers() {
     let mut fixture = Fixture::launching("codex");
     fixture.start_daemon();
     fixture.wait_for("the launch", || {
-        fixture
-            .daemon_log()
-            .contains("launched alacritty for a restore")
+        fixture.pid_in("launch-stream.pid").is_some_and(alive)
+            && fixture.pid_in("terminal.pid").is_some_and(alive)
     });
-    fixture.wait_for("the launched terminal", || {
-        fixture.pid_in("terminal.pid").is_some_and(alive)
-    });
-    fixture.wait_for("the answer to be awaited", || {
-        String::from_utf8_lossy(&fixture.lockout().stderr).contains("has not answered")
-    });
+    // Another app launching alongside is asked about too; only the answer
+    // after the terminal's launch notice is its own.
+    fixture.emit_launch("1", &requested());
+    fixture.emit_launch("2", &born_line());
+    fixture.emit_launch("3", &answered());
     thread::sleep(Duration::from_millis(1500));
+    assert!(deciding(&fixture.lockout()));
     assert!(!fixture.root().join("launcher.pid").exists());
     assert!(
         fixture
@@ -524,20 +577,15 @@ fn a_launched_terminal_gets_no_tab_until_screen_time_answers_for_it() {
             .contains("Held 1 sessions: Screen Time has not answered for alacritty's launch yet.")
     );
 
-    fixture.emit(
-        "1",
-        &agent_line("Requesting policy for bundle IDs: org.alacritty"),
-    );
-    fixture.emit(
-        "2",
-        &agent_line("Successfully requested policies for 1 bundleIdentifiers"),
-    );
+    fixture.emit_launch("4", &requested());
+    fixture.emit_launch("5", &answered());
     fixture.wait_for("the held restore", || {
         fixture
             .daemon_log()
             .contains("held restore: Restored 1 sessions")
     });
     assert_eq!(fixture.lockout().status.code(), Some(0));
+    assert!(!fixture.pid_in("launch-stream.pid").is_some_and(alive));
     assert_eq!(fixture.launches(), 1);
     fixture.stop_daemon();
 }
@@ -547,23 +595,23 @@ fn a_terminal_locked_out_at_launch_gets_no_tab_until_the_lockout_lifts() {
     let mut fixture = Fixture::launching("codex");
     fixture.start_daemon();
     fixture.wait_for("the launch", || {
-        fixture
-            .daemon_log()
-            .contains("launched alacritty for a restore")
+        fixture.pid_in("launch-stream.pid").is_some_and(alive)
+            && fixture.pid_in("terminal.pid").is_some_and(alive)
     });
-    fixture.emit(
-        "1",
-        &agent_line("Requesting policy for bundle IDs: org.alacritty"),
-    );
-    fixture.emit(
-        "2",
-        &agent_line("Successfully requested policies for 1 bundleIdentifiers"),
-    );
-    fixture.emit("3", &agent_line("Begin lockout on app: org.alacritty"));
+    fixture.emit_launch("1", &born_line());
+    fixture.emit_launch("2", &requested());
+    fixture.emit_launch("3", &answered());
+    fixture.emit_launch("4", &began());
     fixture.wait_for("the lockout to be known", || {
         fixture.lockout().status.code() == Some(1)
     });
+    let engaged = json!({
+        "eventMessage": "LockoutUI changed state: engaged",
+        "processID": fixture.terminal_pid(),
+    });
+    fixture.emit("1", &engaged);
     thread::sleep(Duration::from_millis(1500));
+    assert_eq!(fixture.lockout().status.code(), Some(1));
     assert!(!fixture.root().join("launcher.pid").exists());
     assert!(!fixture.daemon_log().contains("Restored 1"));
 
@@ -571,12 +619,89 @@ fn a_terminal_locked_out_at_launch_gets_no_tab_until_the_lockout_lifts() {
         "eventMessage": "LockoutUI changed state: disengaged",
         "processID": fixture.terminal_pid(),
     });
-    fixture.emit("4", &disengaged);
+    fixture.emit("2", &disengaged);
     fixture.wait_for("the held restore", || {
         fixture
             .daemon_log()
             .contains("held restore: Restored 1 sessions")
     });
     assert_eq!(fixture.launches(), 1);
+    fixture.stop_daemon();
+}
+
+#[test]
+fn lockout_wait_launches_the_terminal_and_returns_once_screen_time_answers() {
+    let mut fixture = Fixture::idle();
+    fixture.start_daemon();
+    fixture.wait_for("the closed terminal to read as not running", || {
+        String::from_utf8_lossy(&fixture.lockout().stderr).contains("is not running")
+    });
+    fixture.wait_for("the watcher's first read", || {
+        fs::read(fixture.state_file())
+            .ok()
+            .and_then(|state| serde_json::from_slice::<Value>(&state).ok())
+            .is_some_and(|state| state["seed"] != "Reading")
+    });
+    let mut waiting = fixture
+        .command(&["lockout", "--wait"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fixture.wait_for("the launch", || {
+        fixture.pid_in("launch-stream.pid").is_some_and(alive)
+            && fixture.pid_in("terminal.pid").is_some_and(alive)
+    });
+    thread::sleep(Duration::from_millis(500));
+    assert!(waiting.try_wait().unwrap().is_none());
+    assert!(deciding(&fixture.lockout()));
+
+    fixture.emit_launch("1", &born_line());
+    fixture.emit_launch("2", &requested());
+    fixture.emit_launch("3", &answered());
+    fixture.wait_for("lockout --wait to return", || {
+        waiting.try_wait().unwrap().is_some()
+    });
+    assert!(waiting.wait().unwrap().success());
+    assert_eq!(fixture.launches(), 1);
+    fixture.stop_daemon();
+}
+
+#[test]
+fn a_terminal_launched_by_anyone_else_waits_for_the_answer_after_its_check_in() {
+    let mut fixture = Fixture::idle();
+    fixture.start_daemon();
+    fixture.wait_for("the closed terminal to read as not running", || {
+        String::from_utf8_lossy(&fixture.lockout().stderr).contains("is not running")
+    });
+    fixture.wait_for("the watcher's first read", || {
+        fs::read(fixture.state_file())
+            .ok()
+            .and_then(|state| serde_json::from_slice::<Value>(&state).ok())
+            .is_some_and(|state| state["seed"] != "Reading")
+    });
+
+    fixture.terminal = Some(Command::new(stand_in_terminal_path()).spawn().unwrap());
+    assert!(deciding(&fixture.lockout()));
+    fixture.emit("1", &requested());
+    fixture.emit("2", &checkin_line(fixture.terminal_pid()));
+    fixture.emit("3", &answered());
+    thread::sleep(Duration::from_millis(1000));
+    assert!(deciding(&fixture.lockout()));
+    fixture.emit("4", &requested());
+    fixture.emit("5", &answered());
+    fixture.wait_for("the answer", || fixture.lockout().status.code() == Some(0));
+
+    let mut unlocked = fixture
+        .terminal
+        .replace(Command::new(stand_in_terminal_path()).spawn().unwrap())
+        .unwrap();
+    unlocked.kill().unwrap();
+    unlocked.wait().unwrap();
+    assert!(deciding(&fixture.lockout()));
+    fixture.emit("6", &checkin_line(fixture.terminal_pid()));
+    fixture.emit("7", &requested());
+    fixture.emit("8", &answered());
+    fixture.emit("9", &began());
+    fixture.wait_for("the lockout", || fixture.lockout().status.code() == Some(1));
     fixture.stop_daemon();
 }
