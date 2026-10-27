@@ -304,28 +304,21 @@ well and says why.
 AppKit logs nothing for a terminal that launches unlocked, and logs `engaged`
 about a second and a half after launch for one that launches locked out. To
 know a launch was not locked out, the daemon also follows Screen Time's lockout
-agent. The agent asks for each launched app's policy as it hears of the launch,
-answers its requests in order, and logs any lockout right after the answer
-that decided it. It redacts the app's name in those lines, so the daemon tells
-which request is the terminal's by its order:
+agent, which asks for each launched app's policy and logs any lockout inside
+the answer that decides it. The agent redacts the app's name unless
+`profiles/lockout-agent-names.mobileconfig` is installed, which makes its lines
+name the app for the `com.apple.LockoutAgent` subsystem only. With the profile,
+a terminal launched after the daemon started is undecided until the agent has
+answered for it: `session-guard lockout` answers 2, `--wait` waits, and a
+restore that has to launch the terminal launches it with no tab and opens tabs
+once the answer is in. Without the profile, a just-launched terminal counts as
+unlocked until it logs, so a tab opened in its first second and a half is not
+covered.
 
-- When session-guard launches the terminal itself, for a restore, a background
-  session's tab, or `session-guard lockout --wait`, it first opens a short
-  debug-level `log stream`. That stream carries the agent's launch notice,
-  which names the app, so the request after the terminal's notice is its own.
-  The stream closes once the agent has answered.
-- For a terminal launched any other way, the daemon's own stream sees
-  LaunchServices check the terminal in, by PID, and takes the agent's next
-  request as the terminal's. Another app launching in the same instant can
-  take its place in that order; the daemon's own launches are exact.
-
-Until the agent has answered for a launch, the terminal is undecided:
-`session-guard lockout` answers 2, `--wait` waits, and restores hold. An answer
-followed by no lockout within 250 ms counts as unlocked. Outside Downtime the
-answer takes a few milliseconds; the slowest measured on a swapping Mac took
-1.3 seconds. A terminal that is not running counts as undecided too, because a
-tab opened as it launches would come before the answer: `session-guard
-lockout` answers 2 and says so, and `--wait` launches it and waits.
+To install the profile, open it (`open profiles/lockout-agent-names.mobileconfig`),
+then approve it in System Settings under General → Device Management. The
+daemon notices on the next app launch; lines the agent logged before the
+profile stay redacted.
 
 A Claude session needs no tab to keep working, so a pass that finds the
 terminal locked out resumes it at once with `claude --bg --resume`, sending the

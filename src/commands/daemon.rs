@@ -222,10 +222,7 @@ pub fn run() -> Result<()> {
             && let Ok(terminal) = configured_terminal()
         {
             let now = lockout::lockout(terminal);
-            if now == Lockout::Clear
-                || now == Lockout::NotRunning
-                || (now == Lockout::Engaged && *seen != Lockout::Engaged)
-            {
+            if now == Lockout::Clear || (now == Lockout::Engaged && *seen != Lockout::Engaged) {
                 let summary = restore_once(RestoreMode::Held)?;
                 log_line(&format!("held restore: {}", summary.message()))?;
                 for error in &summary.errors {
@@ -602,29 +599,27 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
     while let Some(session) = to_open.next() {
         let kind = configured_terminal()?;
         let adapter = adapter.get_or_insert_with(|| adapter_for(kind));
-        let lockout = match lockout::lockout(kind) {
-            Lockout::NotRunning => match launch_terminal(kind) {
-                Ok(()) => {
-                    log_line(&format!("launching {kind} for a restore"))?;
-                    Lockout::Deciding
-                }
-                Err(error) => {
-                    for session in std::iter::once(session).chain(to_open) {
-                        summary.failed += 1;
-                        summary.errors.push(format!(
-                            "failed to restore {}: could not launch {kind}: {error:#}",
-                            session.session_id
-                        ));
-                    }
-                    break;
-                }
-            },
-            known => known,
+        // A terminal launched together with its first tab gives Screen Time no
+        // moment to lock it out before the tab; launch it alone and wait for
+        // the answer.
+        let lockout = if adapter.is_running() {
+            lockout::lockout(kind)
+        } else if let Err(error) = adapter.launch() {
+            for session in std::iter::once(session).chain(to_open) {
+                summary.failed += 1;
+                summary.errors.push(format!(
+                    "failed to restore {}: could not launch {kind}: {error:#}",
+                    session.session_id
+                ));
+            }
+            break;
+        } else {
+            log_line(&format!("launched {kind} for a restore"))?;
+            Lockout::Deciding
         };
         let held_reason = match &lockout {
             Lockout::Clear => None,
             Lockout::Engaged => Some(format!("{kind} is locked out by Screen Time")),
-            Lockout::NotRunning => Some(format!("{kind} is not running")),
             Lockout::Deciding => Some(format!(
                 "Screen Time has not answered for {kind}'s launch yet"
             )),
@@ -697,16 +692,6 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
     record_holds(&path, &attempted, &summary.held)
 }
 
-// A terminal launched together with its first tab gives Screen Time no moment
-// to lock it out before the tab, so it is launched alone, and tabs wait until
-// Screen Time has answered for the launch.
-fn launch_terminal(kind: TerminalKind) -> Result<()> {
-    lockout::launch(kind, move |failure| {
-        let _ = log_line(&format!("launching {kind} failed: {failure}"));
-    })
-    .map(drop)
-}
-
 // The session runs at once with no tab; `attach_backgrounded` gives it one when
 // the lockout lifts. The prompt is taken, marking it sent as a launch does,
 // only once the background session is up, so a failed start keeps it for the
@@ -770,18 +755,8 @@ fn attach_backgrounded(processes: &ProcessSnapshot) -> Result<()> {
         .into_iter()
         .filter(|session| session.attach_after_lockout)
         .collect();
-    if waiting.is_empty() {
+    if waiting.is_empty() || lockout::lockout(kind) != Lockout::Clear {
         return Ok(());
-    }
-    match lockout::lockout(kind) {
-        Lockout::Clear => {}
-        Lockout::NotRunning => {
-            launch_terminal(kind)?;
-            return log_line(&format!("launching {kind} for background sessions' tabs"));
-        }
-        Lockout::Engaged | Lockout::Deciding | Lockout::Reading | Lockout::Unknown(_) => {
-            return Ok(());
-        }
     }
     let restore_lock = crate::commands::restore::lock()?;
     restore_lock.lock_exclusive()?;
