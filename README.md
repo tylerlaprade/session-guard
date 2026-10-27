@@ -227,7 +227,10 @@ claims the session again and resumes it in place, after waiting out any
 critical memory pressure. A closed tab's SIGHUP, and SIGINT and SIGTERM, are
 stops, and a tool that dies before it registers is not relaunched, so a crash
 at startup cannot loop. Either way, the resume gets the same continuation and
-lost-message handling as any restore.
+lost-message handling as any restore. Any other failed exit marks the session
+recoverable, unless the tool fired its SessionEnd first: Claude exits 1 on a
+closed tab's SIGHUP after its SessionEnd, so that end is settled like any
+other, and a tab closed under a running terminal retires its session.
 
 Restored tabs run through `session-guard launch`. That foreground controller
 registers its process identity before starting the provider in the user's

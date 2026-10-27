@@ -2,7 +2,7 @@ use crate::adapters::shell_quote;
 use crate::commands::{daemon, deregister};
 use crate::paths;
 use crate::process::{self, ProcessSnapshot};
-use crate::sessions::{self, SessionRecord};
+use crate::sessions::{self, SessionRecord, SessionState};
 use anyhow::{Context, Result, bail};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
@@ -149,10 +149,12 @@ fn finish(record: &SessionRecord, succeeded: bool) -> Result<()> {
     let path = paths::sessions_file()?;
     if !succeeded {
         return sessions::with_sessions_mut(&path, |sessions| {
-            if let Some(current) = sessions
-                .iter_mut()
-                .find(|session| session.session_id == record.session_id)
-            {
+            // A tool that fired its SessionEnd has already said the session is
+            // over, and settling that end judges a closed tab from a teardown;
+            // Claude exits 1 on the SIGHUP of a closed tab, after its SessionEnd.
+            if let Some(current) = sessions.iter_mut().find(|session| {
+                session.session_id == record.session_id && session.state != SessionState::Ending
+            }) {
                 current.mark_recoverable();
             }
             Ok(())

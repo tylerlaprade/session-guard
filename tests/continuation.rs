@@ -443,3 +443,49 @@ fn a_launcher_resumes_its_tool_in_place_only_after_a_kill_once_it_came_up() {
         assert_eq!(records[0]["state"], "recoverable", "{case}");
     }
 }
+
+#[test]
+fn a_failed_exit_after_the_tools_session_end_is_left_for_the_daemon_to_settle() {
+    for (ends_itself, state) in [(true, "ending"), (false, "recoverable")] {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        let store = root.join(".config/session-guard/active-sessions.json");
+        fs::create_dir_all(root.join(".config/session-guard")).unwrap();
+        fs::create_dir(root.join("bin")).unwrap();
+        fs::write(
+            &store,
+            json!([{
+                "tool":"claude","session_id":ID,"directory":root,"session_name":null,
+                "registered_at":"2020-01-01T00:00:00Z","state":"recoverable","restore_pending":true,
+                "pid":2_147_483_647,"pid_started_at":STARTED
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let session_end = if ends_itself {
+            format!(
+                "printf '{{\"session_id\":\"{ID}\",\"hook_event_name\":\"SessionEnd\"}}' | '{}' deregister\n",
+                env!("CARGO_BIN_EXE_session-guard")
+            )
+        } else {
+            String::new()
+        };
+        let executable = root.join("bin/claude");
+        fs::write(&executable, format!("#!/bin/sh\n{session_end}exit 1\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_session-guard"))
+            .args(["launch", "--session-id", ID])
+            .env("HOME", root)
+            .env("CLAUDE_CONFIG_DIR", root.join(".claude"))
+            .env("SHELL", "/bin/sh")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "ends itself: {ends_itself}");
+        let records: Value = serde_json::from_slice(&fs::read(&store).unwrap()).unwrap();
+        assert_eq!(records[0]["state"], state, "ends itself: {ends_itself}");
+    }
+}
