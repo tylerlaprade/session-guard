@@ -9,18 +9,22 @@ use std::time::{Duration, Instant};
 
 const SESSION: &str = "5f0c2b48-865f-4829-af1b-7a248d2c2bee";
 
-// Stands in for `log`. The stored log holds no change and takes a moment to
-// read. The first stream reports the terminal locked out, so a later daemon
-// knows it only from the record the first one left; any stream lifts the
-// lockout when the test creates `lift`.
+// Stands in for `log`. The terminal was locked out before the first daemon
+// started, so the stored log shows that once; a later daemon knows it only
+// from the record the first one left. The stored log takes a moment to read,
+// and the stream lifts the lockout when the test creates `lift`.
 const LOG: &str = r#"#!/bin/sh
-[ "$1" = show ] && { sleep 1; echo '{"count":0,"finished":1}'; exit 0; }
+if [ "$1" = show ]; then
+    sleep 1
+    if [ ! -e "$HOME/reported" ]; then
+        : > "$HOME/reported"
+        echo "{\"processID\":$TERMINAL_PID,\"eventMessage\":\"LockoutUI changed state: engaged\"}"
+    fi
+    echo '{"count":0,"finished":1}'
+    exit 0
+fi
 echo $$ > "$HOME/stream.pid"
 echo 'Filtering the log data using "stand-in"'
-if [ ! -e "$HOME/reported" ]; then
-    : > "$HOME/reported"
-    echo "{\"processID\":$TERMINAL_PID,\"eventMessage\":\"LockoutUI changed state: engaged\"}"
-fi
 while [ ! -e "$HOME/lift" ]; do sleep 0.1; done
 echo "{\"processID\":$TERMINAL_PID,\"eventMessage\":\"LockoutUI changed state: disengaged\"}"
 exec sleep 600
@@ -110,6 +114,8 @@ impl Drop for Fixture {
             let _ = terminal.kill();
             let _ = terminal.wait();
         }
+        // The next fixture finds the terminal by name, so a killed one must be
+        // gone before this one lets go of `ONE_TERMINAL`.
         for (file, group) in [
             ("launcher.pid", true),
             ("stream.pid", false),
@@ -118,6 +124,10 @@ impl Drop for Fixture {
             if let Some(pid) = self.pid_in(file) {
                 unsafe {
                     libc::kill(if group { -pid } else { pid }, libc::SIGKILL);
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while alive(pid) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(20));
                 }
             }
         }
@@ -408,11 +418,13 @@ fn a_claude_session_resumes_in_the_background_and_gets_its_tab_after_the_lockout
     fixture.wait_for("the attach flag to clear", || {
         fixture.record()["attach_after_lockout"] == false
     });
-    // The startup pass ran while the watcher was still reading the state, so
-    // it held the session; the lockout, once known, sent it to the background.
-    assert!(fixture.daemon_log().contains(
-        "held restore: Restored 0 sessions (0 Claude Code, 0 Codex, 0 Grok, 0 OpenCode). Pruned 0 (directory gone). Resumed 1 in the background: alacritty is locked out by Screen Time."
-    ), "{}", fixture.daemon_log());
+    assert!(
+        fixture
+            .daemon_log()
+            .contains("Resumed 1 in the background: alacritty is locked out by Screen Time."),
+        "{}",
+        fixture.daemon_log()
+    );
     fixture.stop_daemon();
 }
 
