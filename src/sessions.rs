@@ -352,10 +352,92 @@ pub fn register(path: &Path, mut record: SessionRecord) -> Result<()> {
             record.tab_position = record.tab_position.or(previous.tab_position);
             record.attach_after_lockout = previous.attach_after_lockout;
         }
+        if !record.attach_after_lockout && record.tool.spec().background.is_some() {
+            record.attach_after_lockout = claim_pending_attach(path, &record.session_id)?;
+        }
         sessions.retain(|session| session.session_id != record.session_id);
         sessions.push(record);
         Ok(())
     })
+}
+
+/// What `attach_after_lockout` did with a background session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Attach {
+    Marked,
+    /// The session has not registered yet; its registration takes the mark.
+    Pending,
+}
+
+/// Marks the background session whose id starts with `id` for a tab once the
+/// terminal can take one. A session started a moment ago may not have
+/// registered yet, so the mark waits for its registration instead.
+pub fn attach_after_lockout(path: &Path, id: &str) -> Result<Attach> {
+    with_sessions_mut(path, |sessions| {
+        let mut matches = sessions
+            .iter_mut()
+            .filter(|session| session.session_id.starts_with(id));
+        let Some(session) = matches.next() else {
+            let pending_path = pending_attaches_path(path);
+            let mut pending = read_pending_attaches(&pending_path)?;
+            if !pending.iter().any(|waiting| waiting == id) {
+                pending.push(id.to_string());
+            }
+            write_pending_attaches(&pending_path, &pending)?;
+            return Ok(Attach::Pending);
+        };
+        if matches.next().is_some() {
+            anyhow::bail!("'{id}' matches more than one session");
+        }
+        session
+            .tool
+            .spec()
+            .background
+            .as_ref()
+            .with_context(|| format!("{} has no background mode", session.tool))?;
+        session.attach_after_lockout = true;
+        Ok(Attach::Marked)
+    })
+}
+
+// Kept beside the registry and changed only under its lock, so a session
+// registering cannot slip between the check and the mark.
+fn pending_attaches_path(path: &Path) -> PathBuf {
+    path.with_file_name("attach-after-lockout.json")
+}
+
+fn read_pending_attaches(path: &Path) -> Result<Vec<String>> {
+    match fs::read(path) {
+        Ok(contents) => serde_json::from_slice(&contents)
+            .with_context(|| format!("failed to parse {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+fn write_pending_attaches(path: &Path, pending: &[String]) -> Result<()> {
+    if pending.is_empty() {
+        return match fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("failed to remove {}", path.display()))
+            }
+            Ok(()) | Err(_) => Ok(()),
+        };
+    }
+    fs::write(path, serde_json::to_vec(pending)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn claim_pending_attach(path: &Path, session_id: &str) -> Result<bool> {
+    let pending_path = pending_attaches_path(path);
+    let mut pending = read_pending_attaches(&pending_path)?;
+    let before = pending.len();
+    pending.retain(|waiting| !session_id.starts_with(waiting.as_str()));
+    if pending.len() == before {
+        return Ok(false);
+    }
+    write_pending_attaches(&pending_path, &pending)?;
+    Ok(true)
 }
 
 pub fn repair_if_corrupt(path: &Path) -> Result<Option<PathBuf>> {
@@ -480,6 +562,68 @@ mod tests {
         before.read_to_string(&mut original).unwrap();
         assert_eq!(original, "[]\n");
         assert_eq!(read_sessions(&path).unwrap().len(), 8);
+    }
+
+    fn background_session(tool: &str, session_id: &str) -> SessionRecord {
+        SessionRecord::new(
+            crate::tool(tool),
+            session_id.to_string(),
+            Some(1),
+            Some(10),
+            PathBuf::from("/tmp/one"),
+            None,
+            None,
+            Some("startup".to_string()),
+        )
+    }
+
+    #[test]
+    fn a_session_handed_off_before_it_registers_is_marked_when_it_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active-sessions.json");
+        let session = "6d27e092-0000-4000-8000-000000000000";
+        assert_eq!(
+            attach_after_lockout(&path, &session[..8]).unwrap(),
+            Attach::Pending
+        );
+        register(
+            &path,
+            background_session("claude", "7e000000-0000-4000-8000-000000000000"),
+        )
+        .unwrap();
+        register(&path, background_session("claude", session)).unwrap();
+        let sessions = read_sessions(&path).unwrap();
+        assert!(!sessions[0].attach_after_lockout);
+        assert!(sessions[1].attach_after_lockout);
+        assert!(!pending_attaches_path(&path).exists());
+
+        register(&path, background_session("claude", session)).unwrap();
+        assert!(read_sessions(&path).unwrap()[1].attach_after_lockout);
+    }
+
+    #[test]
+    fn a_registered_session_is_marked_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active-sessions.json");
+        let session = "6d27e092-0000-4000-8000-000000000000";
+        register(&path, background_session("claude", session)).unwrap();
+        assert_eq!(
+            attach_after_lockout(&path, &session[..8]).unwrap(),
+            Attach::Marked
+        );
+        assert!(read_sessions(&path).unwrap()[0].attach_after_lockout);
+        assert!(!pending_attaches_path(&path).exists());
+    }
+
+    #[test]
+    fn a_pending_hand_off_waits_for_a_tool_with_a_background_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active-sessions.json");
+        let session = "6d27e092-0000-4000-8000-000000000000";
+        attach_after_lockout(&path, &session[..8]).unwrap();
+        register(&path, background_session("codex", session)).unwrap();
+        assert!(!read_sessions(&path).unwrap()[0].attach_after_lockout);
+        assert!(pending_attaches_path(&path).exists());
     }
 
     #[test]

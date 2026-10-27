@@ -331,6 +331,10 @@ with `claude --bg` itself can hand it to the daemon the same way:
 session-guard attach-after-lockout 1499f9ac   # the short id `claude --bg` prints
 ```
 
+The session registers through its own hooks a moment after `claude --bg`
+returns, and later still on a busy Mac. A hand-off that comes first is kept
+until the session registers, and the registration takes it.
+
 Scripts that open terminal tabs can ask the same question:
 
 ```sh
