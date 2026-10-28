@@ -11,7 +11,6 @@
 
 use crate::TerminalKind;
 use crate::adapters::adapter_for;
-use crate::kid_mode::{self, KidMode};
 use crate::paths;
 use crate::process::{self, ProcessIdentityStatus};
 use anyhow::{Context, Result};
@@ -70,9 +69,6 @@ pub enum Lockout {
     Reading,
     /// The terminal just launched and Screen Time has not answered for it yet.
     Deciding,
-    /// Kid mode is on, so a tab, or the terminal launching, would take the
-    /// screen from the child using the Mac.
-    KidMode,
     Unknown(String),
 }
 
@@ -296,23 +292,6 @@ impl Launch {
 }
 
 pub fn lockout(terminal: TerminalKind) -> Lockout {
-    match screen_time_lockout(terminal) {
-        screen_time @ (Lockout::Clear | Lockout::NotRunning) => match kid_mode::kid_mode() {
-            KidMode::Off => screen_time,
-            KidMode::On => Lockout::KidMode,
-            KidMode::Unknown(reason) => {
-                Lockout::Unknown(format!("cannot tell whether kid mode is on: {reason}"))
-            }
-        },
-        held @ (Lockout::Engaged
-        | Lockout::Reading
-        | Lockout::Deciding
-        | Lockout::KidMode
-        | Lockout::Unknown(_)) => held,
-    }
-}
-
-fn screen_time_lockout(terminal: TerminalKind) -> Lockout {
     let current = current_instance(terminal);
     let (state, launch) = match (paths::lockout_state(), paths::lockout_launch()) {
         (Ok(state), Ok(launch)) => (state, launch),
@@ -1317,17 +1296,11 @@ pub fn run(wait: bool) -> ! {
                     std::process::exit(2);
                 }
             }
-            Lockout::Engaged | Lockout::KidMode | Lockout::Reading | Lockout::Deciding if wait => {
+            Lockout::Engaged | Lockout::Reading | Lockout::Deciding if wait => {
                 thread::sleep(WAIT_INTERVAL);
             }
             Lockout::Engaged => {
                 eprintln!("{terminal} is locked out by Screen Time");
-                std::process::exit(1);
-            }
-            Lockout::KidMode => {
-                eprintln!(
-                    "kid mode is on, and a tab opened now would take the screen from the child"
-                );
                 std::process::exit(1);
             }
             Lockout::NotRunning => {

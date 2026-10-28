@@ -7,7 +7,6 @@ mod exit_watch;
 mod fresh_tab;
 mod harness;
 mod hooks;
-mod kid_mode;
 mod last_sessions;
 mod lockout;
 mod paths;
@@ -266,9 +265,9 @@ enum Command {
         all: bool,
     },
     /// Exit 0 when a tab can be opened now; 1 while Screen Time has the
-    /// terminal locked out or kid mode is on; 2 when that cannot be known yet
-    /// or the terminal is not running. A tab opened while the terminal is
-    /// locked out crashes it when the lockout lifts.
+    /// terminal locked out; 2 when that cannot be known yet or the terminal is
+    /// not running. A tab opened while the terminal is locked out crashes it
+    /// when the lockout lifts.
     Lockout {
         #[arg(
             long,
@@ -277,7 +276,7 @@ enum Command {
         wait: bool,
     },
     /// Give a session started with `claude --bg` a terminal tab once Screen
-    /// Time no longer has the terminal locked out and kid mode is off.
+    /// Time no longer has the terminal locked out.
     AttachAfterLockout {
         #[arg(help = "Session id, or the short id `claude --bg` prints")]
         id: String,

@@ -260,7 +260,6 @@ impl Fixture {
             .env("TERMINAL_PID", self.terminal_pid().to_string())
             .env("STAND_IN", stand_in_terminal_path())
             .env("SESSION_GUARD_LOCKOUT_AGENT", AGENT)
-            .env("SESSION_GUARD_KANATA_PLIST", root.join("kanata.plist"))
             .env(
                 "PATH",
                 format!(
@@ -1022,98 +1021,5 @@ fn an_agent_that_exits_takes_its_open_requests_with_it() {
     fixture.emit("3", &requested());
     fixture.emit("4", &answered());
     fixture.wait_for("the answer", || fixture.lockout().status.code() == Some(0));
-    fixture.stop_daemon();
-}
-
-/// Stands in for Kanata: it greets each client with the current layer, as
-/// Kanata does, and its launch daemon's plist names its port.
-struct Kanata {
-    layer: std::sync::Arc<std::sync::Mutex<String>>,
-}
-
-impl Kanata {
-    fn start(fixture: &Fixture, layer: &str) -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        fs::write(
-            fixture.root().join("kanata.plist"),
-            format!(
-                "<array>\n<string>kanata</string>\n<string>--port</string>\n<string>{}</string>\n</array>\n",
-                listener.local_addr().unwrap()
-            ),
-        )
-        .unwrap();
-        let layer = std::sync::Arc::new(std::sync::Mutex::new(layer.to_string()));
-        let current = std::sync::Arc::clone(&layer);
-        thread::spawn(move || {
-            for client in listener.incoming().flatten() {
-                let mut client = client;
-                let greeting = json!({"LayerChange": {"new": *current.lock().unwrap()}});
-                let _ = std::io::Write::write_all(&mut client, format!("{greeting}\n").as_bytes());
-            }
-        });
-        Self { layer }
-    }
-
-    fn switch_to(&self, layer: &str) {
-        *self.layer.lock().unwrap() = layer.to_string();
-    }
-}
-
-#[test]
-fn kid_mode_reads_as_no_tab_and_waits_like_a_lockout() {
-    let fixture = Fixture::idle();
-    let kanata = Kanata::start(&fixture, "kid");
-    let held = fixture.lockout();
-    assert_eq!(held.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&held.stderr).contains("kid mode is on"));
-    kanata.switch_to("base");
-    let clear = fixture.lockout();
-    assert!(String::from_utf8_lossy(&clear.stderr).contains("is not running"));
-}
-
-#[test]
-fn a_claude_session_restored_in_kid_mode_gets_its_tab_once_kid_mode_ends() {
-    let mut fixture = Fixture::new("claude");
-    fs::write(fixture.root().join("lift"), "").unwrap();
-    let kanata = Kanata::start(&fixture, "kid");
-    fixture.start_daemon();
-    fixture.wait_for("the background resume", || {
-        fixture
-            .daemon_log()
-            .contains("Resumed 1 in the background: kid mode is on.")
-    });
-    let claude_args = || fs::read_to_string(fixture.root().join("claude.args")).unwrap_or_default();
-    thread::sleep(Duration::from_secs(6));
-    assert!(
-        !claude_args().contains("attach"),
-        "{}\n{}",
-        claude_args(),
-        fixture.daemon_log()
-    );
-
-    kanata.switch_to("base");
-    fixture.wait_for("the attach tab", || {
-        claude_args().contains(&format!("attach {}", &SESSION[..8]))
-    });
-    fixture.stop_daemon();
-}
-
-#[test]
-fn a_codex_session_restored_in_kid_mode_waits_for_its_tab() {
-    let mut fixture = Fixture::new("codex");
-    fs::write(fixture.root().join("lift"), "").unwrap();
-    let kanata = Kanata::start(&fixture, "kid");
-    fixture.start_daemon();
-    fixture.wait_for("the hold", || {
-        fixture.daemon_log().contains("kid mode is on")
-    });
-    thread::sleep(Duration::from_secs(2));
-    assert!(!fixture.root().join("launcher.pid").exists());
-    kanata.switch_to("base");
-    fixture.wait_for("the held restore", || {
-        fixture
-            .daemon_log()
-            .contains("held restore: Restored 1 sessions")
-    });
     fixture.stop_daemon();
 }
