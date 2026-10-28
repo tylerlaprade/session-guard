@@ -35,9 +35,14 @@ exec sleep 600
 
 // Stands in for `log` when the test supplies the lockout agent's lines: each
 // file dropped in `emit/` is delivered once, in name order, and the debug-level
-// stream a launch watches reads `emit-launch/` the same way.
+// stream a launch watches reads `emit-launch/` the same way. A launch's read of
+// the requests still open shows `open-requests` when there is one, and the
+// launch stream holds back its banner while `hold-banner` exists.
 const CUED_LOG: &str = r#"#!/bin/sh
 if [ "$1" = show ]; then
+    case "$*" in
+        *--end*) [ -e "$HOME/open-requests" ] && cat "$HOME/open-requests" ;;
+    esac
     echo '{"count":0,"finished":1}'
     exit 0
 fi
@@ -46,6 +51,7 @@ case "$*" in
     *) name=stream cues="$HOME/emit" ;;
 esac
 echo $$ > "$HOME/$name.pid"
+while [ "$name" = launch-stream ] && [ -e "$HOME/hold-banner" ]; do sleep 0.05; done
 echo 'Filtering the log data using "stand-in"'
 mkdir -p "$cues"
 while :; do
@@ -263,6 +269,12 @@ impl Fixture {
             )
             .stdin(Stdio::null());
         command
+    }
+
+    fn stop_agent(&mut self) {
+        let mut agent = self.agent.take().unwrap();
+        agent.kill().unwrap();
+        agent.wait().unwrap();
     }
 
     fn launches(&self) -> usize {
@@ -539,7 +551,11 @@ fn a_failed_background_start_keeps_the_work_it_would_have_resumed() {
 }
 
 fn agent_line(message: &str) -> Value {
-    json!({"eventMessage": message, "processID": 762})
+    agent_line_on(message, 7)
+}
+
+fn agent_line_on(message: &str, thread: u64) -> Value {
+    json!({"eventMessage": message, "processID": 762, "threadID": thread})
 }
 
 fn born_line() -> Value {
@@ -561,11 +577,22 @@ fn requested() -> Value {
 }
 
 fn answered() -> Value {
-    agent_line("Successfully requested policies for 1 bundleIdentifiers")
+    answered_on(7)
+}
+
+fn answered_on(thread: u64) -> Value {
+    agent_line_on(
+        "Successfully requested policies for 1 bundleIdentifiers",
+        thread,
+    )
 }
 
 fn began() -> Value {
-    agent_line("Begin lockout on app: <private>")
+    began_on(7)
+}
+
+fn began_on(thread: u64) -> Value {
+    agent_line_on("Begin lockout on app: <private>", thread)
 }
 
 fn deciding(output: &Output) -> bool {
@@ -618,10 +645,14 @@ fn a_terminal_locked_out_at_launch_gets_no_tab_until_the_lockout_lifts() {
         fixture.pid_in("launch-stream.pid").is_some_and(alive)
             && fixture.pid_in("terminal.pid").is_some_and(alive)
     });
+    // Answered on two threads, the lockout comes on the terminal's.
     fixture.emit_launch("1", &born_line());
-    fixture.emit_launch("2", &requested());
-    fixture.emit_launch("3", &answered());
-    fixture.emit_launch("4", &began());
+    fixture.emit_launch("2", &born("com.apple.dictionary", "Foreground"));
+    fixture.emit_launch("3", &requested());
+    fixture.emit_launch("4", &requested());
+    fixture.emit_launch("5", &answered_on(7));
+    fixture.emit_launch("6", &answered_on(9));
+    fixture.emit_launch("7", &began_on(7));
     fixture.wait_for("the lockout to be known", || {
         fixture.lockout().status.code() == Some(1)
     });
@@ -705,12 +736,11 @@ fn a_terminal_launched_by_anyone_else_waits_for_the_answer_after_its_check_in() 
     fixture.emit("1", &requested());
     fixture.emit("2", &checkin_line(fixture.terminal_pid()));
     fixture.emit("3", &answered());
-    fixture.emit(
-        "4",
-        &agent_line("Received policy changed notification for registration dmf.policy.monitor.app"),
-    );
     fixture.emit("5", &requested());
-    fixture.emit("6", &answered());
+    fixture.emit(
+        "6",
+        &agent_line("Successfully requested policies for 12 bundleIdentifiers"),
+    );
     fixture.emit("7", &began());
     thread::sleep(Duration::from_millis(1000));
     assert!(deciding(&fixture.lockout()));
@@ -745,5 +775,130 @@ fn without_screen_times_lockout_agent_a_launched_terminal_takes_tabs_at_once() {
     assert!(!fixture.root().join("launch-stream.pid").exists());
     assert_eq!(fixture.lockout().status.code(), Some(0));
     assert_eq!(fixture.launches(), 1);
+    fixture.stop_daemon();
+}
+
+fn restored_without_a_tab_first(fixture: &Fixture) {
+    thread::sleep(Duration::from_millis(1000));
+    assert!(deciding(&fixture.lockout()));
+    assert!(!fixture.root().join("launcher.pid").exists());
+}
+
+fn wait_for_launch(fixture: &Fixture) {
+    fixture.wait_for("the launch", || {
+        fixture.pid_in("launch-stream.pid").is_some_and(alive)
+            && fixture.pid_in("terminal.pid").is_some_and(alive)
+    });
+}
+
+fn wait_for_held_restore(fixture: &Fixture) {
+    fixture.wait_for("the held restore", || {
+        fixture
+            .daemon_log()
+            .contains("held restore: Restored 1 sessions")
+    });
+}
+
+#[test]
+fn a_failed_request_for_the_launch_answers_it() {
+    let mut fixture = Fixture::launching("codex");
+    fixture.start_daemon();
+    wait_for_launch(&fixture);
+    fixture.emit_launch("1", &born_line());
+    fixture.emit_launch("2", &requested());
+    restored_without_a_tab_first(&fixture);
+    fixture.emit_launch("3", &agent_line("Error requesting policies: <private>"));
+    wait_for_held_restore(&fixture);
+    assert_eq!(fixture.lockout().status.code(), Some(0));
+    fixture.stop_daemon();
+}
+
+#[test]
+fn answers_for_requests_open_before_the_launch_come_first() {
+    let mut fixture = Fixture::launching("codex");
+    // Asked a moment before the launch, and one asked after it that the
+    // stream delivers instead.
+    let at = |offset: i64| {
+        (Utc::now() + Age::seconds(offset))
+            .format("%Y-%m-%d %H:%M:%S%.6f+0000")
+            .to_string()
+    };
+    let mut asked = requested();
+    asked["timestamp"] = json!(at(-5));
+    let mut later = requested();
+    later["timestamp"] = json!(at(30));
+    fs::write(
+        fixture.root().join("open-requests"),
+        format!("{asked}\n{later}\n"),
+    )
+    .unwrap();
+    fixture.start_daemon();
+    wait_for_launch(&fixture);
+    fixture.emit_launch("1", &born_line());
+    fixture.emit_launch("2", &requested());
+    fixture.emit_launch("3", &answered());
+    // Downtime starting meanwhile: one answer for every running app, then
+    // its lockouts.
+    fixture.emit_launch("4", &requested());
+    fixture.emit_launch(
+        "5",
+        &agent_line("Successfully requested policies for 12 bundleIdentifiers"),
+    );
+    fixture.emit_launch("6", &began());
+    fixture.emit_launch("7", &began());
+    restored_without_a_tab_first(&fixture);
+    fixture.emit_launch("8", &answered());
+    wait_for_held_restore(&fixture);
+    assert_eq!(fixture.lockout().status.code(), Some(0));
+    fixture.stop_daemon();
+}
+
+#[test]
+fn an_agent_that_exits_ends_the_wait_for_its_answer() {
+    let mut fixture = Fixture::launching("codex");
+    fixture.start_daemon();
+    wait_for_launch(&fixture);
+    fixture.emit_launch("1", &born_line());
+    fixture.emit_launch("2", &requested());
+    restored_without_a_tab_first(&fixture);
+    fixture.stop_agent();
+    wait_for_held_restore(&fixture);
+    assert!(!fixture.pid_in("launch-stream.pid").is_some_and(alive));
+    fixture.stop_daemon();
+}
+
+#[test]
+fn a_terminal_already_starting_when_its_launch_is_watched_is_followed_from_its_check_in() {
+    let mut fixture = Fixture::idle();
+    fs::write(fixture.root().join("hold-banner"), "").unwrap();
+    fixture.start_daemon();
+    fixture.wait_for("the closed terminal to read as not running", || {
+        String::from_utf8_lossy(&fixture.lockout().stderr).contains("is not running")
+    });
+    let mut waiting = fixture
+        .command(&["lockout", "--wait"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fixture.wait_for("the launch stream", || {
+        fixture.pid_in("launch-stream.pid").is_some_and(alive)
+    });
+    fixture.terminal = Some(Command::new(stand_in_terminal_path()).spawn().unwrap());
+    fs::remove_file(fixture.root().join("hold-banner")).unwrap();
+    fixture.wait_for("the launch stream to close", || {
+        !fixture.pid_in("launch-stream.pid").is_some_and(alive)
+    });
+    thread::sleep(Duration::from_millis(500));
+    assert!(waiting.try_wait().unwrap().is_none());
+    assert!(deciding(&fixture.lockout()));
+
+    fixture.emit("1", &checkin_line(fixture.terminal_pid()));
+    fixture.emit("2", &requested());
+    fixture.emit("3", &answered());
+    fixture.wait_for("lockout --wait to return", || {
+        waiting.try_wait().unwrap().is_some()
+    });
+    assert!(waiting.wait().unwrap().success());
+    assert_eq!(fixture.launches(), 0);
     fixture.stop_daemon();
 }

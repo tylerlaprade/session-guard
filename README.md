@@ -306,21 +306,31 @@ about a second and a half after launch for one that launches locked out. To
 know a launch was not locked out, the daemon also follows Screen Time's lockout
 agent. The agent asks for the policy of each app launched in the foreground,
 in the order it hears of the launches, and logs any lockout right after the
-answer that decided it. It redacts the app's name in those lines, and nothing
-in them ties a request to its launch, so the daemon counts on that order:
+answer that decided it, on the same thread. It redacts the app's name in those
+lines, and nothing in them ties an answer to its launch, so the daemon counts
+on that order:
 
 - When session-guard launches the terminal itself, for a restore, a background
   session's tab, or `session-guard lockout --wait`, it first opens a short
   debug-level `log stream`. That stream carries the agent's launch notices,
   which name each app and say whether it runs in the foreground, so the
-  daemon knows how many requests come before the terminal's. Launches heard
-  of together are answered in that order. The request the agent makes for
-  every running app when its policy changes, at the start and end of
-  Downtime, is left out. The stream closes once the agent has answered.
+  daemon knows how many answers come before the terminal's. It also reads the
+  last minute of the stored log for requests still unanswered when the stream
+  opened, whose answers come first. The stream closes once the agent has
+  answered. A terminal that was already starting when the stream opened is
+  followed from its check-in instead, as below.
 - For a terminal launched any other way, the daemon's own stream sees
-  LaunchServices check the terminal in, by PID, and takes the agent's next
-  request as the terminal's. Another app launching in the same instant can
-  take its place in that order; the daemon's own launches are exact.
+  LaunchServices check the terminal in, by PID. The agent's next answer, after
+  the ones still due for requests already asked, is the terminal's. Another
+  app launching in the same instant can take its place in that order; the
+  daemon's own launches are exact.
+
+An answer for more than one app is the one the agent asks for every running
+app when its policy changes, at the start and end of Downtime, and decides no
+launch. A request that fails decides the launch as unlocked, since nothing
+locks an app out after a failed request; a lockout that comes later still
+shows in AppKit's own line. If the agent exits while a launch waits for its
+answer, the wait ends there.
 
 Until the agent has answered for a launch, the terminal is undecided:
 `session-guard lockout` answers 2, `--wait` waits, and restores hold. An answer

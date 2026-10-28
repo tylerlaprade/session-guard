@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -36,9 +36,9 @@ const BIRTH_APP_KEY: &str = r#""BundleIdentifierLowerCase"=""#;
 const BIRTH_TYPE_KEY: &str = r#""ApplicationType"=""#;
 // The agent asks about a launch only for an app of this type.
 const FOREGROUND: &str = "Foreground";
-const POLICY_CHANGED_PREFIX: &str = "Received policy changed notification";
 const REQUESTED_PREFIX: &str = "Requesting policy for bundle IDs: ";
 const ANSWERED_PREFIX: &str = "Successfully requested policies for ";
+const FAILED_PREFIX: &str = "Error requesting policies: ";
 const BEGAN_PREFIX: &str = "Begin lockout on app: ";
 const AGENT: &str = "lockoutagent";
 // The tests stand in for the agent, and for its absence, by another name.
@@ -52,6 +52,10 @@ const WAIT_INTERVAL: Duration = Duration::from_millis(500);
 // resumed read starts this far before the old follower stopped. Reading part
 // of what it already read again changes nothing.
 const RESUME_OVERLAP: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
+// A launch's stream counts the agent's requests still open when it starts
+// from this far back in the stored log. The slowest answer measured took 1.3
+// seconds; a request open for longer than this would be missed.
+const OPEN_REQUESTS_LOOKBACK: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lockout {
@@ -232,6 +236,9 @@ struct Launch {
     /// Taken just before the launch; an instance started earlier is not it.
     at: chrono::DateTime<chrono::Utc>,
     outcome: Outcome,
+    /// The debug-level stream watching the launch, while it runs.
+    #[serde(default)]
+    stream: Option<Instance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,8 +268,10 @@ impl Launch {
         }
     }
 
-    /// Why the launch failed, while the process that tried is still up; the
-    /// next one tries again.
+    /// Why the launch failed, while the process that tried is still up. The
+    /// terminal is not running then, and launching it again on every pass
+    /// would relaunch it every second; restores hold, saying why, until the
+    /// terminal runs or the daemon restarts.
     fn failure(&self, running: impl Fn(&Instance) -> bool) -> Option<String> {
         match &self.outcome {
             Outcome::Failed(reason) => {
@@ -311,8 +320,11 @@ fn current_instance(terminal: TerminalKind) -> Option<Instance> {
 /// Without its lockout agent Screen Time locks nothing out, and nothing would
 /// ever answer for a launch.
 fn agent_running() -> bool {
-    let agent = std::env::var(AGENT_PROCESS_VARIABLE).unwrap_or_else(|_| AGENT.to_string());
-    !process::pids_named_ignoring_case(&agent).is_empty()
+    !process::pids_named_ignoring_case(&agent_process()).is_empty()
+}
+
+fn agent_process() -> String {
+    std::env::var(AGENT_PROCESS_VARIABLE).unwrap_or_else(|_| AGENT.to_string())
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -334,7 +346,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 fn agent_clause(launch_notice: &str) -> String {
     format!(
-        r#"process == "{AGENT}" AND ({launch_notice}eventMessage BEGINSWITH "{POLICY_CHANGED_PREFIX}" OR eventMessage BEGINSWITH "{REQUESTED_PREFIX}" OR eventMessage BEGINSWITH "{ANSWERED_PREFIX}" OR eventMessage BEGINSWITH "{BEGAN_PREFIX}")"#
+        r#"process == "{AGENT}" AND ({launch_notice}eventMessage BEGINSWITH "{REQUESTED_PREFIX}" OR eventMessage BEGINSWITH "{ANSWERED_PREFIX}" OR eventMessage BEGINSWITH "{FAILED_PREFIX}" OR eventMessage BEGINSWITH "{BEGAN_PREFIX}")"#
     )
 }
 
@@ -359,16 +371,15 @@ enum Event {
     /// The lockout agent hearing of an app's launch, named in lower case;
     /// only a stream at debug level carries it.
     Born { app: String, foreground: bool },
-    /// The policy changed, as at the start and end of Downtime, so the
-    /// agent's next request is for every running app, not for a launch.
-    PolicyChanged,
     /// The lockout agent asking for a launched app's policy, or for every
-    /// running app's after a policy change.
+    /// running app's when the policy changes.
     Requested,
-    /// The answer to the agent's oldest open request.
-    Answered,
-    /// The agent locking an app out, right after the answer that decided it.
-    Began,
+    /// The answer to one of the agent's requests, logged on `thread`: for
+    /// how many apps, or None when the request failed.
+    Answered { thread: u64, apps: Option<usize> },
+    /// The agent locking an app out, right after the answer that decided it
+    /// and on the same thread.
+    Began { thread: u64 },
 }
 
 fn parse_event(line: &str) -> Result<Option<Event>> {
@@ -383,17 +394,34 @@ fn parse_event(line: &str) -> Result<Option<Event>> {
     else {
         return Ok(None);
     };
+    let thread = || {
+        value
+            .get("threadID")
+            .and_then(serde_json::Value::as_u64)
+            .with_context(|| format!("no thread for '{message}'"))
+    };
     if message.starts_with(REQUESTED_PREFIX) {
         return Ok(Some(Event::Requested));
     }
-    if message.starts_with(ANSWERED_PREFIX) {
-        return Ok(Some(Event::Answered));
+    if let Some(apps) = message.strip_prefix(ANSWERED_PREFIX) {
+        let apps = apps
+            .split_whitespace()
+            .next()
+            .and_then(|apps| apps.parse().ok())
+            .with_context(|| format!("unrecognized answer '{message}'"))?;
+        return Ok(Some(Event::Answered {
+            thread: thread()?,
+            apps: Some(apps),
+        }));
+    }
+    if message.starts_with(FAILED_PREFIX) {
+        return Ok(Some(Event::Answered {
+            thread: thread()?,
+            apps: None,
+        }));
     }
     if message.starts_with(BEGAN_PREFIX) {
-        return Ok(Some(Event::Began));
-    }
-    if message.starts_with(POLICY_CHANGED_PREFIX) {
-        return Ok(Some(Event::PolicyChanged));
+        return Ok(Some(Event::Began { thread: thread()? }));
     }
     if message.starts_with(CHECKIN_PREFIX) {
         let mut fields = message.split_whitespace().skip(1);
@@ -451,6 +479,7 @@ impl Watcher {
         if let Some(previous) = &previous {
             stop_orphaned_stream(previous);
         }
+        stop_orphaned_launch_stream(&paths::lockout_launch()?);
         let mut stream = Command::new("log")
             .args([
                 "stream",
@@ -584,19 +613,124 @@ fn follow(
     record.seed = Seed::Read { terminal: current };
     write_json(path, record)?;
 
+    let mut agent = None;
     loop {
-        let wait = answers
-            .deadline()
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        match wait {
-            Some(wait) if !readable(&stream, i32::try_from(wait.as_millis())?)? => {
-                if let Some(decision) = answers.expire() {
+        if !answers.is_deciding() {
+            agent = None;
+        } else if agent.is_none() {
+            agent = AgentExit::watch()?;
+            if agent.is_none() {
+                for decision in answers.agent_gone() {
                     decision.record(record);
                 }
             }
-            _ => answers.follow(&read_line(&mut stream)?, terminal, record)?,
+        }
+        match next(&stream, agent.as_ref(), answers.deadline())? {
+            Next::Line => answers.follow(&read_line(&mut stream)?, terminal, record)?,
+            Next::AgentExited => {
+                agent = None;
+                for decision in answers.agent_gone() {
+                    decision.record(record);
+                }
+            }
+            Next::Deadline => {
+                for decision in answers.expire() {
+                    decision.record(record);
+                }
+            }
         }
         write_json(path, record)?;
+    }
+}
+
+/// Readable once Screen Time's lockout agent exits. launchd starts it on
+/// demand, so it can end while a launch waits for its answer.
+struct AgentExit {
+    queue: OwnedFd,
+}
+
+impl AgentExit {
+    /// None when the agent is not running.
+    fn watch() -> Result<Option<Self>> {
+        let pids = process::pids_named_ignoring_case(&agent_process());
+        if pids.is_empty() {
+            return Ok(None);
+        }
+        let queue = unsafe { libc::kqueue() };
+        if queue < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to watch the lockout agent");
+        }
+        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+        let mut watched = 0;
+        for pid in pids {
+            let change = libc::kevent {
+                ident: usize::try_from(pid)?,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let registered = unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    &raw const change,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            // A pid that exited since the listing cannot be watched.
+            if registered == 0 {
+                watched += 1;
+            }
+        }
+        Ok((watched > 0).then_some(Self { queue }))
+    }
+}
+
+enum Next {
+    Line,
+    AgentExited,
+    Deadline,
+}
+
+/// Waits for a line from `stream`, the agent's exit, or `deadline`.
+fn next(
+    stream: &BufReader<ChildStdout>,
+    agent: Option<&AgentExit>,
+    deadline: Option<Instant>,
+) -> Result<Next> {
+    if !stream.buffer().is_empty() {
+        return Ok(Next::Line);
+    }
+    let mut ready = vec![libc::pollfd {
+        fd: stream.get_ref().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    if let Some(agent) = agent {
+        ready.push(libc::pollfd {
+            fd: agent.queue.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    let timeout = deadline.map_or(Ok(-1), |deadline| {
+        i32::try_from(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+    })?;
+    let count = libc::nfds_t::try_from(ready.len())?;
+    match unsafe { libc::poll(ready.as_mut_ptr(), count, timeout) } {
+        -1 => Err(std::io::Error::last_os_error()).context("failed to poll the lockout log stream"),
+        0 => Ok(Next::Deadline),
+        _ if ready[0].revents != 0 => Ok(Next::Line),
+        _ => Ok(Next::AgentExited),
     }
 }
 
@@ -643,10 +777,19 @@ impl Decision {
 }
 
 /// Pairs the lockout agent's answers with the terminal's launch. The agent
-/// asks about each foreground launch it hears of and answers its requests;
-/// nothing in its lines ties a request to its launch or an answer to its
-/// request, and they run on different threads, so this takes both to keep
-/// the order of the launches. Launches heard of together have kept it.
+/// asks about each foreground launch as it hears of it, and nothing in its
+/// lines ties an answer to its launch: they run on several threads and the
+/// app's name is redacted. So this takes the answers to come in the order of
+/// the launches, as they did for launches heard of together. An answer for
+/// more than one app is the one the agent asks for every running app when
+/// its policy changes, at the start and end of Downtime; one that covers a
+/// single running app would pass for a launch's.
+///
+/// Answers for requests asked before the terminal's launch come first: the
+/// daemon's stream counts the ones open when the terminal checks in, and a
+/// launch's own stream reads them from the stored log. A launch the agent
+/// hears of in the moment before either, and asks about just after, can
+/// still take the terminal's place; that window is a few milliseconds.
 ///
 /// Nothing times a launch out. An agent that runs but never asks about a
 /// foreground launch would leave the terminal deciding for good, but that
@@ -656,26 +799,35 @@ impl Decision {
 /// slowest answer; add one only with a launch that went unasked.
 #[derive(Default)]
 struct Answers {
-    /// Launches the agent has not asked about yet, oldest first, each with
+    /// Launches the agent has not answered for yet, oldest first, each with
     /// the terminal's instance if it is the terminal's.
     waiting: VecDeque<Option<Instance>>,
-    /// A policy change was announced, so the next request is not a launch's.
-    policy_changed: bool,
-    /// Open requests, oldest first, each with the launch it asks about if
-    /// that is the terminal's.
-    open: VecDeque<Option<Instance>>,
-    /// The launch whose answer just came, waiting out `BEGIN_GRACE` for a
-    /// lockout.
-    answered: Option<(Instance, Instant)>,
+    /// Requests asked and not yet answered, as far as this stream has seen.
+    open: usize,
+    /// Answers still due for requests asked before the terminal's launch.
+    earlier: usize,
+    /// The terminal's launches answered just now, each with the answer's
+    /// thread, waiting out `BEGIN_GRACE` for a lockout on that thread.
+    answered: Vec<(Instance, u64, Instant)>,
 }
 
 impl Answers {
     fn deadline(&self) -> Option<Instant> {
-        self.answered.as_ref().map(|(_, at)| *at + BEGIN_GRACE)
+        self.answered
+            .iter()
+            .map(|(_, _, at)| *at + BEGIN_GRACE)
+            .min()
     }
 
     fn launched(&mut self, terminal: Option<Instance>) {
         self.waiting.push_back(terminal);
+    }
+
+    /// The terminal checked in; what the agent was asked before is answered
+    /// first.
+    fn checked_in(&mut self, terminal: Instance) {
+        self.earlier = self.open;
+        self.waiting.push_back(Some(terminal));
     }
 
     fn deciding(&self, terminal: &Instance) -> bool {
@@ -683,50 +835,95 @@ impl Answers {
             .iter()
             .flatten()
             .any(|waiting| waiting == terminal)
-            || self.open.iter().flatten().any(|asked| asked == terminal)
             || self
                 .answered
-                .as_ref()
-                .is_some_and(|(answered, _)| answered == terminal)
+                .iter()
+                .any(|(answered, _, _)| answered == terminal)
+    }
+
+    fn is_deciding(&self) -> bool {
+        self.waiting.iter().flatten().next().is_some() || !self.answered.is_empty()
+    }
+
+    fn take_answered_on(&mut self, thread: u64, locked: bool) -> Vec<Decision> {
+        let (on_thread, others) = std::mem::take(&mut self.answered)
+            .into_iter()
+            .partition(|(_, on, _)| *on == thread);
+        self.answered = others;
+        on_thread
+            .into_iter()
+            .map(|(terminal, _, _)| Decision { terminal, locked })
+            .collect()
     }
 
     /// Takes one of the agent's lines; any other event is for the caller.
-    fn apply(&mut self, event: &Event) -> Option<Decision> {
+    fn apply(&mut self, event: &Event) -> Vec<Decision> {
         match event {
-            Event::PolicyChanged => {
-                self.policy_changed = true;
-                None
-            }
             Event::Requested => {
-                let asked = if std::mem::take(&mut self.policy_changed) {
-                    None
-                } else {
-                    self.waiting.pop_front().flatten()
-                };
-                self.open.push_back(asked);
-                None
+                self.open += 1;
+                Vec::new()
             }
-            Event::Answered => {
-                let unlocked = self.expire();
-                if let Some(Some(asked)) = self.open.pop_front() {
-                    self.answered = Some((asked, Instant::now()));
+            Event::Answered { thread, apps } => {
+                self.open = self.open.saturating_sub(1);
+                // A thread logs a lockout right after the answer that decided
+                // it, so its next answer means the one before locked nothing.
+                let mut decisions = self.take_answered_on(*thread, false);
+                if apps.is_some_and(|apps| apps > 1) {
+                    return decisions;
                 }
-                unlocked
+                if self.earlier > 0 {
+                    self.earlier -= 1;
+                    return decisions;
+                }
+                if let Some(Some(asked)) = self.waiting.pop_front() {
+                    match apps {
+                        // Nothing locks an app out after a failed request;
+                        // a lockout that comes later shows in AppKit's line.
+                        None => decisions.push(Decision {
+                            terminal: asked,
+                            locked: false,
+                        }),
+                        Some(_) => self.answered.push((asked, *thread, Instant::now())),
+                    }
+                }
+                decisions
             }
-            Event::Began => self.answered.take().map(|(terminal, _)| Decision {
-                terminal,
-                locked: true,
-            }),
-            Event::Lockout { .. } | Event::CheckedIn { .. } | Event::Born { .. } => None,
+            Event::Began { thread } => self.take_answered_on(*thread, true),
+            Event::Lockout { .. } | Event::CheckedIn { .. } | Event::Born { .. } => Vec::new(),
         }
     }
 
-    /// The answer for the terminal's launch came with no lockout after it.
-    fn expire(&mut self) -> Option<Decision> {
-        self.answered.take().map(|(terminal, _)| Decision {
-            terminal,
-            locked: false,
-        })
+    /// The answers for the terminal's launches that came with no lockout
+    /// after them in time.
+    fn expire(&mut self) -> Vec<Decision> {
+        let now = Instant::now();
+        let (due, waiting) = std::mem::take(&mut self.answered)
+            .into_iter()
+            .partition(|(_, _, at)| *at + BEGIN_GRACE <= now);
+        self.answered = waiting;
+        due.into_iter()
+            .map(|(terminal, _, _)| Decision {
+                terminal,
+                locked: false,
+            })
+            .collect()
+    }
+
+    /// The agent exited, so it answers nothing more and locks nothing out.
+    fn agent_gone(&mut self) -> Vec<Decision> {
+        let waiting = std::mem::take(&mut self.waiting).into_iter().flatten();
+        let answered = std::mem::take(&mut self.answered)
+            .into_iter()
+            .map(|(terminal, _, _)| terminal);
+        self.open = 0;
+        self.earlier = 0;
+        waiting
+            .chain(answered)
+            .map(|terminal| Decision {
+                terminal,
+                locked: false,
+            })
+            .collect()
     }
 
     /// Takes a line of the watcher's stream into `record`.
@@ -751,15 +948,15 @@ impl Answers {
             Event::CheckedIn { pid, app } if app == terminal.bundle_id() => {
                 if let Ok(instance) = Instance::of(*pid) {
                     if agent_running() {
-                        self.launched(Some(instance));
+                        self.checked_in(instance);
                     } else {
                         record.decided.insert(instance);
                     }
                 }
             }
             Event::CheckedIn { .. } | Event::Born { .. } => {}
-            Event::PolicyChanged | Event::Requested | Event::Answered | Event::Began => {
-                if let Some(decision) = self.apply(&event) {
+            Event::Requested | Event::Answered { .. } | Event::Began { .. } => {
+                for decision in self.apply(&event) {
                     decision.record(record);
                 }
             }
@@ -821,36 +1018,73 @@ pub fn launch(
     report: impl FnOnce(String) + Send + 'static,
 ) -> Result<JoinHandle<()>> {
     let path = paths::lockout_launch()?;
+    stop_orphaned_launch_stream(&path);
     let by = Instance::of(i32::try_from(std::process::id())?)?;
     let at = chrono::Utc::now();
-    write_json(
-        &path,
-        &Launch {
-            by: by.clone(),
-            at,
-            outcome: Outcome::Pending,
-        },
-    )?;
+    let pending = Launch {
+        by,
+        at,
+        outcome: Outcome::Pending,
+        stream: None,
+    };
+    write_json(&path, &pending)?;
     Ok(thread::spawn(move || {
-        let outcome = match launch_watched(terminal) {
+        let watching = |stream| {
+            write_json(
+                &path,
+                &Launch {
+                    stream: Some(stream),
+                    ..pending.clone()
+                },
+            )
+        };
+        let outcome = match launch_watched(terminal, watching) {
             Ok(Decision { terminal, locked }) => Outcome::Answered { terminal, locked },
             Err(error) => {
                 report(format!("{error:#}"));
                 Outcome::Failed(format!("{error:#}"))
             }
         };
-        let _ = write_json(&path, &Launch { by, at, outcome });
+        let _ = write_json(
+            &path,
+            &Launch {
+                outcome,
+                ..pending.clone()
+            },
+        );
     }))
 }
 
-fn launch_watched(terminal: TerminalKind) -> Result<Decision> {
+// A launch watched by a process killed outright leaves its debug-level
+// stream running, and logging at debug level costs the whole Mac.
+fn stop_orphaned_launch_stream(path: &Path) {
+    if let Ok(Some(Launch {
+        by,
+        outcome: Outcome::Pending,
+        stream: Some(stream),
+        ..
+    })) = read_json::<Launch>(path)
+        && !by.is_running()
+        && stream.is_running()
+    {
+        unsafe {
+            libc::kill(stream.pid, libc::SIGTERM);
+        }
+    }
+}
+
+fn launch_watched(
+    terminal: TerminalKind,
+    watching: impl FnOnce(Instance) -> Result<()>,
+) -> Result<Decision> {
     let adapter = adapter_for(terminal);
+    let unlocked = |terminal| Decision {
+        terminal,
+        locked: false,
+    };
     if !agent_running() {
         adapter.launch()?;
-        return Ok(Decision {
-            terminal: launched(terminal)?,
-            locked: false,
-        });
+        return Ok(unlocked(launched(terminal)?));
     }
     let mut stream = Command::new("log")
         .args([
@@ -866,40 +1100,59 @@ fn launch_watched(terminal: TerminalKind) -> Result<Decision> {
         .stderr(Stdio::null())
         .spawn()
         .context("failed to start the launch log stream")?;
-    let decision = stream
-        .stdout
-        .take()
-        .context("launch log stream has no output")
+    let decision = Instance::of(i32::try_from(stream.id())?)
+        .and_then(watching)
+        .and_then(|()| {
+            stream
+                .stdout
+                .take()
+                .context("launch log stream has no output")
+        })
         .and_then(|stdout| {
             let mut stream = BufReader::new(stdout);
             // `log` prints its banner once the stream is live, so a launch
             // after it cannot slip by.
             read_line(&mut stream)?;
+            let live = chrono::Utc::now();
+            // A terminal that started before the stream was live was heard of
+            // before it, and launching it only brings it forward; the
+            // daemon's stream follows it from its check-in instead.
+            if current_instance(terminal).is_some() {
+                anyhow::bail!("{terminal} was already starting when its launch was watched");
+            }
+            let mut answers = Answers {
+                earlier: open_requests(live)?,
+                ..Answers::default()
+            };
+            let Some(agent) = AgentExit::watch()? else {
+                adapter.launch()?;
+                return Ok(unlocked(launched(terminal)?));
+            };
             adapter.launch()?;
             let launched = launched(terminal)?;
             let app = terminal.bundle_id().to_ascii_lowercase();
-            let mut answers = Answers::default();
             loop {
-                let wait = answers
-                    .deadline()
-                    .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-                let decision = match wait {
-                    Some(wait) if !readable(&stream, i32::try_from(wait.as_millis())?)? => {
-                        answers.expire()
-                    }
-                    _ => match parse_event(read_line(&mut stream)?.trim_end())? {
+                let decisions = match next(&stream, Some(&agent), answers.deadline())? {
+                    Next::AgentExited => return Ok(unlocked(launched)),
+                    Next::Deadline => answers.expire(),
+                    Next::Line => match parse_event(read_line(&mut stream)?.trim_end())? {
+                        // The agent asks about foreground launches only.
+                        Some(Event::Born {
+                            app: born,
+                            foreground: false,
+                        }) if born == app => return Ok(unlocked(launched)),
                         Some(Event::Born {
                             app: born,
                             foreground: true,
                         }) => {
                             answers.launched((born == app).then(|| launched.clone()));
-                            None
+                            Vec::new()
                         }
                         Some(event) => answers.apply(&event),
-                        None => None,
+                        None => Vec::new(),
                     },
                 };
-                if let Some(decision) = decision {
+                if let Some(decision) = decisions.into_iter().next() {
                     return Ok(decision);
                 }
             }
@@ -907,6 +1160,64 @@ fn launch_watched(terminal: TerminalKind) -> Result<Decision> {
     let _ = stream.kill();
     let _ = stream.wait();
     decision
+}
+
+/// How many of the agent's requests were still unanswered at `live`, read
+/// from the stored log.
+fn open_requests(live: chrono::DateTime<chrono::Utc>) -> Result<usize> {
+    // `log show` takes whole seconds only, so it reads up to the second after
+    // `live` and leaves out what came later, which the stream delivers.
+    let second =
+        |at: chrono::DateTime<chrono::Utc>| at.format("%Y-%m-%d %H:%M:%S+0000").to_string();
+    let output = Command::new("log")
+        .args([
+            "show",
+            "--style",
+            "ndjson",
+            "--start",
+            &second(live - OPEN_REQUESTS_LOOKBACK),
+            "--end",
+            &second(live + chrono::TimeDelta::seconds(1)),
+            "--predicate",
+            &agent_clause(""),
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("failed to read the agent's open requests")?;
+    if !output.status.success() {
+        anyhow::bail!("log show failed with status {}", output.status);
+    }
+    let mut open: usize = 0;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(event) = parse_event(line)? else {
+            continue;
+        };
+        if logged_at(&serde_json::from_str(line)?)? > live {
+            continue;
+        }
+        match event {
+            Event::Requested => open += 1,
+            Event::Answered { .. } => open = open.saturating_sub(1),
+            Event::Began { .. }
+            | Event::Lockout { .. }
+            | Event::CheckedIn { .. }
+            | Event::Born { .. } => {}
+        }
+    }
+    Ok(open)
+}
+
+fn logged_at(line: &serde_json::Value) -> Result<chrono::DateTime<chrono::Utc>> {
+    let logged = line
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .context("log line has no time")?;
+    Ok(
+        chrono::DateTime::parse_from_str(logged, "%Y-%m-%d %H:%M:%S%.f%z")
+            .with_context(|| format!("unreadable log time '{logged}'"))?
+            .to_utc(),
+    )
 }
 
 fn launched(terminal: TerminalKind) -> Result<Instance> {
@@ -1004,6 +1315,7 @@ mod tests {
                 .unwrap()
                 .and_utc(),
             outcome,
+            stream: None,
         }
     }
 
@@ -1059,12 +1371,26 @@ mod tests {
                 Event::Requested,
             ),
             (
-                "Successfully requested policies for 1 bundleIdentifiers",
-                Event::Answered,
+                "Successfully requested policies for 12 bundleIdentifiers",
+                Event::Answered {
+                    thread: 7,
+                    apps: Some(12),
+                },
             ),
-            ("Begin lockout on app: <private>", Event::Began),
+            (
+                "Error requesting policies: <private>",
+                Event::Answered {
+                    thread: 7,
+                    apps: None,
+                },
+            ),
+            (
+                "Begin lockout on app: <private>",
+                Event::Began { thread: 7 },
+            ),
         ] {
-            let line = json!({"eventMessage": message, "processID": 762}).to_string();
+            let line =
+                json!({"eventMessage": message, "processID": 762, "threadID": 7}).to_string();
             assert_eq!(parse_event(&line).unwrap(), Some(event));
         }
     }
@@ -1082,8 +1408,24 @@ mod tests {
     fn decide(answers: &mut Answers, events: &[Event]) -> Vec<Decision> {
         events
             .iter()
-            .filter_map(|event| answers.apply(event))
+            .flat_map(|event| answers.apply(event))
             .collect()
+    }
+
+    const ONE: Option<usize> = Some(1);
+
+    fn unlocked(terminal: &Instance) -> Vec<Decision> {
+        vec![Decision {
+            terminal: terminal.clone(),
+            locked: false,
+        }]
+    }
+
+    fn locked(terminal: &Instance) -> Vec<Decision> {
+        vec![Decision {
+            terminal: terminal.clone(),
+            locked: true,
+        }]
     }
 
     #[test]
@@ -1091,75 +1433,176 @@ mod tests {
         let launched = instance(700, LATER);
         let mut answers = Answers::default();
         answers.launched(Some(launched.clone()));
-        assert_eq!(
-            decide(&mut answers, &[Event::Requested, Event::Answered]),
-            []
-        );
+        let asked = [
+            Event::Requested,
+            Event::Answered {
+                thread: 7,
+                apps: ONE,
+            },
+        ];
+        assert_eq!(decide(&mut answers, &asked), []);
         assert!(answers.deciding(&launched));
-        assert_eq!(
-            answers.expire(),
-            Some(Decision {
-                terminal: launched.clone(),
-                locked: false
-            })
-        );
+        answers.answered[0].2 -= BEGIN_GRACE;
+        assert_eq!(answers.expire(), unlocked(&launched));
 
         let mut answers = Answers::default();
         answers.launched(Some(launched.clone()));
-        assert_eq!(
-            decide(
-                &mut answers,
-                &[Event::Requested, Event::Answered, Event::Began]
-            ),
-            [Decision {
-                terminal: launched,
-                locked: true
-            }]
-        );
+        let asked = [
+            Event::Requested,
+            Event::Answered {
+                thread: 7,
+                apps: ONE,
+            },
+            Event::Began { thread: 7 },
+        ];
+        assert_eq!(decide(&mut answers, &asked), locked(&launched));
     }
 
     #[test]
-    fn another_apps_answer_does_not_decide_the_launch() {
+    fn a_lockout_goes_to_the_answer_logged_on_its_thread() {
+        // Two launches answered on two threads: the lockout logged after the
+        // other answer, on the terminal's thread, is still the terminal's.
+        let launched = instance(700, LATER);
+        let mut answers = Answers::default();
+        answers.launched(Some(launched.clone()));
+        answers.launched(None);
+        let events = [
+            Event::Requested,
+            Event::Requested,
+            Event::Answered {
+                thread: 7,
+                apps: ONE,
+            },
+            Event::Answered {
+                thread: 9,
+                apps: ONE,
+            },
+            Event::Began { thread: 7 },
+        ];
+        assert_eq!(decide(&mut answers, &events), locked(&launched));
+    }
+
+    #[test]
+    fn the_next_answer_on_the_same_thread_means_no_lockout() {
+        let launched = instance(700, LATER);
+        let mut answers = Answers::default();
+        answers.launched(Some(launched.clone()));
+        answers.launched(None);
+        let events = [
+            Event::Requested,
+            Event::Requested,
+            Event::Answered {
+                thread: 7,
+                apps: ONE,
+            },
+            Event::Answered {
+                thread: 7,
+                apps: ONE,
+            },
+            Event::Began { thread: 7 },
+        ];
+        assert_eq!(decide(&mut answers, &events), unlocked(&launched));
+    }
+
+    #[test]
+    fn a_failed_request_answers_the_launch_without_a_lockout() {
+        let launched = instance(700, LATER);
+        let mut answers = Answers::default();
+        answers.launched(Some(launched.clone()));
+        let events = [
+            Event::Requested,
+            Event::Answered {
+                thread: 7,
+                apps: None,
+            },
+        ];
+        assert_eq!(decide(&mut answers, &events), unlocked(&launched));
+        assert_eq!(answers.open, 0);
+    }
+
+    #[test]
+    fn answers_due_for_earlier_requests_do_not_decide_the_launch() {
         let launched = instance(700, LATER);
         let mut answers = Answers::default();
         assert_eq!(decide(&mut answers, &[Event::Requested]), []);
-        answers.launched(Some(launched.clone()));
-        assert_eq!(decide(&mut answers, &[Event::Answered, Event::Began]), []);
+        answers.checked_in(launched.clone());
+        let events = [
+            Event::Answered {
+                thread: 7,
+                apps: ONE,
+            },
+            Event::Began { thread: 7 },
+        ];
+        assert_eq!(decide(&mut answers, &events), []);
         assert!(answers.deciding(&launched));
-        assert_eq!(
-            decide(&mut answers, &[Event::Requested, Event::Answered]),
-            []
-        );
-        assert_eq!(
-            answers.expire(),
-            Some(Decision {
-                terminal: launched,
-                locked: false
-            })
-        );
+        let events = [
+            Event::Requested,
+            Event::Answered {
+                thread: 7,
+                apps: ONE,
+            },
+            Event::Answered {
+                thread: 7,
+                apps: ONE,
+            },
+        ];
+        assert_eq!(decide(&mut answers, &events), unlocked(&launched));
     }
 
     #[test]
-    fn a_lockout_after_the_next_answer_belongs_to_that_answer() {
+    fn launches_heard_of_together_are_answered_in_the_order_heard() {
+        // As logged for Calculator and Dictionary launched at once: both
+        // notices, then both requests, then both answers.
+        let launched = instance(700, LATER);
+        let mut answers = Answers::default();
+        answers.launched(None);
+        answers.launched(Some(launched.clone()));
+        let events = [
+            Event::Requested,
+            Event::Requested,
+            Event::Answered {
+                thread: 7,
+                apps: ONE,
+            },
+        ];
+        assert_eq!(decide(&mut answers, &events), []);
+        assert!(answers.deciding(&launched));
+        let events = [
+            Event::Answered {
+                thread: 9,
+                apps: ONE,
+            },
+            Event::Began { thread: 9 },
+        ];
+        assert_eq!(decide(&mut answers, &events), locked(&launched));
+    }
+
+    #[test]
+    fn the_answer_for_every_running_app_is_not_a_launches() {
+        // Downtime starting: one answer for 12 apps, then its lockouts.
         let launched = instance(700, LATER);
         let mut answers = Answers::default();
         answers.launched(Some(launched.clone()));
-        assert_eq!(
-            decide(
-                &mut answers,
-                &[
-                    Event::Requested,
-                    Event::Answered,
-                    Event::Requested,
-                    Event::Answered,
-                    Event::Began
-                ]
-            ),
-            [Decision {
-                terminal: launched,
-                locked: false
-            }]
-        );
+        let mut events = vec![
+            Event::Requested,
+            Event::Answered {
+                thread: 7,
+                apps: Some(12),
+            },
+        ];
+        events.extend(std::iter::repeat_n(Event::Began { thread: 7 }, 9));
+        assert_eq!(decide(&mut answers, &events), []);
+        assert!(answers.deciding(&launched));
+    }
+
+    #[test]
+    fn an_agent_that_exits_answers_nothing_more() {
+        let launched = instance(700, LATER);
+        let mut answers = Answers::default();
+        answers.launched(Some(launched.clone()));
+        assert!(answers.is_deciding());
+        assert_eq!(answers.agent_gone(), unlocked(&launched));
+        assert!(!answers.is_deciding());
     }
 
     #[test]
@@ -1174,68 +1617,6 @@ mod tests {
             Some(Event::Born {
                 app: "com.apple.talagent".into(),
                 foreground: false
-            })
-        );
-        let line = json!({
-            "eventMessage": "Received policy changed notification for registration dmf.policy.monitor.app",
-            "processID": 762,
-        })
-        .to_string();
-        assert_eq!(parse_event(&line).unwrap(), Some(Event::PolicyChanged));
-    }
-
-    #[test]
-    fn launches_heard_of_together_are_answered_in_the_order_heard() {
-        // As logged for Calculator and Dictionary launched at once: both
-        // notices, then both requests, then both answers.
-        let launched = instance(700, LATER);
-        let mut answers = Answers::default();
-        answers.launched(None);
-        answers.launched(Some(launched.clone()));
-        assert_eq!(
-            decide(
-                &mut answers,
-                &[Event::Requested, Event::Requested, Event::Answered]
-            ),
-            []
-        );
-        assert!(answers.deciding(&launched));
-        assert_eq!(
-            decide(&mut answers, &[Event::Answered, Event::Began]),
-            [Decision {
-                terminal: launched,
-                locked: true
-            }]
-        );
-    }
-
-    #[test]
-    fn the_request_after_a_policy_change_is_not_the_launches() {
-        let launched = instance(700, LATER);
-        let mut answers = Answers::default();
-        answers.launched(Some(launched.clone()));
-        assert_eq!(
-            decide(
-                &mut answers,
-                &[
-                    Event::PolicyChanged,
-                    Event::Requested,
-                    Event::Answered,
-                    Event::Began
-                ]
-            ),
-            []
-        );
-        assert!(answers.deciding(&launched));
-        assert_eq!(
-            decide(&mut answers, &[Event::Requested, Event::Answered]),
-            []
-        );
-        assert_eq!(
-            answers.expire(),
-            Some(Decision {
-                terminal: launched,
-                locked: false
             })
         );
     }
@@ -1351,6 +1732,15 @@ mod tests {
         assert_eq!(
             record.lockout(Some(&older), Some(&launch(Outcome::Pending)), |_| true),
             Lockout::Clear
+        );
+    }
+
+    #[test]
+    fn log_times_are_read_with_their_offset() {
+        let line = json!({"timestamp": "2026-10-27 13:55:16.685569+0545"});
+        assert_eq!(
+            logged_at(&line).unwrap().to_rfc3339(),
+            "2026-10-27T08:10:16.685569+00:00"
         );
     }
 
