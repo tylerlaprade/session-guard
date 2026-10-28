@@ -43,6 +43,10 @@ pub fn lockout_state() -> Result<PathBuf> {
     Ok(user_temp_dir()?.join("session-guard-lockout.json"))
 }
 
+pub fn lockout_launch() -> Result<PathBuf> {
+    Ok(user_temp_dir()?.join("session-guard-lockout-launch.json"))
+}
+
 // launchd gives the LaunchAgent no TMPDIR, so the daemon asks for the
 // per-user directory that shells' TMPDIR names.
 fn user_temp_dir() -> Result<PathBuf> {

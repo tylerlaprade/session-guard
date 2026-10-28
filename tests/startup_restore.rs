@@ -9,12 +9,17 @@ use std::time::{Duration, Instant};
 struct Daemon {
     child: Child,
     launcher_pid: std::path::PathBuf,
+    // The daemon finds the terminal by its process name, and opens no tab for
+    // a terminal that is not running.
+    terminal: Child,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = self.terminal.kill();
+        let _ = self.terminal.wait();
         if let Ok(contents) = fs::read_to_string(&self.launcher_pid)
             && let Ok(pid) = contents.trim().parse::<i32>()
             && pid > 1
@@ -151,9 +156,19 @@ else:
             .spawn()
             .unwrap()
     };
+    let stand_in = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("examples/alacritty");
+    fs::copy(stand_in, home.join("ghostty")).unwrap();
+    let terminal = Command::new(home.join("ghostty")).spawn().unwrap();
     let mut daemon = Daemon {
         child: spawn_daemon(),
         launcher_pid: home.join("launcher.pid"),
+        terminal,
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut first_owner = None;
