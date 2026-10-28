@@ -896,10 +896,6 @@ impl Answers {
                 .any(|(answered, _, _)| answered == terminal)
     }
 
-    fn is_deciding(&self) -> bool {
-        self.waiting.iter().flatten().next().is_some() || !self.answered.is_empty()
-    }
-
     fn take_answered_on(&mut self, thread: u64, locked: bool) -> Vec<Decision> {
         let (on_thread, others) = std::mem::take(&mut self.answered)
             .into_iter()
@@ -1695,9 +1691,9 @@ mod tests {
         let launched = instance(700, LATER);
         let mut answers = Answers::default();
         answers.launched(Some(launched.clone()));
-        assert!(answers.is_deciding());
+        assert!(answers.deciding(&launched));
         assert_eq!(answers.agent_gone(), unlocked(&launched));
-        assert!(!answers.is_deciding());
+        assert!(!answers.deciding(&launched));
     }
 
     #[test]
