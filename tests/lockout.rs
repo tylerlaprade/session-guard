@@ -271,6 +271,10 @@ impl Fixture {
         command
     }
 
+    fn start_agent(&mut self) {
+        self.agent = Some(Command::new(self.root().join(AGENT)).spawn().unwrap());
+    }
+
     fn stop_agent(&mut self) {
         let mut agent = self.agent.take().unwrap();
         agent.kill().unwrap();
@@ -993,5 +997,29 @@ fn a_policy_request_open_at_a_check_in_is_no_launches_in_either_order() {
         }
         fixture.wait_for("the answer", || fixture.lockout().status.code() == Some(0));
     }
+    fixture.stop_daemon();
+}
+
+#[test]
+fn an_agent_that_exits_takes_its_open_requests_with_it() {
+    let mut fixture = Fixture::idle();
+    fixture.start_daemon();
+    fixture.wait_for("the watcher's first read", || {
+        fs::read(fixture.state_file())
+            .ok()
+            .and_then(|state| serde_json::from_slice::<Value>(&state).ok())
+            .is_some_and(|state| state["seed"] != "Reading")
+    });
+    fixture.emit("1", &requested());
+    thread::sleep(Duration::from_millis(500));
+    fixture.stop_agent();
+    fixture.start_agent();
+    thread::sleep(Duration::from_millis(1500));
+
+    fixture.terminal = Some(Command::new(stand_in_terminal_path()).spawn().unwrap());
+    fixture.emit("2", &checkin_line(fixture.terminal_pid()));
+    fixture.emit("3", &requested());
+    fixture.emit("4", &answered());
+    fixture.wait_for("the answer", || fixture.lockout().status.code() == Some(0));
     fixture.stop_daemon();
 }

@@ -628,11 +628,11 @@ fn follow(
     record.seed = Seed::Read { terminal: current };
     write_json(path, record)?;
 
+    // Watched for as long as the agent runs: one that exits takes its open
+    // requests with it, and its count with them.
     let mut agent = None;
     loop {
-        if !answers.is_deciding() {
-            agent = None;
-        } else if agent.is_none() {
+        if agent.is_none() {
             agent = AgentExit::watch()?;
             if agent.is_none() {
                 for decision in answers.agent_gone() {
@@ -829,11 +829,12 @@ struct Answers {
 
 /// The agent's launch requests still unanswered. The request after a policy
 /// change is the one for every running app, answered for more than one app,
-/// and counts for neither.
+/// and is kept apart.
 #[derive(Default)]
 struct OpenRequests {
     launches: usize,
     policy_next: bool,
+    policies: usize,
 }
 
 impl OpenRequests {
@@ -841,12 +842,19 @@ impl OpenRequests {
         match event {
             Event::PolicyChanged => self.policy_next = true,
             Event::Requested => {
-                if !std::mem::take(&mut self.policy_next) {
+                if std::mem::take(&mut self.policy_next) {
+                    self.policies += 1;
+                } else {
                     self.launches += 1;
                 }
             }
             Event::Answered { apps, .. } => {
-                if !apps.is_some_and(|apps| apps > 1) {
+                if apps.is_some_and(|apps| apps > 1) && self.policies > 0 {
+                    self.policies -= 1;
+                } else {
+                    // An answer for many apps with no policy request open
+                    // answers one whose notice came before this count began,
+                    // and which was counted as a launch's.
                     self.launches = self.launches.saturating_sub(1);
                 }
             }
@@ -1621,6 +1629,19 @@ mod tests {
             });
             assert_eq!(decide(&mut answers, &events), unlocked(&launched));
         }
+    }
+
+    #[test]
+    fn an_answer_for_many_apps_with_no_policy_request_open_was_counted_as_a_launch() {
+        // The count began between a policy notice and its request.
+        let mut open = OpenRequests::default();
+        open.take(&Event::Requested);
+        assert_eq!(open.launches, 1);
+        open.take(&Event::Answered {
+            thread: 9,
+            apps: Some(12),
+        });
+        assert_eq!(open.launches, 0);
     }
 
     #[test]
