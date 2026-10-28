@@ -265,15 +265,19 @@ enum Command {
         )]
         all: bool,
     },
-    /// Exit 0 unless Screen Time has the terminal locked out (1), or that
-    /// cannot be known (2). Opening a tab while it is locked out crashes it
-    /// when the lockout lifts.
+    /// Exit 0 when a tab can be opened now; 1 while Screen Time has the
+    /// terminal locked out or kid mode is on; 2 when that cannot be known yet
+    /// or the terminal is not running. A tab opened while the terminal is
+    /// locked out crashes it when the lockout lifts.
     Lockout {
-        #[arg(long, help = "Wait while the terminal is locked out")]
+        #[arg(
+            long,
+            help = "Launch a terminal that is not running, and wait until a tab can be opened"
+        )]
         wait: bool,
     },
     /// Give a session started with `claude --bg` a terminal tab once Screen
-    /// Time no longer has the terminal locked out.
+    /// Time no longer has the terminal locked out and kid mode is off.
     AttachAfterLockout {
         #[arg(help = "Session id, or the short id `claude --bg` prints")]
         id: String,
