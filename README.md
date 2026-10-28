@@ -336,7 +336,8 @@ Until the agent has answered for a launch, the terminal is undecided:
 `session-guard lockout` answers 2, `--wait` waits, and restores hold. An answer
 followed by no lockout within 250 ms counts as unlocked. Outside Downtime the
 answer takes a few milliseconds; the slowest measured on a swapping Mac took
-1.3 seconds. A terminal that is not running counts as undecided too, because a
+1.3 seconds. A launch session-guard makes also reads the stored log first,
+which took 1.5 seconds and takes longer on a swapping Mac. A terminal that is not running counts as undecided too, because a
 tab opened as it launches would come before the answer: `session-guard
 lockout` answers 2 and says so, and `--wait` launches it and waits.
 

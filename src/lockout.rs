@@ -39,6 +39,7 @@ const FOREGROUND: &str = "Foreground";
 const REQUESTED_PREFIX: &str = "Requesting policy for bundle IDs: ";
 const ANSWERED_PREFIX: &str = "Successfully requested policies for ";
 const FAILED_PREFIX: &str = "Error requesting policies: ";
+const POLICY_CHANGED_PREFIX: &str = "Received policy changed notification";
 const BEGAN_PREFIX: &str = "Begin lockout on app: ";
 const AGENT: &str = "lockoutagent";
 // The tests stand in for the agent, and for its absence, by another name.
@@ -132,6 +133,20 @@ impl Record {
         launch: Option<&Launch>,
         running: impl Fn(&Instance) -> bool,
     ) -> Lockout {
+        let watching = running(&self.daemon) && running(&self.watcher);
+        // AppKit's word on the instance is final, even over a launch still
+        // waiting for the agent's answer.
+        if let Some(current) = current
+            && watching
+            && matches!(self.seed, Seed::Read { .. })
+        {
+            if self.engaged.contains(current) {
+                return Lockout::Engaged;
+            }
+            if self.reported.contains(current) {
+                return Lockout::Clear;
+            }
+        }
         if launch.is_some_and(|launch| launch.pending(current, &running)) {
             return Lockout::Deciding;
         }
@@ -140,18 +155,12 @@ impl Record {
                 .and_then(|launch| launch.failure(&running))
                 .map_or(Lockout::NotRunning, Lockout::Unknown);
         };
-        if !running(&self.daemon) || !running(&self.watcher) {
+        if !watching {
             return Lockout::Unknown("the session-guard lockout watcher is not running".into());
         }
         let Seed::Read { terminal } = &self.seed else {
             return Lockout::Reading;
         };
-        if self.engaged.contains(current) {
-            return Lockout::Engaged;
-        }
-        if self.reported.contains(current) {
-            return Lockout::Clear;
-        }
         if let Some(locked) = launch.and_then(|launch| launch.answer_for(current)) {
             return if locked {
                 Lockout::Engaged
@@ -346,7 +355,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 fn agent_clause(launch_notice: &str) -> String {
     format!(
-        r#"process == "{AGENT}" AND ({launch_notice}eventMessage BEGINSWITH "{REQUESTED_PREFIX}" OR eventMessage BEGINSWITH "{ANSWERED_PREFIX}" OR eventMessage BEGINSWITH "{FAILED_PREFIX}" OR eventMessage BEGINSWITH "{BEGAN_PREFIX}")"#
+        r#"process == "{AGENT}" AND ({launch_notice}eventMessage BEGINSWITH "{POLICY_CHANGED_PREFIX}" OR eventMessage BEGINSWITH "{REQUESTED_PREFIX}" OR eventMessage BEGINSWITH "{ANSWERED_PREFIX}" OR eventMessage BEGINSWITH "{FAILED_PREFIX}" OR eventMessage BEGINSWITH "{BEGAN_PREFIX}")"#
     )
 }
 
@@ -371,8 +380,11 @@ enum Event {
     /// The lockout agent hearing of an app's launch, named in lower case;
     /// only a stream at debug level carries it.
     Born { app: String, foreground: bool },
+    /// The policy changed, as at the start and end of Downtime, so the
+    /// agent's next request is for every running app, not for a launch.
+    PolicyChanged,
     /// The lockout agent asking for a launched app's policy, or for every
-    /// running app's when the policy changes.
+    /// running app's after a policy change.
     Requested,
     /// The answer to one of the agent's requests, logged on `thread`: for
     /// how many apps, or None when the request failed.
@@ -402,6 +414,9 @@ fn parse_event(line: &str) -> Result<Option<Event>> {
     };
     if message.starts_with(REQUESTED_PREFIX) {
         return Ok(Some(Event::Requested));
+    }
+    if message.starts_with(POLICY_CHANGED_PREFIX) {
+        return Ok(Some(Event::PolicyChanged));
     }
     if let Some(apps) = message.strip_prefix(ANSWERED_PREFIX) {
         let apps = apps
@@ -802,13 +817,45 @@ struct Answers {
     /// Launches the agent has not answered for yet, oldest first, each with
     /// the terminal's instance if it is the terminal's.
     waiting: VecDeque<Option<Instance>>,
-    /// Requests asked and not yet answered, as far as this stream has seen.
-    open: usize,
+    /// Launch requests asked and not yet answered, as far as this stream has
+    /// seen.
+    open: OpenRequests,
     /// Answers still due for requests asked before the terminal's launch.
     earlier: usize,
     /// The terminal's launches answered just now, each with the answer's
     /// thread, waiting out `BEGIN_GRACE` for a lockout on that thread.
     answered: Vec<(Instance, u64, Instant)>,
+}
+
+/// The agent's launch requests still unanswered. The request after a policy
+/// change is the one for every running app, answered for more than one app,
+/// and counts for neither.
+#[derive(Default)]
+struct OpenRequests {
+    launches: usize,
+    policy_next: bool,
+}
+
+impl OpenRequests {
+    fn take(&mut self, event: &Event) {
+        match event {
+            Event::PolicyChanged => self.policy_next = true,
+            Event::Requested => {
+                if !std::mem::take(&mut self.policy_next) {
+                    self.launches += 1;
+                }
+            }
+            Event::Answered { apps, .. } => {
+                if !apps.is_some_and(|apps| apps > 1) {
+                    self.launches = self.launches.saturating_sub(1);
+                }
+            }
+            Event::Began { .. }
+            | Event::Lockout { .. }
+            | Event::CheckedIn { .. }
+            | Event::Born { .. } => {}
+        }
+    }
 }
 
 impl Answers {
@@ -826,7 +873,7 @@ impl Answers {
     /// The terminal checked in; what the agent was asked before is answered
     /// first.
     fn checked_in(&mut self, terminal: Instance) {
-        self.earlier = self.open;
+        self.earlier = self.open.launches;
         self.waiting.push_back(Some(terminal));
     }
 
@@ -859,12 +906,12 @@ impl Answers {
     /// Takes one of the agent's lines; any other event is for the caller.
     fn apply(&mut self, event: &Event) -> Vec<Decision> {
         match event {
-            Event::Requested => {
-                self.open += 1;
+            Event::PolicyChanged | Event::Requested => {
+                self.open.take(event);
                 Vec::new()
             }
             Event::Answered { thread, apps } => {
-                self.open = self.open.saturating_sub(1);
+                self.open.take(event);
                 // A thread logs a lockout right after the answer that decided
                 // it, so its next answer means the one before locked nothing.
                 let mut decisions = self.take_answered_on(*thread, false);
@@ -915,7 +962,7 @@ impl Answers {
         let answered = std::mem::take(&mut self.answered)
             .into_iter()
             .map(|(terminal, _, _)| terminal);
-        self.open = 0;
+        self.open = OpenRequests::default();
         self.earlier = 0;
         waiting
             .chain(answered)
@@ -955,7 +1002,10 @@ impl Answers {
                 }
             }
             Event::CheckedIn { .. } | Event::Born { .. } => {}
-            Event::Requested | Event::Answered { .. } | Event::Began { .. } => {
+            Event::PolicyChanged
+            | Event::Requested
+            | Event::Answered { .. }
+            | Event::Began { .. } => {
                 for decision in self.apply(&event) {
                     decision.record(record);
                 }
@@ -1188,24 +1238,16 @@ fn open_requests(live: chrono::DateTime<chrono::Utc>) -> Result<usize> {
     if !output.status.success() {
         anyhow::bail!("log show failed with status {}", output.status);
     }
-    let mut open: usize = 0;
+    let mut open = OpenRequests::default();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Some(event) = parse_event(line)? else {
             continue;
         };
-        if logged_at(&serde_json::from_str(line)?)? > live {
-            continue;
-        }
-        match event {
-            Event::Requested => open += 1,
-            Event::Answered { .. } => open = open.saturating_sub(1),
-            Event::Began { .. }
-            | Event::Lockout { .. }
-            | Event::CheckedIn { .. }
-            | Event::Born { .. } => {}
+        if logged_at(&serde_json::from_str(line)?)? <= live {
+            open.take(&event);
         }
     }
-    Ok(open)
+    Ok(open.launches)
 }
 
 fn logged_at(line: &serde_json::Value) -> Result<chrono::DateTime<chrono::Utc>> {
@@ -1517,7 +1559,7 @@ mod tests {
             },
         ];
         assert_eq!(decide(&mut answers, &events), unlocked(&launched));
-        assert_eq!(answers.open, 0);
+        assert_eq!(answers.open.launches, 0);
     }
 
     #[test]
@@ -1547,6 +1589,38 @@ mod tests {
             },
         ];
         assert_eq!(decide(&mut answers, &events), unlocked(&launched));
+    }
+
+    #[test]
+    fn a_policy_request_open_at_the_check_in_is_no_launches_in_either_order() {
+        let launched = instance(700, LATER);
+        let policy_open = [Event::PolicyChanged, Event::Requested];
+        for policy_first in [true, false] {
+            let mut answers = Answers::default();
+            assert_eq!(decide(&mut answers, &policy_open), []);
+            answers.checked_in(launched.clone());
+            assert_eq!(answers.earlier, 0);
+            let launch_answer = Event::Answered {
+                thread: 7,
+                apps: ONE,
+            };
+            let policy_answer = Event::Answered {
+                thread: 9,
+                apps: Some(12),
+            };
+            let answers_in_order = if policy_first {
+                [policy_answer, launch_answer]
+            } else {
+                [launch_answer, policy_answer]
+            };
+            let mut events = vec![Event::Requested];
+            events.extend(answers_in_order);
+            events.push(Event::Answered {
+                thread: 7,
+                apps: ONE,
+            });
+            assert_eq!(decide(&mut answers, &events), unlocked(&launched));
+        }
     }
 
     #[test]
@@ -1696,6 +1770,23 @@ mod tests {
         assert_eq!(
             record.lockout(Some(&launched), Some(&other), |_| true),
             Lockout::Clear
+        );
+    }
+
+    #[test]
+    fn appkits_word_settles_a_launch_still_waiting_for_its_answer() {
+        let launched = instance(700, LATER);
+        let pending = launch(Outcome::Pending);
+        let mut record = record(Seed::Read { terminal: None }, &[]);
+        record.reported.insert(launched.clone());
+        assert_eq!(
+            record.lockout(Some(&launched), Some(&pending), |_| true),
+            Lockout::Clear
+        );
+        record.engaged.insert(launched.clone());
+        assert_eq!(
+            record.lockout(Some(&launched), Some(&pending), |_| true),
+            Lockout::Engaged
         );
     }
 

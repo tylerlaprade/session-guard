@@ -736,6 +736,7 @@ fn a_terminal_launched_by_anyone_else_waits_for_the_answer_after_its_check_in() 
     fixture.emit("1", &requested());
     fixture.emit("2", &checkin_line(fixture.terminal_pid()));
     fixture.emit("3", &answered());
+    fixture.emit("4", &policy_changed());
     fixture.emit("5", &requested());
     fixture.emit(
         "6",
@@ -900,5 +901,97 @@ fn a_terminal_already_starting_when_its_launch_is_watched_is_followed_from_its_c
     });
     assert!(waiting.wait().unwrap().success());
     assert_eq!(fixture.launches(), 0);
+    fixture.stop_daemon();
+}
+
+fn policy_changed() -> Value {
+    agent_line("Received policy changed notification for registration dmf.policy.monitor.app")
+}
+
+fn policy_answered() -> Value {
+    agent_line_on(
+        "Successfully requested policies for 12 bundleIdentifiers",
+        9,
+    )
+}
+
+fn a_policy_request_open_at_launch_is_no_launches(policy_answered_first: bool) {
+    let mut fixture = Fixture::launching("codex");
+    let asked = |line: Value| {
+        let mut line = line;
+        line["timestamp"] = json!(
+            (Utc::now() - Age::seconds(1))
+                .format("%Y-%m-%d %H:%M:%S%.6f+0000")
+                .to_string()
+        );
+        line
+    };
+    fs::write(
+        fixture.root().join("open-requests"),
+        format!("{}\n{}\n", asked(policy_changed()), asked(requested())),
+    )
+    .unwrap();
+    fixture.start_daemon();
+    wait_for_launch(&fixture);
+    fixture.emit_launch("1", &born_line());
+    fixture.emit_launch("2", &requested());
+    if policy_answered_first {
+        fixture.emit_launch("3", &policy_answered());
+        fixture.emit_launch("4", &began_on(9));
+        fixture.emit_launch("5", &answered());
+    } else {
+        fixture.emit_launch("3", &answered());
+        fixture.emit_launch("4", &policy_answered());
+        fixture.emit_launch("5", &began_on(9));
+    }
+    wait_for_held_restore(&fixture);
+    assert_eq!(fixture.lockout().status.code(), Some(0));
+    fixture.stop_daemon();
+}
+
+#[test]
+fn a_policy_request_open_at_launch_answered_first_is_no_launches() {
+    a_policy_request_open_at_launch_is_no_launches(true);
+}
+
+#[test]
+fn a_policy_request_open_at_launch_answered_last_is_no_launches() {
+    a_policy_request_open_at_launch_is_no_launches(false);
+}
+
+#[test]
+fn a_policy_request_open_at_a_check_in_is_no_launches_in_either_order() {
+    let mut fixture = Fixture::idle();
+    fixture.start_daemon();
+    fixture.wait_for("the watcher's first read", || {
+        fs::read(fixture.state_file())
+            .ok()
+            .and_then(|state| serde_json::from_slice::<Value>(&state).ok())
+            .is_some_and(|state| state["seed"] != "Reading")
+    });
+    for (round, policy_answered_first) in [("a", true), ("b", false)] {
+        if let Some(mut previous) = fixture
+            .terminal
+            .replace(Command::new(stand_in_terminal_path()).spawn().unwrap())
+        {
+            previous.kill().unwrap();
+            previous.wait().unwrap();
+        }
+        let cue = |step: u32| format!("{round}{step}");
+        fixture.emit(&cue(1), &policy_changed());
+        fixture.emit(&cue(2), &requested());
+        fixture.emit(&cue(3), &checkin_line(fixture.terminal_pid()));
+        fixture.emit(&cue(4), &requested());
+        if policy_answered_first {
+            fixture.emit(&cue(5), &policy_answered());
+            fixture.emit(&cue(6), &began_on(9));
+            fixture.emit(&cue(7), &answered());
+        } else {
+            fixture.emit(&cue(5), &answered());
+            fixture.emit(&cue(6), &policy_answered());
+            fixture.emit(&cue(7), &began_on(9));
+        }
+        fixture.wait_for("the answer", || fixture.lockout().status.code() == Some(0));
+    }
     fixture.stop_daemon();
 }

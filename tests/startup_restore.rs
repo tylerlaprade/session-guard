@@ -6,6 +6,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+// The daemon takes the oldest process named like the terminal for it, so two
+// tests' stand-ins running at once would stand in for each other.
+static ONE_TERMINAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Daemon {
     child: Child,
     launcher_pid: std::path::PathBuf,
@@ -163,6 +167,9 @@ else:
         .parent()
         .unwrap()
         .join("examples/alacritty");
+    let _one_terminal = ONE_TERMINAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::copy(stand_in, home.join("ghostty")).unwrap();
     let terminal = Command::new(home.join("ghostty")).spawn().unwrap();
     let mut daemon = Daemon {
