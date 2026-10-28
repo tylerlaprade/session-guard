@@ -14,7 +14,9 @@ on run {workingDirectory, initialInput, restoreWindowId}
       end if
       set restoreWindow to front window
     end if
+    set previousId to id of selected tab of restoreWindow
     set newTab to new tab in restoreWindow with configuration cfg
+    if selected of newTab then select tab (first tab of restoreWindow whose id is previousId)
     return (id of restoreWindow) & (character id 9) & (id of newTab)
   end tell
 end run

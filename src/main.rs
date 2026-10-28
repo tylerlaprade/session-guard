@@ -7,6 +7,7 @@ mod exit_watch;
 mod fresh_tab;
 mod harness;
 mod hooks;
+mod kid_mode;
 mod last_sessions;
 mod lockout;
 mod paths;

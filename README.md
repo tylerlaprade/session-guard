@@ -345,6 +345,21 @@ A Mac that has never set up Screen Time does not run the lockout agent at all,
 and nothing there can be locked out, so a launch with no agent running is
 decided at once.
 
+### Kid mode
+
+Kid mode is a layer of the Kanata keyboard remapper under which a child uses
+the Mac. A tab opened then, or the terminal launching, would take the screen
+from them, so the daemon treats kid mode like a lockout: `session-guard
+lockout` answers 1 and says so, `--wait` waits, and restores and background
+sessions' tabs wait until kid mode ends. Kanata greets each client of its TCP
+port with the layer it is on; the daemon reads the port from Kanata's launch
+daemon, `/Library/LaunchDaemons/com.tylerlaprade.kanata.plist`. Without that
+file, or with Kanata not listening, there is no kid mode.
+
+When the daemon does open a tab, it keeps the tab that was selected in that
+window selected, so the new tab never takes the screen from whoever is using
+the terminal.
+
 A Claude session needs no tab to keep working, so a pass that finds the
 terminal locked out resumes it at once with `claude --bg --resume`, sending the
 same prompt a tab would, and the daemon opens a tab running `claude attach`

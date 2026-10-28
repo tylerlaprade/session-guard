@@ -145,6 +145,7 @@ else:
             .arg("daemon")
             .env("HOME", home)
             .env("TMPDIR", home)
+            .env("SESSION_GUARD_KANATA_PLIST", home.join("kanata.plist"))
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CODEX_HOME", home.join(".codex"))
             .env("SHELL", "/bin/sh")

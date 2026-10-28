@@ -225,6 +225,7 @@ pub fn run() -> Result<()> {
             if now == Lockout::Clear
                 || now == Lockout::NotRunning
                 || (now == Lockout::Engaged && *seen != Lockout::Engaged)
+                || (now == Lockout::KidMode && *seen != Lockout::KidMode)
             {
                 let summary = restore_once(RestoreMode::Held)?;
                 log_line(&format!("held restore: {}", summary.message()))?;
@@ -625,6 +626,7 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
             Lockout::Clear => None,
             Lockout::Engaged => Some(format!("{kind} is locked out by Screen Time")),
             Lockout::NotRunning => Some(format!("{kind} is not running")),
+            Lockout::KidMode => Some("kid mode is on".to_string()),
             Lockout::Deciding => Some(format!(
                 "Screen Time has not answered for {kind}'s launch yet"
             )),
@@ -637,14 +639,15 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
         };
         if let Some(reason) = held_reason {
             for session in std::iter::once(session).chain(to_open) {
-                // Only a lockout is worth a detour through the background; a
-                // state still being read or unknown is held as it is.
+                // Only a lockout or kid mode is worth a detour through the
+                // background; a state still being read or unknown is held as
+                // it is.
                 let Some(background) = session
                     .tool
                     .spec()
                     .background
                     .as_ref()
-                    .filter(|_| lockout == Lockout::Engaged)
+                    .filter(|_| matches!(lockout, Lockout::Engaged | Lockout::KidMode))
                 else {
                     summary.held.push(session);
                     continue;
@@ -779,7 +782,11 @@ fn attach_backgrounded(processes: &ProcessSnapshot) -> Result<()> {
             launch_terminal(kind)?;
             return log_line(&format!("launching {kind} for background sessions' tabs"));
         }
-        Lockout::Engaged | Lockout::Deciding | Lockout::Reading | Lockout::Unknown(_) => {
+        Lockout::Engaged
+        | Lockout::KidMode
+        | Lockout::Deciding
+        | Lockout::Reading
+        | Lockout::Unknown(_) => {
             return Ok(());
         }
     }
