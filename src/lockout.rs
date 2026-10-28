@@ -647,6 +647,13 @@ impl Decision {
 /// nothing in its lines ties a request to its launch or an answer to its
 /// request, and they run on different threads, so this takes both to keep
 /// the order of the launches. Launches heard of together have kept it.
+///
+/// Nothing times a launch out. An agent that runs but never asks about a
+/// foreground launch would leave the terminal deciding for good, but that
+/// has never been seen: every foreground launch measured got its request,
+/// and a Mac without Screen Time runs no agent, which `agent_running`
+/// settles at once. A timer would trade that for a guess at the agent's
+/// slowest answer; add one only with a launch that went unasked.
 #[derive(Default)]
 struct Answers {
     /// Launches the agent has not asked about yet, oldest first, each with
