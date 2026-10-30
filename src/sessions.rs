@@ -85,6 +85,10 @@ pub struct SessionRecord {
     // registration replaces the record, so `register` carries this over.
     #[serde(default)]
     pub attach_after_lockout: bool,
+    // The attach was handed off by a spawn rather than a restore, so its tab
+    // keeps the selection.
+    #[serde(default)]
+    pub attach_keeps_selection: bool,
     #[serde(default)]
     pub activity: Option<crate::continuation::Activity>,
     #[serde(default)]
@@ -140,6 +144,7 @@ impl SessionRecord {
             restore_pending: false,
             held_for_lockout: false,
             attach_after_lockout: false,
+            attach_keeps_selection: false,
             activity: None,
             background_tasks: None,
             command: None,
@@ -177,6 +182,7 @@ impl SessionRecord {
             restore_pending: false,
             held_for_lockout: false,
             attach_after_lockout: false,
+            attach_keeps_selection: false,
             activity: None,
             background_tasks: None,
             command: None,
@@ -351,9 +357,14 @@ pub fn register(path: &Path, mut record: SessionRecord) -> Result<()> {
         {
             record.tab_position = record.tab_position.or(previous.tab_position);
             record.attach_after_lockout = previous.attach_after_lockout;
+            record.attach_keeps_selection = previous.attach_keeps_selection;
         }
-        if !record.attach_after_lockout && record.tool.spec().background.is_some() {
-            record.attach_after_lockout = claim_pending_attach(path, &record.session_id)?;
+        if !record.attach_after_lockout
+            && record.tool.spec().background.is_some()
+            && claim_pending_attach(path, &record.session_id)?
+        {
+            record.attach_after_lockout = true;
+            record.attach_keeps_selection = true;
         }
         sessions.retain(|session| session.session_id != record.session_id);
         sessions.push(record);
@@ -396,6 +407,7 @@ pub fn attach_after_lockout(path: &Path, id: &str) -> Result<Attach> {
             .as_ref()
             .with_context(|| format!("{} has no background mode", session.tool))?;
         session.attach_after_lockout = true;
+        session.attach_keeps_selection = true;
         Ok(Attach::Marked)
     })
 }
@@ -595,10 +607,12 @@ mod tests {
         let sessions = read_sessions(&path).unwrap();
         assert!(!sessions[0].attach_after_lockout);
         assert!(sessions[1].attach_after_lockout);
+        assert!(sessions[1].attach_keeps_selection);
         assert!(!pending_attaches_path(&path).exists());
 
         register(&path, background_session("claude", session)).unwrap();
         assert!(read_sessions(&path).unwrap()[1].attach_after_lockout);
+        assert!(read_sessions(&path).unwrap()[1].attach_keeps_selection);
     }
 
     #[test]
@@ -612,6 +626,7 @@ mod tests {
             Attach::Marked
         );
         assert!(read_sessions(&path).unwrap()[0].attach_after_lockout);
+        assert!(read_sessions(&path).unwrap()[0].attach_keeps_selection);
         assert!(!pending_attaches_path(&path).exists());
     }
 

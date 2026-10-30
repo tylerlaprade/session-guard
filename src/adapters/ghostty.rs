@@ -1,4 +1,4 @@
-use super::{TerminalAdapter, run_checked};
+use super::{Selection, TerminalAdapter, run_checked};
 use crate::process;
 use anyhow::{Context, Result};
 use std::cell::RefCell;
@@ -36,7 +36,16 @@ impl Ghostty {
 /// Ghostty is often running with no window yet, and `new tab in front window`
 /// fails with -1728 ("Can't get front window") in that state. It answers with
 /// the window's id and the tab's, tab-separated.
-fn restore_tab_command(directory: &str, input: &str, window: &str) -> Command {
+fn restore_tab_command(
+    directory: &str,
+    input: &str,
+    window: &str,
+    selection: Selection,
+) -> Command {
+    let selection = match selection {
+        Selection::Take => "take",
+        Selection::Keep => "keep",
+    };
     let mut osa = Command::new("osascript");
     osa.args([
         "-e",
@@ -44,12 +53,13 @@ fn restore_tab_command(directory: &str, input: &str, window: &str) -> Command {
         directory,
         input,
         window,
+        selection,
     ]);
     osa
 }
 
 impl TerminalAdapter for Ghostty {
-    fn open_tab(&self, directory: &Path, command: &str) -> Result<()> {
+    fn open_tab(&self, directory: &Path, command: &str, selection: Selection) -> Result<()> {
         if crate::fresh_tab::fill(directory, command)? {
             return Ok(());
         }
@@ -65,6 +75,7 @@ impl TerminalAdapter for Ghostty {
             dir_str,
             &format!("{command}\n"),
             &self.restore_window.borrow().clone().unwrap_or_default(),
+            selection,
         );
         // Ghostty scripting can hang when the app is busy/recovering; do not
         // block the daemon (or its sessions lock) forever. A tab whose surface
@@ -150,14 +161,27 @@ mod tests {
     #[test]
     fn a_pass_keeps_its_later_tabs_in_its_first_tab_window() {
         let ghostty = Ghostty::default();
-        let window_argument = |command: &Command| command.get_args().last().unwrap().to_owned();
-        let first = restore_tab_command("/tmp", "launch\n", "");
+        let window_argument = |command: &Command| command.get_args().nth(4).unwrap().to_owned();
+        let first = restore_tab_command("/tmp", "launch\n", "", Selection::Take);
         assert_eq!(window_argument(&first), "");
         ghostty.remember_window("tab-group-1\ttab-7").unwrap();
         let remembered = ghostty.restore_window.borrow().clone().unwrap();
-        let second = restore_tab_command("/tmp", "launch\n", &remembered);
+        let second = restore_tab_command("/tmp", "launch\n", &remembered, Selection::Take);
         assert_eq!(window_argument(&second), "tab-group-1");
         assert!(ghostty.remember_window("tab-7").is_err());
         assert!(ghostty.remember_window("\ttab-7").is_err());
+    }
+
+    #[test]
+    fn the_tab_script_is_told_whether_to_keep_the_selection() {
+        let selection = |selection| {
+            restore_tab_command("/tmp", "launch\n", "", selection)
+                .get_args()
+                .last()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(selection(Selection::Take), "take");
+        assert_eq!(selection(Selection::Keep), "keep");
     }
 }

@@ -522,6 +522,7 @@ fn a_claude_session_resumes_in_the_background_and_gets_its_tab_after_the_lockout
     let claude_args = || fs::read_to_string(fixture.root().join("claude.args")).unwrap_or_default();
     assert!(claude_args().contains(&format!("--bg --resume {SESSION}")));
     assert_eq!(fixture.record()["attach_after_lockout"], true);
+    assert_eq!(fixture.record()["attach_keeps_selection"], false);
     assert_eq!(fixture.record()["state"], "active");
 
     // The attach pass runs every five seconds and must open nothing while the
@@ -572,6 +573,7 @@ fn attach_after_lockout_marks_the_one_session_its_prefix_names() {
         String::from_utf8_lossy(&marked.stderr)
     );
     assert_eq!(fixture.record()["attach_after_lockout"], true);
+    assert_eq!(fixture.record()["attach_keeps_selection"], true);
 }
 
 #[test]

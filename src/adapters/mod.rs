@@ -9,8 +9,19 @@ use crate::TerminalKind;
 use anyhow::{Context, Result};
 use std::path::Path;
 
+/// Whether a tab the daemon opens takes the selection in its window. A
+/// restored tab does, so it can be watched opening; a spawned session's tab
+/// opened after a lockout keeps the tab in front, as it would have opened at
+/// once. Only Ghostty can keep it; in the other terminals the new tab or
+/// window always takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    Take,
+    Keep,
+}
+
 pub trait TerminalAdapter {
-    fn open_tab(&self, directory: &Path, command: &str) -> Result<()>;
+    fn open_tab(&self, directory: &Path, command: &str, selection: Selection) -> Result<()>;
     fn is_running(&self) -> bool;
     fn launch(&self) -> Result<()>;
     /// Every terminal's tty with its (window, tab) position, for a terminal

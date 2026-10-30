@@ -1,4 +1,4 @@
-use super::{TerminalAdapter, launch_until_running, run_checked};
+use super::{Selection, TerminalAdapter, launch_until_running, run_checked};
 use crate::process;
 use anyhow::Result;
 use std::path::Path;
@@ -7,7 +7,7 @@ use std::process::Command;
 pub struct Kitty;
 
 impl TerminalAdapter for Kitty {
-    fn open_tab(&self, directory: &Path, command: &str) -> Result<()> {
+    fn open_tab(&self, directory: &Path, command: &str, _selection: Selection) -> Result<()> {
         let mut process = Command::new("kitty");
         process.args(["@", "launch", "--type=tab", "--cwd"]);
         process.arg(directory);

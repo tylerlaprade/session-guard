@@ -1,4 +1,4 @@
-use super::{TerminalAdapter, run_checked, shell_line};
+use super::{Selection, TerminalAdapter, run_checked, shell_line};
 use crate::process;
 use anyhow::Result;
 use std::path::Path;
@@ -7,7 +7,7 @@ use std::process::Command;
 pub struct TerminalApp;
 
 impl TerminalAdapter for TerminalApp {
-    fn open_tab(&self, directory: &Path, command: &str) -> Result<()> {
+    fn open_tab(&self, directory: &Path, command: &str, _selection: Selection) -> Result<()> {
         let line = shell_line(directory, command);
         let mut command = Command::new("osascript");
         command.args([

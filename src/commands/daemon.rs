@@ -1,4 +1,4 @@
-use crate::adapters::{adapter_for, shell_quote};
+use crate::adapters::{Selection, adapter_for, shell_quote};
 use crate::cargo_targets;
 use crate::harness::{Discovery, Integration};
 use crate::last_sessions::{self, LastSessionRecord};
@@ -704,7 +704,11 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
         attempted.push(session.session_id.clone());
 
         match adapter
-            .open_tab(&session.directory, &launch_command(&session.session_id)?)
+            .open_tab(
+                &session.directory,
+                &launch_command(&session.session_id)?,
+                Selection::Take,
+            )
             .and_then(|()| wait_for_restore_owner(&path, &session.session_id))
         {
             Ok(()) => {
@@ -754,6 +758,7 @@ fn start_in_background(
             .context("the session left the registry before it could resume")?;
         record.held_for_lockout = false;
         record.attach_after_lockout = true;
+        record.attach_keeps_selection = false;
         Ok(crate::continuation::restore_prompt(record))
     })?;
     let mut command = background
@@ -833,6 +838,11 @@ fn attach_backgrounded(processes: &ProcessSnapshot) -> Result<()> {
             adapter.open_tab(
                 &session.directory,
                 &(background.attach)(&session.session_id),
+                if session.attach_keeps_selection {
+                    Selection::Keep
+                } else {
+                    Selection::Take
+                },
             )
         }) {
             Some(Ok(())) => log_line(&format!(
@@ -859,6 +869,7 @@ fn attach_backgrounded(processes: &ProcessSnapshot) -> Result<()> {
             .filter(|session| settled.contains(&session.session_id))
         {
             session.attach_after_lockout = false;
+            session.attach_keeps_selection = false;
         }
         Ok(())
     })

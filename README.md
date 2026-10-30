@@ -360,6 +360,11 @@ The session registers through its own hooks a moment after `claude --bg`
 returns, and later still on a busy Mac. A hand-off that comes first is kept
 until the session registers, and the registration takes it.
 
+A restored session's tab takes the selection when it opens, so restores can be
+watched. A handed-off session's tab keeps the tab in front selected, as the
+spawn would have if it had opened its tab at once. Only Ghostty can keep the
+selection; in the other terminals the new tab or window takes it.
+
 ### Locked screen
 
 A locked screen counts as a lockout. A window that enters native fullscreen
