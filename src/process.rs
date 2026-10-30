@@ -576,6 +576,14 @@ pub fn parent_pid(pid: i32) -> Option<i32> {
     i32::try_from(unsafe { info.assume_init() }.pbi_ppid).ok()
 }
 
+/// Whether `ancestor` started `pid`, directly or through its descendants.
+pub fn is_ancestor(ancestor: i32, pid: i32) -> bool {
+    std::iter::successors(parent_pid(pid), |&parent| {
+        parent_pid(parent).filter(|_| parent > 1)
+    })
+    .any(|parent| parent == ancestor)
+}
+
 /// The leader of the session a process belongs to.
 pub fn session_leader(pid: i32) -> Option<i32> {
     let leader = unsafe { libc::getsid(pid) };

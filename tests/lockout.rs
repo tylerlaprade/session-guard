@@ -84,17 +84,26 @@ pathlib.Path(os.environ["HOME"], "launcher.pid").write_text(str(child.pid))
 
 // Stands in for `claude`. `--bg --resume ID` starts a background session and
 // registers it the way Claude's hooks do; anything else, such as `attach ID`,
-// is recorded and then waits like an interactive session.
+// is recorded and then waits like an interactive session. Claude's background
+// service runs each session as its child, and the hook names as its shell the
+// launcher of whatever session first started that service, long gone.
 const CLAUDE: &str = r#"#!/bin/sh
 echo "$*" >> "$HOME/claude.args"
 if [ "$1" = --bg ] && [ -e "$HOME/background-fails" ]; then
     exit 1
 fi
 if [ "$1" = --bg ]; then
-    sleep 60 </dev/null >/dev/null 2>&1 &
+    sh -c 'sleep 60 & echo $! > "$HOME/session.pid"; wait' </dev/null >/dev/null 2>&1 &
     echo $! >> "$HOME/background.pids"
-    "$TEST_BINARY" register --tool claude --session-id "$3" --pid $! --shell-pid $! --directory "$PWD" </dev/null >/dev/null
-    echo "backgrounded · $(echo "$3" | cut -c1-8) · stand-in"
+    while [ ! -s "$HOME/session.pid" ]; do sleep 0.01; done
+    session=$(cat "$HOME/session.pid")
+    rm "$HOME/session.pid"
+    echo "$session" >> "$HOME/background.pids"
+    sh -c : &
+    launcher=$!
+    wait $launcher
+    "$TEST_BINARY" register --tool claude --session-id "$3" --pid "$session" --shell-pid "$launcher" --directory "$PWD" </dev/null >/dev/null
+    echo "backgrounded · $(echo "$3" | cut -c1-8)"
     exit 0
 fi
 exec sleep 30

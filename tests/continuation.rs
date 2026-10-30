@@ -264,11 +264,21 @@ fn registration_without_a_shell_pid_takes_the_owning_shell_from_the_tool_process
         tool.wait().unwrap();
         assert_ne!(unsafe { libc::kill(-group, 0) }, 0, "tool group survived");
     };
-    let launched = tool()
+    // A launcher named in the environment owns the tool only while it is the
+    // tool's ancestor; Claude's background service hands sessions the name of
+    // one long gone.
+    let inherited = tool()
         .env("SESSION_GUARD_SHELL_PID", "424242")
         .spawn()
         .unwrap();
-    assert_eq!(register(launched.id()), json!(424_242));
+    assert_eq!(register(inherited.id()), json!(std::process::id()));
+    stop(inherited);
+
+    let launched = tool()
+        .env("SESSION_GUARD_SHELL_PID", std::process::id().to_string())
+        .spawn()
+        .unwrap();
+    assert_eq!(register(launched.id()), json!(std::process::id()));
     stop(launched);
 
     let typed = tool()

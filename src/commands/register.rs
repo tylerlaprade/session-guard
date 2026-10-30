@@ -222,7 +222,9 @@ fn run_with_input(
             tool,
             session_id,
             pid,
-            shell_pid.or_else(|| pid.and_then(owning_shell)),
+            shell_pid
+                .filter(|&shell| pid.is_none_or(|pid| process::is_ancestor(shell, pid)))
+                .or_else(|| pid.and_then(owning_shell)),
             directory,
             transcript_path,
             name,
@@ -288,10 +290,20 @@ fn set_owner(record: &mut SessionRecord, pid: i32, shell_pid: Option<i32>) {
 }
 
 /// The shell holding a tool's tab: the restore launcher that started it, named
-/// in the tool's starting environment, or else its parent.
+/// in the tool's starting environment, or else its parent. A process the tool
+/// starts inherits that name and can outlive the launcher: Claude's background
+/// service hands it to every session it starts. So the name counts only while
+/// the launcher is still the tool's ancestor.
 fn owning_shell(tool_pid: i32) -> Option<i32> {
-    process::process_environment_variable(tool_pid, crate::commands::launch::SHELL_PID_ENV)
-        .and_then(|pid| pid.parse().ok())
+    let launcher =
+        process::process_environment_variable(tool_pid, crate::commands::launch::SHELL_PID_ENV)
+            .and_then(|pid| pid.parse().ok());
+    owning_shell_named(tool_pid, launcher)
+}
+
+fn owning_shell_named(tool_pid: i32, launcher: Option<i32>) -> Option<i32> {
+    launcher
+        .filter(|&launcher| process::is_ancestor(launcher, tool_pid))
         .or_else(|| process::parent_pid(tool_pid))
 }
 
@@ -362,6 +374,54 @@ mod tests {
 
     fn own_pid() -> i32 {
         i32::try_from(std::process::id()).unwrap()
+    }
+
+    /// A tool started under a shell; returns it with its pid and its shell's.
+    fn tool_under_a_shell() -> (std::process::Child, i32, i32) {
+        let shell = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & wait"])
+            .spawn()
+            .unwrap();
+        let shell_pid = i32::try_from(shell.id()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let tool = loop {
+            if let Some(&tool) = process::child_pids(shell_pid).first() {
+                break tool;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tool never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        (shell, tool, shell_pid)
+    }
+
+    #[test]
+    fn a_launcher_named_by_the_environment_owns_the_tool_only_while_it_is_an_ancestor() {
+        let (mut shell, tool, shell_pid) = tool_under_a_shell();
+        assert_eq!(owning_shell_named(tool, Some(own_pid())), Some(own_pid()));
+        assert_eq!(owning_shell_named(tool, None), Some(shell_pid));
+
+        // Claude's background service passes its own environment, launcher
+        // variable included, to sessions it starts long after that launcher.
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let unrelated_pid = i32::try_from(unrelated.id()).unwrap();
+        assert_eq!(
+            owning_shell_named(tool, Some(unrelated_pid)),
+            Some(shell_pid)
+        );
+
+        unsafe {
+            libc::kill(tool, libc::SIGKILL);
+        }
+        for child in [&mut shell, &mut unrelated] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     fn transcript(dir: &tempfile::TempDir, source: &serde_json::Value) -> PathBuf {
