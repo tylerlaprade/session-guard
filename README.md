@@ -360,11 +360,25 @@ The session registers through its own hooks a moment after `claude --bg`
 returns, and later still on a busy Mac. A hand-off that comes first is kept
 until the session registers, and the registration takes it.
 
-Scripts that open terminal tabs can ask the same question:
+### Locked screen
+
+A locked screen counts as a lockout. A window that enters native fullscreen
+behind the lock screen drops straight back out and leaves AppKit's record of its
+tabs inconsistent; tab changes there end in AppKit asserting "expected no items"
+once someone unlocks and picks the window from the Dock (Ghostty, 2026-10-28,
+after scripts opened windows and tabs behind the lock screen). So while the
+screen is locked, the daemon opens no tab and launches no terminal, Claude
+sessions resume in the background as they do under Screen Time, and their tabs
+open as soon as the screen unlocks. loginwindow keeps the lock state in the
+shared state of the notification `com.apple.sessionagent.screenIsLocked` and
+posts `com.apple.sessionagent.screenIsUnlocked` on unlock, which is what the
+daemon and `--wait` wait on.
+
+Scripts that open or close terminal tabs can ask the same question:
 
 ```sh
-session-guard lockout         # 0: not locked out, or not running; 1: locked out; 2: unknown
-session-guard lockout --wait  # waits while locked out or still being read: 0 once clear, 2 if it becomes unknown
+session-guard lockout         # 0: a tab can open; 1: locked out or the screen is locked; 2: unknown, or the terminal is not running
+session-guard lockout --wait  # launches a terminal that is not running and waits: 0 once a tab can open, 2 if it becomes unknown
 ```
 
 ### Continuing interrupted work

@@ -166,6 +166,7 @@ pub fn run() -> Result<()> {
     log_line("daemon started")?;
     let mut lockout_watcher = start_lockout_watcher();
     let mut exit_watcher = start_exit_watcher();
+    let unlocks = watch_unlocks();
     update_installed_hooks()?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -224,7 +225,7 @@ pub fn run() -> Result<()> {
             let now = lockout::lockout(terminal);
             if now == Lockout::Clear
                 || now == Lockout::NotRunning
-                || (now == Lockout::Engaged && *seen != Lockout::Engaged)
+                || (resumes_in_background(&now) && *seen != now)
             {
                 let summary = restore_once(RestoreMode::Held)?;
                 log_line(&format!("held restore: {}", summary.message()))?;
@@ -233,6 +234,16 @@ pub fn run() -> Result<()> {
                 }
                 held_under = held_lockout(&summary);
             }
+        }
+
+        // Background sessions get their tabs the moment the screen unlocks,
+        // not at the next settle pass.
+        if unlocks
+            .as_ref()
+            .is_some_and(|unlocks| unlocks.take().unwrap_or(false))
+            && let Ok(processes) = ProcessSnapshot::capture()
+        {
+            attach_backgrounded(&processes)?;
         }
 
         seconds_until_settle -= 1;
@@ -354,6 +365,27 @@ fn start_exit_watcher() -> Option<crate::exit_watch::Watcher> {
             let _ = log_line(&format!("exit watcher failed to start: {error:#}"));
         })
         .ok()
+}
+
+fn watch_unlocks() -> Option<crate::screen::Unlocks> {
+    crate::screen::Unlocks::watch()
+        .map_err(|error| {
+            let _ = log_line(&format!("screen unlock watch failed to start: {error:#}"));
+        })
+        .ok()
+}
+
+/// Only a lockout is worth a detour through the background; a state still
+/// being read or unknown is held as it is.
+fn resumes_in_background(lockout: &Lockout) -> bool {
+    match lockout {
+        Lockout::Engaged | Lockout::ScreenLocked => true,
+        Lockout::Clear
+        | Lockout::NotRunning
+        | Lockout::Reading
+        | Lockout::Deciding
+        | Lockout::Unknown(_) => false,
+    }
 }
 
 fn held_lockout(summary: &RestoreSummary) -> Option<Lockout> {
@@ -624,6 +656,7 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
         let held_reason = match &lockout {
             Lockout::Clear => None,
             Lockout::Engaged => Some(format!("{kind} is locked out by Screen Time")),
+            Lockout::ScreenLocked => Some("the screen is locked".to_string()),
             Lockout::NotRunning => Some(format!("{kind} is not running")),
             Lockout::Deciding => Some(format!(
                 "Screen Time has not answered for {kind}'s launch yet"
@@ -637,14 +670,12 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
         };
         if let Some(reason) = held_reason {
             for session in std::iter::once(session).chain(to_open) {
-                // Only a lockout is worth a detour through the background; a
-                // state still being read or unknown is held as it is.
                 let Some(background) = session
                     .tool
                     .spec()
                     .background
                     .as_ref()
-                    .filter(|_| lockout == Lockout::Engaged)
+                    .filter(|_| resumes_in_background(&lockout))
                 else {
                     summary.held.push(session);
                     continue;
@@ -779,7 +810,11 @@ fn attach_backgrounded(processes: &ProcessSnapshot) -> Result<()> {
             launch_terminal(kind)?;
             return log_line(&format!("launching {kind} for background sessions' tabs"));
         }
-        Lockout::Engaged | Lockout::Deciding | Lockout::Reading | Lockout::Unknown(_) => {
+        Lockout::Engaged
+        | Lockout::ScreenLocked
+        | Lockout::Deciding
+        | Lockout::Reading
+        | Lockout::Unknown(_) => {
             return Ok(());
         }
     }

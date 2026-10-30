@@ -1,5 +1,6 @@
 use chrono::{Duration as Age, Utc};
 use serde_json::{Value, json};
+use std::ffi::{CString, c_char, c_int};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -99,6 +100,51 @@ fi
 exec sleep 30
 "#;
 
+unsafe extern "C" {
+    fn notify_register_check(name: *const c_char, out_token: *mut c_int) -> u32;
+    fn notify_set_state(token: c_int, state: u64) -> u32;
+    fn notify_post(name: *const c_char) -> u32;
+    fn notify_cancel(token: c_int) -> u32;
+}
+
+/// Stands in for loginwindow's lock notifications under names of the test's
+/// own. Holding a registration keeps the lock state alive between commands.
+struct Screen {
+    notices: String,
+    token: c_int,
+}
+
+impl Screen {
+    fn new(notices: String) -> Self {
+        let locked = CString::new(format!("{notices}.screenIsLocked")).unwrap();
+        let mut token = 0;
+        assert_eq!(
+            unsafe { notify_register_check(locked.as_ptr(), &raw mut token) },
+            0
+        );
+        Self { notices, token }
+    }
+
+    fn lock(&self) {
+        assert_eq!(unsafe { notify_set_state(self.token, 1) }, 0);
+    }
+
+    /// As loginwindow does: the state first, then the unlock notice.
+    fn unlock(&self) {
+        assert_eq!(unsafe { notify_set_state(self.token, 0) }, 0);
+        let unlocked = CString::new(format!("{}.screenIsUnlocked", self.notices)).unwrap();
+        assert_eq!(unsafe { notify_post(unlocked.as_ptr()) }, 0);
+    }
+}
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        unsafe {
+            notify_cancel(self.token);
+        }
+    }
+}
+
 fn stand_in_terminal_path() -> PathBuf {
     std::env::current_exe()
         .unwrap()
@@ -120,6 +166,7 @@ struct Fixture {
     // A launch is answered for only while Screen Time's lockout agent runs;
     // the daemon looks for this stand-in instead.
     agent: Option<Child>,
+    screen: Screen,
     _one_terminal: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -177,6 +224,11 @@ impl Fixture {
         Self::build(Some(tool), CUED_LOG, false, true)
     }
 
+    /// The terminal is running and Screen Time has not locked it out.
+    fn unlocked(tool: &str) -> Self {
+        Self::build(Some(tool), CUED_LOG, true, true)
+    }
+
     /// The same, on a Mac where Screen Time's lockout agent is not running.
     fn launching_without_agent(tool: &str) -> Self {
         Self::build(Some(tool), CUED_LOG, false, false)
@@ -193,6 +245,10 @@ impl Fixture {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = tempfile::tempdir().unwrap();
         let root = home.path();
+        let screen = Screen::new(format!(
+            "test.session-guard.{}",
+            root.file_name().unwrap().to_string_lossy()
+        ));
         let config = root.join(".config/session-guard");
         let bin = root.join("bin");
         fs::create_dir_all(&config).unwrap();
@@ -238,6 +294,7 @@ impl Fixture {
             terminal,
             daemon: None,
             agent,
+            screen,
             _one_terminal: one_terminal,
         }
     }
@@ -260,6 +317,7 @@ impl Fixture {
             .env("TERMINAL_PID", self.terminal_pid().to_string())
             .env("STAND_IN", stand_in_terminal_path())
             .env("SESSION_GUARD_LOCKOUT_AGENT", AGENT)
+            .env("SESSION_GUARD_SCREEN_NOTICES", &self.screen.notices)
             .env(
                 "PATH",
                 format!(
@@ -551,6 +609,74 @@ fn a_failed_background_start_keeps_the_work_it_would_have_resumed() {
     assert_eq!(record["background_tasks"][0]["id"], "t1", "{record}");
     assert_eq!(record["restore_pending"], true);
     assert_eq!(record["attach_after_lockout"], false);
+    fixture.stop_daemon();
+}
+
+#[test]
+fn behind_a_locked_screen_claude_resumes_in_the_background_and_gets_its_tab_on_unlock() {
+    let mut fixture = Fixture::unlocked("claude");
+    fixture.screen.lock();
+    fixture.start_daemon();
+    fixture.wait_for("the background resume", || {
+        fixture
+            .daemon_log()
+            .contains("Resumed 1 in the background: the screen is locked.")
+    });
+    let locked = fixture.lockout();
+    assert_eq!(locked.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&locked.stderr).contains("the screen is locked"));
+    let mut waiter = fixture.command(&["lockout", "--wait"]).spawn().unwrap();
+
+    // The attach pass runs every five seconds and must open nothing behind
+    // the lock screen.
+    thread::sleep(Duration::from_secs(6));
+    let claude_args = || fs::read_to_string(fixture.root().join("claude.args")).unwrap_or_default();
+    assert!(!claude_args().contains("attach"), "{}", claude_args());
+    assert!(
+        waiter.try_wait().unwrap().is_none(),
+        "--wait returned behind the lock screen"
+    );
+
+    fixture.screen.unlock();
+    fixture.wait_for("--wait to return", || waiter.try_wait().unwrap().is_some());
+    assert_eq!(waiter.wait().unwrap().code(), Some(0));
+    fixture.wait_for("the attach tab", || {
+        claude_args().contains(&format!("attach {}", &SESSION[..8]))
+    });
+    fixture.wait_for("the attach flag to clear", || {
+        fixture.record()["attach_after_lockout"] == false
+    });
+    fixture.stop_daemon();
+}
+
+#[test]
+fn behind_a_locked_screen_no_terminal_launches_until_it_unlocks() {
+    let mut fixture = Fixture::launching("codex");
+    fixture.screen.lock();
+    fixture.start_daemon();
+    fixture.wait_for("the startup pass to hold", || {
+        fixture
+            .daemon_log()
+            .contains("Held 1 sessions: the screen is locked.")
+    });
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(fixture.launches(), 0);
+    assert_eq!(fixture.record()["held_for_lockout"], true);
+
+    fixture.screen.unlock();
+    fixture.wait_for("the launch", || {
+        fixture.pid_in("launch-stream.pid").is_some_and(alive)
+            && fixture.pid_in("terminal.pid").is_some_and(alive)
+    });
+    fixture.emit_launch("1", &born_line());
+    fixture.emit_launch("2", &requested());
+    fixture.emit_launch("3", &answered());
+    fixture.wait_for("the held restore", || {
+        fixture
+            .daemon_log()
+            .contains("held restore: Restored 1 sessions")
+    });
+    assert_eq!(fixture.launches(), 1);
     fixture.stop_daemon();
 }
 

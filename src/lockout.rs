@@ -7,12 +7,14 @@
 //! change. A terminal that launches unlocked logs nothing there, so for a
 //! launch the daemon follows Screen Time's lockout agent instead: it asks for
 //! each launched app's policy in turn, answers in order, and logs a lockout
-//! right after the answer that decided it.
+//! right after the answer that decided it. A locked screen counts as a
+//! lockout too: native fullscreen fails behind it the same way.
 
 use crate::TerminalKind;
 use crate::adapters::adapter_for;
 use crate::paths;
 use crate::process::{self, ProcessIdentityStatus};
+use crate::screen::{self, Unlocks};
 use anyhow::{Context, Result};
 use chrono::Timelike;
 use serde::de::DeserializeOwned;
@@ -62,6 +64,9 @@ const OPEN_REQUESTS_LOOKBACK: chrono::TimeDelta = chrono::TimeDelta::seconds(60)
 pub enum Lockout {
     Clear,
     Engaged,
+    /// A terminal launched now would open its first window behind the lock
+    /// screen, so this comes before whether it is running.
+    ScreenLocked,
     /// The terminal is not running, and a tab opened as it launches would
     /// come before Screen Time's answer for the launch.
     NotRunning,
@@ -292,6 +297,11 @@ impl Launch {
 }
 
 pub fn lockout(terminal: TerminalKind) -> Lockout {
+    match screen::is_locked() {
+        Ok(true) => return Lockout::ScreenLocked,
+        Ok(false) => {}
+        Err(error) => return Lockout::Unknown(format!("{error:#}")),
+    }
     let current = current_instance(terminal);
     let (state, launch) = match (paths::lockout_state(), paths::lockout_launch()) {
         (Ok(state), Ok(launch)) => (state, launch),
@@ -1272,7 +1282,7 @@ fn launched(terminal: TerminalKind) -> Result<Instance> {
 }
 
 /// `session-guard lockout`: 0 when a tab can be opened now, 1 while the
-/// terminal is locked out, 2 when that cannot be known yet or the terminal is
+/// terminal is locked out or the screen is locked, 2 when that cannot be known yet or the terminal is
 /// not running. `--wait` launches a terminal that is not running and waits
 /// until a tab can be opened.
 pub fn run(wait: bool) -> ! {
@@ -1283,9 +1293,28 @@ pub fn run(wait: bool) -> ! {
             std::process::exit(2);
         }
     };
+    let unlocks = match wait.then(Unlocks::watch).transpose() {
+        Ok(unlocks) => unlocks,
+        Err(error) => {
+            eprintln!("cannot watch for the screen to unlock: {error:#}");
+            std::process::exit(2);
+        }
+    };
     loop {
         match lockout(terminal) {
             Lockout::Clear => std::process::exit(0),
+            Lockout::ScreenLocked => {
+                let Some(unlocks) = &unlocks else {
+                    eprintln!(
+                        "the screen is locked, and a tab opened behind it can crash {terminal}"
+                    );
+                    std::process::exit(1);
+                };
+                if let Err(error) = unlocks.wait() {
+                    eprintln!("cannot watch for the screen to unlock: {error:#}");
+                    std::process::exit(2);
+                }
+            }
             Lockout::NotRunning if wait => {
                 if let Err(error) = launch(terminal, drop).and_then(|launching| {
                     launching

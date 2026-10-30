@@ -12,6 +12,7 @@ mod lockout;
 mod paths;
 mod process;
 mod scan;
+mod screen;
 mod sessions;
 mod transcripts;
 
@@ -265,9 +266,9 @@ enum Command {
         all: bool,
     },
     /// Exit 0 when a tab can be opened now; 1 while Screen Time has the
-    /// terminal locked out; 2 when that cannot be known yet or the terminal is
-    /// not running. A tab opened while the terminal is locked out crashes it
-    /// when the lockout lifts.
+    /// terminal locked out or the screen is locked; 2 when that cannot be known
+    /// yet or the terminal is not running. A tab opened behind either can crash
+    /// the terminal later.
     Lockout {
         #[arg(
             long,
@@ -276,7 +277,7 @@ enum Command {
         wait: bool,
     },
     /// Give a session started with `claude --bg` a terminal tab once Screen
-    /// Time no longer has the terminal locked out.
+    /// Time no longer has the terminal locked out and the screen is unlocked.
     AttachAfterLockout {
         #[arg(help = "Session id, or the short id `claude --bg` prints")]
         id: String,

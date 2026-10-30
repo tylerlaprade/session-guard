@@ -151,6 +151,13 @@ else:
             .env("TEST_BINARY", env!("CARGO_BIN_EXE_session-guard"))
             .env("TEST_SESSION", session)
             .env(
+                "SESSION_GUARD_SCREEN_NOTICES",
+                format!(
+                    "test.session-guard.{}",
+                    home.file_name().unwrap().to_string_lossy()
+                ),
+            )
+            .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
             )
