@@ -24,6 +24,11 @@ pub trait TerminalAdapter {
     fn open_tab(&self, directory: &Path, command: &str, selection: Selection) -> Result<()>;
     fn is_running(&self) -> bool;
     fn launch(&self) -> Result<()>;
+    /// Whether every tab asked for so far has been added or never will be:
+    /// a script that gave up waiting can still have its tab added later.
+    fn caught_up(&self) -> bool {
+        true
+    }
     /// Every terminal's tty with its (window, tab) position, for a terminal
     /// whose scripting exposes its tab order.
     fn tab_positions(&self) -> Result<Vec<((u32, u32), String)>> {

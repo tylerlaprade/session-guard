@@ -67,19 +67,34 @@ done
 
 // Stands in for `alacritty`: with no arguments it launches the terminal, which
 // takes a moment to start, and `alacritty --working-directory DIR -e sh -lc
-// COMMAND` opens a window.
+// COMMAND` opens a window. While `late-open` names a delay, the next window
+// opens that many seconds late and the open reports failure, as a Ghostty
+// script that timed out while Ghostty still added its tab.
 const OPEN_WINDOW: &str = r#"#!/usr/bin/env python3
 import os, pathlib, subprocess, sys, time
+home = pathlib.Path(os.environ["HOME"])
 if len(sys.argv) == 1:
-    with open(pathlib.Path(os.environ["HOME"], "launches"), "a") as launches:
+    with open(home / "launches", "a") as launches:
         launches.write(f"{os.getpid()}\n")
-    pathlib.Path(os.environ["HOME"], "terminal.pid").write_text(str(os.getpid()))
+    (home / "terminal.pid").write_text(str(os.getpid()))
     time.sleep(2)
     os.execv(os.environ["STAND_IN"], [os.environ["STAND_IN"]])
-child = subprocess.Popen(sys.argv[4:], cwd=sys.argv[2], stdin=subprocess.DEVNULL,
+with open(home / "windows", "a") as windows:
+    windows.write("opened\n")
+command = sys.argv[4:]
+late = home / "late-open"
+delay = late.read_text().strip() if late.exists() else None
+if delay is not None:
+    late.unlink()
+    command = ["sh", "-c", f'sleep {delay}; : > "$HOME/late-started"; "$@"', "sh", *command]
+child = subprocess.Popen(command, cwd=sys.argv[2], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
-pathlib.Path(os.environ["HOME"], "launcher.pid").write_text(str(child.pid))
+if delay is not None:
+    with open(home / "background.pids", "a") as pids:
+        pids.write(f"{child.pid}\n")
+    sys.exit(1)
+(home / "launcher.pid").write_text(str(child.pid))
 "#;
 
 // Stands in for `claude`. `--bg --resume ID` starts a background session and
@@ -658,6 +673,57 @@ fn behind_a_locked_screen_claude_resumes_in_the_background_and_gets_its_tab_on_u
         fixture.record()["attach_after_lockout"] == false
     });
     fixture.stop_daemon();
+}
+
+/// A tab whose open reported failure but which opened anyway, `late` seconds
+/// after; returns the windows opened and the attaches the tabs ran.
+fn attach_with_a_late_tab(late: u64) -> (usize, usize) {
+    let mut fixture = Fixture::unlocked("claude");
+    fixture.screen.lock();
+    fixture.start_daemon();
+    fixture.wait_for("the background resume", || {
+        fixture.record()["attach_after_lockout"] == true
+    });
+    fs::write(fixture.root().join("late-open"), late.to_string()).unwrap();
+    fixture.screen.unlock();
+    fixture.wait_for("the late tab", || {
+        fixture.root().join("late-started").exists()
+    });
+    fixture.wait_for("the attach flag to clear", || {
+        fixture.record()["attach_after_lockout"] == false
+    });
+    assert!(
+        fixture.daemon_log().contains("which may still open"),
+        "{}",
+        fixture.daemon_log()
+    );
+    // Long enough for another attach pass to open a third tab if it would.
+    thread::sleep(Duration::from_secs(6));
+    let count = |file: &str, line: &str| {
+        fs::read_to_string(fixture.root().join(file))
+            .unwrap_or_default()
+            .lines()
+            .filter(|found| found.starts_with(line))
+            .count()
+    };
+    let opened = (count("windows", "opened"), count("claude.args", "attach"));
+    assert!(
+        fixture.record()["attach_tab_pid"].is_number(),
+        "{}",
+        fixture.record()
+    );
+    fixture.stop_daemon();
+    opened
+}
+
+#[test]
+fn a_tab_that_opens_after_its_open_failed_is_not_opened_again() {
+    assert_eq!(attach_with_a_late_tab(0), (1, 1));
+}
+
+#[test]
+fn a_tab_that_opens_after_its_retry_closes_and_leaves_one_attach() {
+    assert_eq!(attach_with_a_late_tab(8), (2, 1));
 }
 
 #[test]

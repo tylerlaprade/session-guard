@@ -826,42 +826,68 @@ fn attach_backgrounded(processes: &ProcessSnapshot) -> Result<()> {
     let restore_lock = crate::commands::restore::lock()?;
     restore_lock.lock_exclusive()?;
     let adapter = adapter_for(kind);
+    // Asked at most once a pass, and only while an earlier tab may yet open.
+    let mut caught_up = None;
     let mut settled = Vec::new();
     for session in waiting {
-        let attach = session
-            .tool
-            .spec()
-            .background
-            .as_ref()
-            .filter(|_| session_is_alive(&session, processes));
-        match attach.map(|background| {
-            adapter.open_tab(
-                &session.directory,
-                &(background.attach)(&session.session_id),
-                if session.attach_keeps_selection {
-                    Selection::Keep
-                } else {
-                    Selection::Take
-                },
-            )
-        }) {
-            Some(Ok(())) => log_line(&format!(
-                "opened a tab for a background session: {} {}",
-                session.tool, session.session_id
-            ))?,
-            Some(Err(error)) => {
-                log_line(&format!(
-                    "failed to open a tab for background session {}: {error:#}",
-                    session.session_id
-                ))?;
-                continue;
-            }
-            None => log_line(&format!(
+        if session.tool.spec().background.is_none() || !session_is_alive(&session, processes) {
+            log_line(&format!(
                 "background session ended before its tab: {} {}",
                 session.tool, session.session_id
+            ))?;
+            settled.push(session.session_id);
+            continue;
+        }
+        if session.attach_tab_pending && !*caught_up.get_or_insert_with(|| adapter.caught_up()) {
+            continue;
+        }
+        // As the record stands now: a tab that opened late may have claimed
+        // the session since the pass began.
+        let Some(current) = sessions::read_sessions(&path)?
+            .into_iter()
+            .find(|current| current.session_id == session.session_id)
+            .filter(|current| current.attach_after_lockout)
+        else {
+            continue;
+        };
+        if current.has_attach_tab() {
+            log_line(&format!(
+                "background session already has its tab: {} {}",
+                session.tool, session.session_id
+            ))?;
+            settled.push(session.session_id);
+            continue;
+        }
+        sessions::with_sessions_mut(&path, |sessions| {
+            if let Some(record) = sessions
+                .iter_mut()
+                .find(|record| record.session_id == session.session_id)
+            {
+                record.attach_tab_pending = true;
+            }
+            Ok(())
+        })?;
+        match adapter.open_tab(
+            &session.directory,
+            &attach_tab_command(&session.session_id)?,
+            if session.attach_keeps_selection {
+                Selection::Keep
+            } else {
+                Selection::Take
+            },
+        ) {
+            Ok(()) => {
+                log_line(&format!(
+                    "opened a tab for a background session: {} {}",
+                    session.tool, session.session_id
+                ))?;
+                settled.push(session.session_id);
+            }
+            Err(error) => log_line(&format!(
+                "failed to open a tab for background session {}, which may still open: {error:#}",
+                session.session_id
             ))?,
         }
-        settled.push(session.session_id);
     }
     sessions::with_sessions_mut(&path, |sessions| {
         for session in sessions
@@ -870,9 +896,21 @@ fn attach_backgrounded(processes: &ProcessSnapshot) -> Result<()> {
         {
             session.attach_after_lockout = false;
             session.attach_keeps_selection = false;
+            session.attach_tab_pending = false;
         }
         Ok(())
     })
+}
+
+/// The tab claims the session before showing it, and closes itself when
+/// another tab already shows it.
+fn attach_tab_command(session_id: &str) -> Result<String> {
+    Ok(format!(
+        "{} attach-tab {} || [ $? -ne {} ] || exit",
+        shell_quote(&std::env::current_exe()?.to_string_lossy()),
+        shell_quote(session_id),
+        crate::commands::attach_tab::ALREADY_SHOWN
+    ))
 }
 
 fn launch_command(session_id: &str) -> Result<String> {

@@ -89,6 +89,17 @@ impl TerminalAdapter for Ghostty {
         process::app_is_running("Ghostty")
     }
 
+    // Ghostty handles scripted commands one at a time, in the order they
+    // arrive, so once a later one answers, any tab asked for before it exists.
+    fn caught_up(&self) -> bool {
+        if !self.is_running() {
+            return true;
+        }
+        let mut osa = Command::new("osascript");
+        osa.args(["-e", r#"tell application "Ghostty" to count windows"#]);
+        super::run_capture_timeout(&mut osa, "asking Ghostty to catch up", OPEN_TAB_TIMEOUT).is_ok()
+    }
+
     fn launch(&self) -> Result<()> {
         let mut command = Command::new("open");
         command.args(["-a", "Ghostty", "--args", "--initial-window=false"]);

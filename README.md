@@ -360,6 +360,14 @@ The session registers through its own hooks a moment after `claude --bg`
 returns, and later still on a busy Mac. A hand-off that comes first is kept
 until the session registers, and the registration takes it.
 
+A background session's tab runs `session-guard attach-tab <id>`, which claims
+the tab for the session before running `claude attach`. Ghostty can still add
+a tab after the script that asked for it timed out, so a failed or timed-out
+open counts as one that may yet succeed: the daemon asks again only once
+Ghostty has answered a later script, which it handles in order, and no tab has
+claimed the session. A tab that finds the session already claimed closes
+itself, so a late tab and its retry never show one session twice.
+
 A restored session's tab takes the selection when it opens, so restores can be
 watched. A handed-off session's tab keeps the tab in front selected, as the
 spawn would have if it had opened its tab at once. Only Ghostty can keep the

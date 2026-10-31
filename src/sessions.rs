@@ -89,6 +89,15 @@ pub struct SessionRecord {
     // keeps the selection.
     #[serde(default)]
     pub attach_keeps_selection: bool,
+    // A tab was asked for and may yet open: its script failed or timed out,
+    // and Ghostty can still add a tab it was asked for after the script gave up.
+    #[serde(default)]
+    pub attach_tab_pending: bool,
+    // The `attach-tab` process showing this background session in a tab.
+    #[serde(default)]
+    pub attach_tab_pid: Option<i32>,
+    #[serde(default)]
+    pub attach_tab_started_at: Option<String>,
     #[serde(default)]
     pub activity: Option<crate::continuation::Activity>,
     #[serde(default)]
@@ -145,6 +154,9 @@ impl SessionRecord {
             held_for_lockout: false,
             attach_after_lockout: false,
             attach_keeps_selection: false,
+            attach_tab_pending: false,
+            attach_tab_pid: None,
+            attach_tab_started_at: None,
             activity: None,
             background_tasks: None,
             command: None,
@@ -183,11 +195,25 @@ impl SessionRecord {
             held_for_lockout: false,
             attach_after_lockout: false,
             attach_keeps_selection: false,
+            attach_tab_pending: false,
+            attach_tab_pid: None,
+            attach_tab_started_at: None,
             activity: None,
             background_tasks: None,
             command: None,
             tab_position: None,
             unknown_fields: UnknownFields::new(),
+        }
+    }
+
+    /// Whether a tab is showing this background session now.
+    pub fn has_attach_tab(&self) -> bool {
+        match (self.attach_tab_pid, self.attach_tab_started_at.as_deref()) {
+            (Some(pid), Some(started)) => {
+                process::process_identity_status(pid, started)
+                    == process::ProcessIdentityStatus::Alive
+            }
+            _ => false,
         }
     }
 
@@ -358,6 +384,11 @@ pub fn register(path: &Path, mut record: SessionRecord) -> Result<()> {
             record.tab_position = record.tab_position.or(previous.tab_position);
             record.attach_after_lockout = previous.attach_after_lockout;
             record.attach_keeps_selection = previous.attach_keeps_selection;
+            record.attach_tab_pending = previous.attach_tab_pending;
+            record.attach_tab_pid = previous.attach_tab_pid;
+            record
+                .attach_tab_started_at
+                .clone_from(&previous.attach_tab_started_at);
         }
         if !record.attach_after_lockout
             && record.tool.spec().background.is_some()

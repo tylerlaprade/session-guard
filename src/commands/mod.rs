@@ -1,4 +1,5 @@
 pub mod attach_after_lockout;
+pub mod attach_tab;
 pub mod daemon;
 pub mod deregister;
 pub mod install;

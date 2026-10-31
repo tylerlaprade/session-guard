@@ -232,6 +232,10 @@ enum Command {
         session_id: String,
     },
     #[command(hide = true)]
+    AttachTab {
+        session_id: String,
+    },
+    #[command(hide = true)]
     LastSession {
         #[arg(long, value_enum)]
         tool: Tool,
@@ -297,6 +301,7 @@ fn main() -> Result<()> {
         Command::Activity => continuation::record_hook(),
         Command::ShellStart => commands::shell_start::run(),
         Command::Launch { session_id } => commands::launch::run(&session_id),
+        Command::AttachTab { session_id } => commands::attach_tab::run(&session_id),
         Command::LastSession { tool, shell_pid } => commands::last_session::run(tool, shell_pid),
         Command::Register {
             tool,
