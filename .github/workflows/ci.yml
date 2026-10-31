@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-      - run: brew install shellcheck biome
+      - run: brew install shellcheck
       - run: curl -fsSL -o "$HOME/.shellcheckrc" https://raw.githubusercontent.com/tylerlaprade/dotfiles/master/.shellcheckrc
       - run: shellcheck src/grok_register.sh
       # biome.jsonc extends ../../.config/biome, which is ~/.config/biome for a checkout at ~/Code/<repo>.
@@ -19,7 +19,7 @@ jobs:
           curl -fsSL -o "$GITHUB_WORKSPACE/../../.config/biome/biome.jsonc" https://raw.githubusercontent.com/tylerlaprade/dotfiles/master/.config/biome/biome.jsonc
       # Biome resolves the OpenCode plugin's solid-js import, which OpenCode supplies at run time, from node_modules.
       - run: npm ci
-      - run: biome check --error-on-warnings
+      - run: npx --yes @biomejs/biome@2.6.4 check --error-on-warnings
       - run: brew install --cask ghostty iterm2
       - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Ghostty.app /Applications/iTerm.app
       - name: Compile AppleScript
