@@ -17,6 +17,8 @@ jobs:
       - run: |
           mkdir -p "$GITHUB_WORKSPACE/../../.config/biome"
           curl -fsSL -o "$GITHUB_WORKSPACE/../../.config/biome/biome.jsonc" https://raw.githubusercontent.com/tylerlaprade/dotfiles/master/.config/biome/biome.jsonc
+      # Biome resolves the OpenCode plugin's solid-js import, which OpenCode supplies at run time, from node_modules.
+      - run: npm ci
       - run: biome check --error-on-warnings
       - run: brew install --cask ghostty iterm2
       - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Ghostty.app /Applications/iTerm.app

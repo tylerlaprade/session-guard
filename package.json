@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "devDependencies": {
+    "solid-js": "1.9.18"
+  }
+}
