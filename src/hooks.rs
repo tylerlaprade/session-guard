@@ -8,8 +8,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use toml::Value as TomlValue;
-use toml::map::Map as TomlMap;
+use toml_edit::{DocumentMut, Item, TableLike};
 
 const OLD_CLAUDE_REGISTER: &str = "session-guard register --tool claude --pid \"$PPID\"";
 // The pre-entrypoint-gate register command; without it in the removal lists,
@@ -88,7 +87,6 @@ pub fn install(tool: Tool) -> Result<HookChange> {
 fn config_path(integration: &Integration) -> Option<&ToolPath> {
     match integration {
         Integration::JsonSettings { path, .. }
-        | Integration::TomlConfig { path, .. }
         | Integration::ScriptDir { path, .. }
         | Integration::PluginFile { path, .. } => Some(path),
         Integration::ProcessScan => None,
@@ -108,14 +106,16 @@ fn install_with(tool: Tool, path: &Path, binary: &Binary) -> Result<HookChange> 
             events,
             register,
             deregister,
+            retired_toml,
             ..
-        } => install_json_hooks(path, events, register, deregister, binary),
-        Integration::TomlConfig {
-            events,
-            register,
-            deregister,
-            ..
-        } => install_toml_hooks(path, &with_activity(events), register, deregister, binary),
+        } => {
+            let mut change =
+                install_json_hooks(path, &with_activity(events), register, deregister, binary)?;
+            if let Some(retired) = retired_toml {
+                change.changed |= remove_toml_hooks(&path.with_file_name(retired))?.changed;
+            }
+            Ok(change)
+        }
         Integration::ScriptDir {
             events,
             script_name,
@@ -151,8 +151,9 @@ fn install_with(tool: Tool, path: &Path, binary: &Binary) -> Result<HookChange> 
 /// user never installed them for.
 pub fn installed(tool: Tool) -> Result<bool> {
     Ok(match &tool.spec().integration {
-        Integration::JsonSettings { path, .. } => json_file_has_own_hook(&path.resolve()?)?,
-        Integration::TomlConfig { path, .. } => toml_file_has_own_hook(&path.resolve()?)?,
+        Integration::JsonSettings {
+            path, retired_toml, ..
+        } => json_hooks_installed(&path.resolve()?, *retired_toml)?,
         Integration::ScriptDir {
             path,
             manifest_name,
@@ -173,6 +174,15 @@ pub fn installed(tool: Tool) -> Result<bool> {
     })
 }
 
+fn json_hooks_installed(path: &Path, retired_toml: Option<&str>) -> Result<bool> {
+    if json_file_has_own_hook(path)? {
+        return Ok(true);
+    }
+    retired_toml.map_or(Ok(false), |retired| {
+        toml_file_has_own_hook(&path.with_file_name(retired))
+    })
+}
+
 fn json_file_has_own_hook(path: &Path) -> Result<bool> {
     Ok(json_hook_commands(&read_json_config(path)?).any(is_own_hook))
 }
@@ -182,22 +192,28 @@ fn toml_file_has_own_hook(path: &Path) -> Result<bool> {
 }
 
 pub fn remove(tool: Tool) -> Result<HookChange> {
+    let Some(path) = config_path(&tool.spec().integration) else {
+        return Ok(HookChange::default());
+    };
+    remove_with(tool, &path.resolve()?)
+}
+
+fn remove_with(tool: Tool, path: &Path) -> Result<HookChange> {
     match &tool.spec().integration {
-        Integration::JsonSettings { path, .. } => remove_json_hooks(&path.resolve()?),
-        Integration::TomlConfig { path, .. } => remove_toml_hooks(&path.resolve()?),
+        Integration::JsonSettings { retired_toml, .. } => {
+            let mut change = remove_json_hooks(path)?;
+            if let Some(retired) = retired_toml {
+                change.changed |= remove_toml_hooks(&path.with_file_name(retired))?.changed;
+            }
+            Ok(change)
+        }
         Integration::ScriptDir {
-            path,
             script_name,
             manifest_name,
             ..
-        } => remove_files(&path.resolve()?, &[manifest_name, script_name]),
-        Integration::PluginFile {
+        } => remove_files(path, &[manifest_name, script_name]),
+        Integration::PluginFile { name, retired, .. } => remove_files(
             path,
-            name,
-            retired,
-            ..
-        } => remove_files(
-            &path.resolve()?,
             &std::iter::once(*name)
                 .chain(retired.iter().copied())
                 .collect::<Vec<_>>(),
@@ -226,22 +242,7 @@ fn install_at(tool: Tool, path: &Path) -> Result<HookChange> {
 
 #[cfg(test)]
 fn remove_at(tool: Tool, path: &Path) -> Result<HookChange> {
-    match &tool.spec().integration {
-        Integration::JsonSettings { .. } => remove_json_hooks(path),
-        Integration::TomlConfig { .. } => remove_toml_hooks(path),
-        Integration::ScriptDir {
-            script_name,
-            manifest_name,
-            ..
-        } => remove_files(path, &[manifest_name, script_name]),
-        Integration::PluginFile { name, retired, .. } => remove_files(
-            path,
-            &std::iter::once(*name)
-                .chain(retired.iter().copied())
-                .collect::<Vec<_>>(),
-        ),
-        Integration::ProcessScan => Ok(HookChange { changed: false }),
-    }
+    remove_with(tool, path)
 }
 
 /// The command template a hook runs for one lifecycle event.
@@ -309,37 +310,13 @@ fn remove_json_hooks(path: &Path) -> Result<HookChange> {
     Ok(HookChange { changed })
 }
 
-fn install_toml_hooks(
-    path: &Path,
-    events: &[HookEvent],
-    register: &str,
-    deregister: &str,
-    binary: &Binary,
-) -> Result<HookChange> {
-    let hooks = rendered_hooks(events, register, deregister, binary);
-    let mut root = read_toml_config(path)?;
-    let mut changed = remove_toml_hook_commands(&mut root, |command| {
-        is_own_hook(command) && !hooks.iter().any(|(_, current)| current == command)
-    });
-
-    for (event, command) in &hooks {
-        changed |= ensure_toml_hook(&mut root, event.event, event.matcher, command)?;
-    }
-
-    if changed {
-        write_toml_config(path, &root)?;
-    }
-
-    Ok(HookChange { changed })
-}
-
 fn remove_toml_hooks(path: &Path) -> Result<HookChange> {
     if !path.exists() {
         return Ok(HookChange::default());
     }
 
     let mut root = read_toml_config(path)?;
-    let changed = remove_toml_hook_commands(&mut root, is_own_hook);
+    let changed = remove_toml_hook_commands(&mut root);
 
     if changed {
         write_toml_config(path, &root)?;
@@ -480,11 +457,6 @@ fn hook_templates() -> impl Iterator<Item = &'static str> {
                 register,
                 deregister,
                 ..
-            }
-            | Integration::TomlConfig {
-                register,
-                deregister,
-                ..
             } => vec![*register, *deregister],
             Integration::ScriptDir { deregister, .. } => vec![*deregister],
             Integration::PluginFile { .. } | Integration::ProcessScan => Vec::new(),
@@ -531,16 +503,29 @@ fn json_hook_commands(root: &JsonValue) -> impl Iterator<Item = &str> {
         .filter_map(|hook| hook.get("command").and_then(JsonValue::as_str))
 }
 
-fn toml_hook_commands(root: &TomlValue) -> impl Iterator<Item = &str> {
-    root.get("hooks")
-        .and_then(TomlValue::as_table)
+fn toml_tables(item: &Item) -> impl Iterator<Item = &dyn TableLike> {
+    let tables = item
+        .as_array_of_tables()
         .into_iter()
-        .flat_map(|hooks| hooks.values())
-        .filter_map(TomlValue::as_array)
         .flatten()
-        .filter_map(|group| group.get("hooks").and_then(TomlValue::as_array))
+        .map(|table| table as &dyn TableLike);
+    let inline_tables = item
+        .as_array()
+        .into_iter()
         .flatten()
-        .filter_map(|hook| hook.get("command").and_then(TomlValue::as_str))
+        .filter_map(|value| value.as_inline_table().map(|table| table as &dyn TableLike));
+    tables.chain(inline_tables)
+}
+
+fn toml_hook_commands(root: &DocumentMut) -> impl Iterator<Item = &str> {
+    root.get("hooks")
+        .and_then(Item::as_table_like)
+        .into_iter()
+        .flat_map(|hooks| hooks.iter())
+        .flat_map(|(_, event)| toml_tables(event))
+        .filter_map(|group| group.get("hooks"))
+        .flat_map(toml_tables)
+        .filter_map(|hook| hook.get("command").and_then(Item::as_str))
 }
 
 fn ensure_json_hook(
@@ -549,11 +534,11 @@ fn ensure_json_hook(
     matcher: Option<&str>,
     command: &str,
 ) -> Result<bool> {
-    let root = json_object_mut(root, "Claude settings root")?;
+    let root = json_object_mut(root, "JSON settings root")?;
     let hooks = root
         .entry("hooks".to_string())
         .or_insert_with(|| JsonValue::Object(JsonMap::new()));
-    let hooks = json_object_mut(hooks, "Claude hooks")?;
+    let hooks = json_object_mut(hooks, "JSON hooks")?;
     let event_hooks = hooks
         .entry(event.to_string())
         .or_insert_with(|| JsonValue::Array(Vec::new()));
@@ -659,154 +644,85 @@ fn json_array_mut<'a>(value: &'a mut JsonValue, name: &str) -> Result<&'a mut Ve
         .with_context(|| format!("{name} hooks must be a JSON array"))
 }
 
-fn read_toml_config(path: &Path) -> Result<TomlValue> {
+fn read_toml_config(path: &Path) -> Result<DocumentMut> {
     if !path.exists() {
-        return Ok(TomlValue::Table(TomlMap::new()));
+        return Ok(DocumentMut::new());
     }
-
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if contents.trim().is_empty() {
-        return Ok(TomlValue::Table(TomlMap::new()));
-    }
-
     contents
-        .parse::<TomlValue>()
+        .parse()
         .with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn write_toml_config(path: &Path, root: &TomlValue) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+fn write_toml_config(path: &Path, root: &DocumentMut) -> Result<()> {
+    fs::write(path, root.to_string()).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn retain_toml_tables(item: &mut Item, mut keep: impl FnMut(&mut dyn TableLike) -> bool) -> bool {
+    if let Some(tables) = item.as_array_of_tables_mut() {
+        let before = tables.len();
+        for index in (0..tables.len()).rev() {
+            if !keep(tables.get_mut(index).unwrap()) {
+                tables.remove(index);
+            }
+        }
+        return tables.len() != before;
     }
-
-    let mut contents = toml::to_string_pretty(root)?;
-    contents.push('\n');
-    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn ensure_toml_hook(
-    root: &mut TomlValue,
-    event: &str,
-    matcher: Option<&str>,
-    command: &str,
-) -> Result<bool> {
-    let root = toml_table_mut(root, "Codex config root")?;
-    let hooks = root
-        .entry("hooks".to_string())
-        .or_insert_with(|| TomlValue::Table(TomlMap::new()));
-    let hooks = toml_table_mut(hooks, "Codex hooks")?;
-    let event_hooks = hooks
-        .entry(event.to_string())
-        .or_insert_with(|| TomlValue::Array(Vec::new()));
-    let event_hooks = toml_array_mut(event_hooks, event)?;
-
-    if toml_event_has_command(event_hooks, command) {
-        return Ok(false);
+    if let Some(values) = item.as_array_mut() {
+        let before = values.len();
+        for index in (0..values.len()).rev() {
+            if let Some(table) = values
+                .get_mut(index)
+                .and_then(toml_edit::Value::as_inline_table_mut)
+                && !keep(table)
+            {
+                values.remove(index);
+            }
+        }
+        return values.len() != before;
     }
-
-    let mut group = TomlMap::new();
-    if let Some(matcher) = matcher {
-        group.insert(
-            "matcher".to_string(),
-            TomlValue::String(matcher.to_string()),
-        );
-    }
-    group.insert(
-        "hooks".to_string(),
-        TomlValue::Array(vec![TomlValue::Table(toml_command_hook(command))]),
-    );
-    event_hooks.push(TomlValue::Table(group));
-    Ok(true)
+    false
 }
 
-fn toml_command_hook(command: &str) -> TomlMap<String, TomlValue> {
-    let mut hook = TomlMap::new();
-    hook.insert("type".to_string(), TomlValue::String("command".to_string()));
-    hook.insert(
-        "command".to_string(),
-        TomlValue::String(command.to_string()),
-    );
-    hook
+fn toml_array_is_empty(item: &Item) -> bool {
+    item.as_array_of_tables()
+        .is_some_and(toml_edit::ArrayOfTables::is_empty)
+        || item.as_array().is_some_and(toml_edit::Array::is_empty)
 }
 
-fn toml_event_has_command(event_hooks: &[TomlValue], command: &str) -> bool {
-    event_hooks.iter().any(|group| {
-        group
-            .get("hooks")
-            .and_then(TomlValue::as_array)
-            .is_some_and(|hooks| {
-                hooks.iter().any(|hook| {
-                    hook.get("command")
-                        .and_then(TomlValue::as_str)
-                        .is_some_and(|existing| existing == command)
-                })
-            })
-    })
-}
-
-fn remove_toml_hook_commands(root: &mut TomlValue, is_removed: impl Fn(&str) -> bool) -> bool {
-    let Some(hooks) = root.get_mut("hooks").and_then(TomlValue::as_table_mut) else {
+fn remove_toml_hook_commands(root: &mut DocumentMut) -> bool {
+    let Some(hooks) = root.get_mut("hooks").and_then(Item::as_table_like_mut) else {
         return false;
     };
-
     let mut changed = false;
-    let events: Vec<String> = hooks.keys().cloned().collect();
-    for event in events {
-        let Some(event_hooks) = hooks.get_mut(&event).and_then(TomlValue::as_array_mut) else {
-            continue;
-        };
-
-        for group in event_hooks.iter_mut() {
-            let Some(inner_hooks) = group.get_mut("hooks").and_then(TomlValue::as_array_mut) else {
-                continue;
+    let mut empty_events = Vec::new();
+    for (event, groups) in hooks.iter_mut() {
+        let mut handlers_removed = false;
+        retain_toml_tables(groups, |group| {
+            let Some(handlers) = group.get_mut("hooks") else {
+                return true;
             };
-            let before = inner_hooks.len();
-            inner_hooks.retain(|hook| {
-                hook.get("command")
-                    .and_then(TomlValue::as_str)
-                    .is_none_or(|command| !is_removed(command))
+            let removed = retain_toml_tables(handlers, |handler| {
+                handler
+                    .get("command")
+                    .and_then(Item::as_str)
+                    .is_none_or(|command| !is_own_hook(command))
             });
-            changed |= inner_hooks.len() != before;
-        }
-
-        let before = event_hooks.len();
-        event_hooks.retain(|group| {
-            group
-                .get("hooks")
-                .and_then(TomlValue::as_array)
-                .is_none_or(|hooks| !hooks.is_empty())
+            handlers_removed |= removed;
+            !removed || !toml_array_is_empty(handlers)
         });
-        changed |= event_hooks.len() != before;
+        if handlers_removed {
+            changed = true;
+            if toml_array_is_empty(groups) {
+                empty_events.push(event.to_string());
+            }
+        }
     }
-
-    let empty_events: Vec<String> = hooks
-        .iter()
-        .filter(|(_, value)| value.as_array().is_some_and(std::vec::Vec::is_empty))
-        .map(|(event, _)| event.clone())
-        .collect();
     for event in empty_events {
         hooks.remove(&event);
-        changed = true;
     }
-
     changed
-}
-
-fn toml_table_mut<'a>(
-    value: &'a mut TomlValue,
-    name: &str,
-) -> Result<&'a mut TomlMap<String, TomlValue>> {
-    value
-        .as_table_mut()
-        .with_context(|| format!("{name} must be a TOML table"))
-}
-
-fn toml_array_mut<'a>(value: &'a mut TomlValue, name: &str) -> Result<&'a mut Vec<TomlValue>> {
-    value
-        .as_array_mut()
-        .with_context(|| format!("{name} hooks must be a TOML array"))
 }
 
 #[cfg(test)]
@@ -937,41 +853,39 @@ mod tests {
     #[test]
     fn codex_hook_install_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let path = dir.path().join("hooks.json");
 
         assert!(install_at(crate::tool("codex"), &path).unwrap().changed);
         assert!(!install_at(crate::tool("codex"), &path).unwrap().changed);
 
-        let root = read_toml_config(&path).unwrap();
+        let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2);
-        assert!(toml_event_has_command(
+        assert!(json_event_has_command(
             stop,
             &test_binary().command(ACTIVITY_COMMAND)
         ));
-        assert!(toml_event_has_command(
+        assert!(json_event_has_command(
             root["hooks"]["Interrupt"].as_array().unwrap(),
             &test_binary().command(ACTIVITY_COMMAND)
         ));
         let end = root["hooks"]["SessionEnd"].as_array().unwrap();
-        assert!(toml_event_has_command(
+        assert!(json_event_has_command(
             end,
             &test_binary().command(CODEX_DEREGISTER)
         ));
-        let contents = fs::read_to_string(path).unwrap();
-        assert!(contents.contains("[[hooks.SessionStart]]"));
-        assert!(contents.contains("[[hooks.Stop]]"));
-        assert!(contents.contains("[[hooks.SessionEnd]]"));
+        assert!(!dir.path().join("config.toml").exists());
     }
 
     #[test]
     fn codex_install_replaces_parent_only_register_hook() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let path = dir.path().join("hooks.json");
+        let old_path = dir.path().join("config.toml");
         fs::write(
-            &path,
+            &old_path,
             format!(
                 r#"[[hooks.SessionStart]]
 
@@ -986,24 +900,28 @@ command = "{}"
         )
         .unwrap();
 
+        assert!(json_hooks_installed(&path, Some("config.toml")).unwrap());
         assert!(install_at(crate::tool("codex"), &path).unwrap().changed);
+        assert!(!toml_file_has_own_hook(&old_path).unwrap());
+        assert!(!install_at(crate::tool("codex"), &path).unwrap().changed);
 
-        let root = read_toml_config(&path).unwrap();
+        let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
-        assert!(toml_event_has_command(
+        assert!(json_event_has_command(
             start,
             &test_binary().command(CODEX_REGISTER)
         ));
-        assert!(!toml_event_has_command(start, OLD_CODEX_REGISTER_PARENT));
+        assert!(!json_event_has_command(start, OLD_CODEX_REGISTER_PARENT));
     }
 
     #[test]
     fn codex_install_replaces_old_env_hook() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let path = dir.path().join("hooks.json");
+        let old_path = dir.path().join("config.toml");
         fs::write(
-            &path,
+            &old_path,
             format!(
                 r#"[[hooks.SessionStart]]
 
@@ -1015,16 +933,128 @@ command = '{OLD_CODEX_REGISTER_ENV}'
         )
         .unwrap();
 
+        assert!(json_hooks_installed(&path, Some("config.toml")).unwrap());
         assert!(install_at(crate::tool("codex"), &path).unwrap().changed);
+        assert!(!toml_file_has_own_hook(&old_path).unwrap());
+        assert!(!install_at(crate::tool("codex"), &path).unwrap().changed);
 
-        let root = read_toml_config(&path).unwrap();
+        let root = read_json_config(&path).unwrap();
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 1);
-        assert!(toml_event_has_command(
+        assert!(json_event_has_command(
             start,
             &test_binary().command(CODEX_REGISTER)
         ));
-        assert!(!toml_event_has_command(start, OLD_CODEX_REGISTER_ENV));
+        assert!(!json_event_has_command(start, OLD_CODEX_REGISTER_ENV));
+    }
+
+    #[test]
+    fn codex_migration_preserves_other_hooks_comments_and_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let target = dir.path().join("shared-hooks.json");
+        fs::write(&target, r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"git-signing-guard"}]}]}}"#).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let old_path = dir.path().join("config.toml");
+        let remaining = r"# Keep this model choice.
+model = 'example-model' # and this comment
+
+[hooks.state.'old-source:stop:0:0']
+trusted_hash = 'example-hash'
+
+[[hooks.Stop]]
+matcher = 'keep-this-matcher'
+[[hooks.Stop.hooks]]
+type = 'command'
+command = 'other-hook' # keep this handler
+";
+        let legacy = format!(
+            "{remaining}\n[[hooks.Stop.hooks]]\ntype = 'command'\ncommand = '{OLD_CODEX_REGISTER_ENV}'\n"
+        );
+        fs::write(&old_path, legacy).unwrap();
+
+        assert!(install_at(crate::tool("codex"), &path).unwrap().changed);
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), remaining);
+        let root = read_json_config(&path).unwrap();
+        let commands: Vec<_> = json_hook_commands(&root).collect();
+        assert!(commands.contains(&"git-signing-guard"));
+        assert_eq!(commands.len(), 10);
+        assert!(!install_at(crate::tool("codex"), &path).unwrap().changed);
+    }
+
+    #[test]
+    fn codex_migration_handles_inline_hook_arrays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let old_path = dir.path().join("config.toml");
+        fs::write(&old_path, format!(r"[hooks]
+Stop = [{{ hooks = [{{ type = 'command', command = '{OLD_CODEX_DEREGISTER_ENV}' }}, {{type = 'command', command = 'other-hook'}}] }}]
+SessionEnd = [{{ hooks = [{{ type = 'command', command = '{OLD_CODEX_DEREGISTER_ENV}' }}] }}]
+")).unwrap();
+        assert!(json_hooks_installed(&path, Some("config.toml")).unwrap());
+        install_at(crate::tool("codex"), &path).unwrap();
+        let remaining = read_toml_config(&old_path).unwrap();
+        assert_eq!(
+            toml_hook_commands(&remaining).collect::<Vec<_>>(),
+            ["other-hook"]
+        );
+        assert!(remaining["hooks"].get("SessionEnd").is_none());
+    }
+
+    #[test]
+    fn codex_failed_json_write_keeps_toml_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let old_path = dir.path().join("config.toml");
+        let legacy = format!(
+            "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = 'command'\ncommand = '{OLD_CODEX_DEREGISTER_ENV}'\n"
+        );
+        fs::write(&old_path, &legacy).unwrap();
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(install_at(crate::tool("codex"), &path).is_err());
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), legacy);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
+    }
+
+    #[test]
+    fn codex_invalid_json_keeps_toml_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let old_path = dir.path().join("config.toml");
+        let legacy = format!(
+            "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = 'command'\ncommand = '{OLD_CODEX_DEREGISTER_ENV}'\n"
+        );
+        fs::write(&old_path, &legacy).unwrap();
+        fs::write(&path, "{invalid").unwrap();
+        assert!(install_at(crate::tool("codex"), &path).is_err());
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), legacy);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{invalid");
+    }
+
+    #[test]
+    fn codex_uninstall_removes_both_current_and_legacy_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let old_path = dir.path().join("config.toml");
+        install_at(crate::tool("codex"), &path).unwrap();
+        let legacy = format!(
+            "# Preserve this setting.\nmodel = 'example-model'\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = 'command'\ncommand = '{OLD_CODEX_DEREGISTER_ENV}'\n"
+        );
+        fs::write(&old_path, legacy).unwrap();
+        assert!(remove_at(crate::tool("codex"), &path).unwrap().changed);
+        assert!(!json_hooks_installed(&path, Some("config.toml")).unwrap());
+        assert_eq!(
+            fs::read_to_string(&old_path).unwrap(),
+            "# Preserve this setting.\nmodel = 'example-model'\n"
+        );
+        assert!(!remove_at(crate::tool("codex"), &path).unwrap().changed);
     }
 
     #[test]
@@ -1171,7 +1201,7 @@ command = '{OLD_CODEX_REGISTER_ENV}'
     #[test]
     fn a_moved_binary_replaces_the_previous_path() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let path = dir.path().join("hooks.json");
         let moved = Binary::at(
             Path::new("/opt/session guard/bin/session-guard"),
             Path::new(TEST_HOME),
@@ -1181,10 +1211,10 @@ command = '{OLD_CODEX_REGISTER_ENV}'
             "'/opt/session guard/bin/session-guard' deregister"
         );
         install_with(crate::tool("codex"), &path, &moved).unwrap();
-        assert!(toml_file_has_own_hook(&path).unwrap());
+        assert!(json_file_has_own_hook(&path).unwrap());
         assert!(install_at(crate::tool("codex"), &path).unwrap().changed);
-        let root = read_toml_config(&path).unwrap();
-        assert!(!toml_hook_commands(&root).any(|command| command.contains("/opt/")));
+        let root = read_json_config(&path).unwrap();
+        assert!(!json_hook_commands(&root).any(|command| command.contains("/opt/")));
         assert!(!install_at(crate::tool("codex"), &path).unwrap().changed);
     }
 
@@ -1240,8 +1270,8 @@ command = '{OLD_CODEX_REGISTER_ENV}'
 
         let toml_path = dir.path().join("config.toml");
         fs::write(&toml_path, "model = \"m\"\napproval_policy = \"never\"\n").unwrap();
-        install_at(crate::tool("codex"), &toml_path).unwrap();
         let contents = fs::read_to_string(&toml_path).unwrap();
-        assert!(contents.find("model =").unwrap() < contents.find("approval_policy =").unwrap());
+        install_at(crate::tool("codex"), &dir.path().join("hooks.json")).unwrap();
+        assert_eq!(fs::read_to_string(&toml_path).unwrap(), contents);
     }
 }

@@ -209,13 +209,7 @@ pub enum Integration {
     /// Hook arrays inside a JSON settings file.
     JsonSettings {
         path: ToolPath,
-        events: &'static [HookEvent],
-        register: &'static str,
-        deregister: &'static str,
-    },
-    /// Hook tables inside a TOML config file.
-    TomlConfig {
-        path: ToolPath,
+        retired_toml: Option<&'static str>,
         events: &'static [HookEvent],
         register: &'static str,
         deregister: &'static str,
@@ -342,6 +336,7 @@ pub static HARNESSES: &[Harness] = &[
             accept: None,
         },
         integration: Integration::JsonSettings {
+            retired_toml: None,
             path: ToolPath {
                 env: Some("CLAUDE_CONFIG_DIR"),
                 default: &[".claude"],
@@ -387,11 +382,12 @@ pub static HARNESSES: &[Harness] = &[
             },
             accept: Some(crate::transcripts::codex_rollout_has_terminal_frontend),
         },
-        integration: Integration::TomlConfig {
+        integration: Integration::JsonSettings {
+            retired_toml: Some("config.toml"),
             path: ToolPath {
                 env: Some("CODEX_HOME"),
                 default: &[".codex"],
-                suffix: &["config.toml"],
+                suffix: &["hooks.json"],
             },
             events: STANDARD_HOOKS,
             register: CODEX_REGISTER,
@@ -588,7 +584,6 @@ mod tests {
         for harness in HARNESSES {
             let events = match &harness.integration {
                 Integration::JsonSettings { events, .. }
-                | Integration::TomlConfig { events, .. }
                 | Integration::ScriptDir { events, .. } => events,
                 Integration::PluginFile { .. } | Integration::ProcessScan => continue,
             };
@@ -606,7 +601,6 @@ mod tests {
             assert!(harness.home.resolve().is_ok(), "{} home", harness.id);
             let path = match &harness.integration {
                 Integration::JsonSettings { path, .. }
-                | Integration::TomlConfig { path, .. }
                 | Integration::ScriptDir { path, .. }
                 | Integration::PluginFile { path, .. } => path,
                 Integration::ProcessScan => continue,

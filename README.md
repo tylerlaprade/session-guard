@@ -469,6 +469,11 @@ therefore keeps the fields that build does not know, so an older launcher
 cannot erase what a newer build recorded, such as another session's background
 tasks.
 
+Codex hooks live in `$CODEX_HOME/hooks.json`, or `~/.codex/hooks.json` by
+default. The installer writes the JSON hooks before removing session-guard's
+old entries from `config.toml`. Other hooks, settings, comments, and trust
+records stay in place. Codex may ask you to trust the moved hooks again.
+
 The daemon updates the hooks already installed each time it starts, so
 reinstalling the binary and restarting the daemon brings them up to date;
 `session-guard install-hooks` does the same by hand. Already-running tools may

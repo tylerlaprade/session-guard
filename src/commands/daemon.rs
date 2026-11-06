@@ -1270,7 +1270,6 @@ fn ends_its_record_on_every_exit(session: &SessionRecord) -> bool {
     session.server_pid.is_none()
         && match session.tool.spec().integration {
             Integration::JsonSettings { .. }
-            | Integration::TomlConfig { .. }
             | Integration::ScriptDir { .. }
             | Integration::PluginFile { .. } => true,
             Integration::ProcessScan => false,
