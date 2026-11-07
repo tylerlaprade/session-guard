@@ -1,7 +1,6 @@
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 const ID: &str = "7a248d2c-865f-4829-af1b-2bee5f0c2b48";
@@ -217,6 +216,12 @@ fn an_idle_restore_after_a_stop_with_background_tasks_asks_to_restart_them() {
 }
 
 #[test]
+#[ignore = "only runs as the tool of the registration test below"]
+fn stand_in_tool() {
+    std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+#[test]
 fn registration_without_a_shell_pid_takes_the_owning_shell_from_the_tool_process() {
     let home = tempfile::tempdir().unwrap();
     let register = |tool_pid: u32| {
@@ -246,23 +251,19 @@ fn registration_without_a_shell_pid_takes_the_owning_shell_from_the_tool_process
         .unwrap();
         records[0]["shell_pid"].clone()
     };
-    // macOS hides a platform binary's environment from other processes, so the
-    // stand-in tool is session-guard itself, waiting on a child.
+    // macOS hides a platform binary's environment from other processes, and a
+    // stand-in that starts children leaves them dying after it is reaped, so
+    // the tool is this test binary parked in `stand_in_tool`.
     let tool = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_session-guard"));
+        let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["cargo-target", "--", "/bin/sleep", "30"])
-            .env("HOME", home.path())
-            .process_group(0);
+            .args(["--exact", "stand_in_tool", "--ignored"])
+            .stdout(std::process::Stdio::null());
         command
     };
     let stop = |mut tool: std::process::Child| {
-        let group = i32::try_from(tool.id()).unwrap();
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
-        }
+        tool.kill().unwrap();
         tool.wait().unwrap();
-        assert_ne!(unsafe { libc::kill(-group, 0) }, 0, "tool group survived");
     };
     // A launcher named in the environment owns the tool only while it is the
     // tool's ancestor; Claude's background service hands sessions the name of

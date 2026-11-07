@@ -692,11 +692,11 @@ fn attach_with_a_late_tab(late: u64) -> (usize, usize) {
     fixture.wait_for("the attach flag to clear", || {
         fixture.record()["attach_after_lockout"] == false
     });
-    assert!(
-        fixture.daemon_log().contains("which may still open"),
-        "{}",
-        fixture.daemon_log()
-    );
+    // The tab's attach clears the flag while the daemon is still waiting to
+    // hear that its open failed, so the daemon logs that afterward.
+    fixture.wait_for("the failed open to be logged", || {
+        fixture.daemon_log().contains("which may still open")
+    });
     // Long enough for another attach pass to open a third tab if it would.
     thread::sleep(Duration::from_secs(6));
     let count = |file: &str, line: &str| {
