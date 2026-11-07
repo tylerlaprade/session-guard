@@ -44,8 +44,15 @@ fn bundled_executable(app: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+fn rex_command(rex: &Path) -> Command {
+    let mut command = Command::new(rex);
+    // Inside a Rex terminal, a block in any other session counts as not found.
+    command.env_remove("REX_SESSION");
+    command
+}
+
 fn new_session_command(rex: &Path, directory: &Path) -> Command {
-    let mut new = Command::new(rex);
+    let mut new = rex_command(rex);
     new.arg("new");
     new.args(session_label(directory));
     new.arg("-c").arg(directory).arg("--json");
@@ -81,7 +88,7 @@ fn first_block(reply: &str) -> Result<String> {
 }
 
 fn send(rex: &Path, block: &str, text: &str) -> Result<()> {
-    let mut command = Command::new(rex);
+    let mut command = rex_command(rex);
     command.args(["send", "-b", block, text]);
     run_capture_timeout(&mut command, "typing into a Rex terminal", COMMAND_TIMEOUT).map(drop)
 }
@@ -109,7 +116,7 @@ fn at_prompt(reply: &str) -> Result<bool> {
 }
 
 fn block_at_prompt(rex: &Path, block: &str) -> Option<Result<bool>> {
-    let mut call = Command::new(rex);
+    let mut call = rex_command(rex);
     call.args(["block", "call", "-b", block, "process"]);
     call.stderr(Stdio::null());
     run_capture_timeout(&mut call, "asking Rex about a terminal", COMMAND_TIMEOUT)
@@ -132,7 +139,7 @@ impl TerminalAdapter for Rex {
 
     fn is_running(&self) -> bool {
         executable().is_ok_and(|rex| {
-            Command::new(rex)
+            rex_command(&rex)
                 .args(["--autostart=false", "server", "status"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -142,7 +149,7 @@ impl TerminalAdapter for Rex {
     }
 
     fn launch(&self) -> Result<()> {
-        let mut start = Command::new(executable()?);
+        let mut start = rex_command(&executable()?);
         start.args(["server", "start"]);
         run_checked(start, "starting the Rex server")
     }
@@ -177,6 +184,16 @@ mod tests {
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn a_rex_terminal_can_reach_blocks_outside_its_own_session() {
+        let command = rex_command(Path::new("rex"));
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == "REX_SESSION" && value.is_none())
+        );
     }
 
     #[test]
