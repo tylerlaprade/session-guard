@@ -1,4 +1,4 @@
-use super::{Selection, TerminalAdapter, run_capture_timeout, run_checked};
+use super::{NamedTab, Selection, TerminalAdapter, run_capture_timeout, run_checked};
 use crate::{TerminalKind, process};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -115,6 +115,54 @@ fn at_prompt(reply: &str) -> Result<bool> {
         .is_some_and(|argv0| argv0.starts_with('-')))
 }
 
+#[derive(Deserialize)]
+struct SessionList {
+    sessions: Vec<ListedSession>,
+}
+
+#[derive(Deserialize)]
+struct ListedSession {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+struct BlockList {
+    blocks: Vec<ListedBlock>,
+}
+
+#[derive(Deserialize)]
+struct ListedBlock {
+    block_id: String,
+}
+
+/// Whether the server holds `block`, read from its listings so that only an
+/// answer, never a failure to get one, says a block is gone. A server this
+/// starts brings back its saved sessions before it answers.
+fn has_block(rex: &Path, block: &str) -> Result<bool> {
+    let mut list = rex_command(rex);
+    list.args(["ls", "--json"]);
+    let sessions: SessionList = serde_json::from_str(&run_capture_timeout(
+        &mut list,
+        "listing Rex sessions",
+        COMMAND_TIMEOUT,
+    )?)
+    .context("Rex's session list is not readable")?;
+    for session in sessions.sessions {
+        let mut blocks = rex_command(rex);
+        blocks.args(["block", "ls", "-s", &session.session_id, "--json"]);
+        let listed: BlockList = serde_json::from_str(&run_capture_timeout(
+            &mut blocks,
+            "listing a Rex session's terminals",
+            COMMAND_TIMEOUT,
+        )?)
+        .context("Rex's terminal list is not readable")?;
+        if listed.blocks.iter().any(|listed| listed.block_id == block) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn block_at_prompt(rex: &Path, block: &str) -> Option<Result<bool>> {
     let mut call = rex_command(rex);
     call.args(["block", "call", "-b", block, "process"]);
@@ -156,19 +204,22 @@ impl TerminalAdapter for Rex {
 
     // A shell Rex just brought back may still be starting, and what it runs from
     // its startup files looks like work at the prompt, so a busy one gets a moment.
-    fn run_in_named_tab(&self, tab: &str, command: &str) -> Result<bool> {
+    fn run_in_named_tab(&self, tab: &str, command: &str) -> Result<NamedTab> {
         let rex = executable()?;
+        if !has_block(&rex, tab)? {
+            return Ok(NamedTab::Closed);
+        }
         let deadline = Instant::now() + PROMPT_WAIT;
         loop {
             let Some(at_prompt) = block_at_prompt(&rex, tab) else {
-                return Ok(false);
+                return Ok(NamedTab::Unavailable);
             };
             if at_prompt? {
                 send(&rex, tab, &format!("{ERASE_LINE}{command}\n"))?;
-                return Ok(true);
+                return Ok(NamedTab::Ran);
             }
             if Instant::now() >= deadline {
-                return Ok(false);
+                return Ok(NamedTab::Unavailable);
             }
             thread::sleep(PROMPT_POLL);
         }
@@ -194,6 +245,19 @@ mod tests {
                 .get_envs()
                 .any(|(name, value)| name == "REX_SESSION" && value.is_none())
         );
+    }
+
+    #[test]
+    fn listings_are_read_from_rexs_replies() {
+        let sessions: SessionList =
+            serde_json::from_str(r#"{"sessions":[{"session_id":"session:1","label":"work"}]}"#)
+                .unwrap();
+        assert_eq!(sessions.sessions[0].session_id, "session:1");
+        let blocks: BlockList = serde_json::from_str(
+            r#"{"blocks":[{"block_id":"block:1","label":"shell","window_id":"window:1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(blocks.blocks[0].block_id, "block:1");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::adapters::{Selection, TerminalAdapter, adapter_for, shell_quote};
+use crate::adapters::{NamedTab, Selection, TerminalAdapter, adapter_for, shell_quote};
 use crate::cargo_targets;
 use crate::harness::{Discovery, Integration};
 use crate::last_sessions::{self, LastSessionRecord};
@@ -734,9 +734,17 @@ fn open_restores_in(
         }
         attempted.push(session.session_id.clone());
 
-        match open_restored_tab(adapter.as_ref(), &session)
-            .and_then(|()| wait_for_restore_owner(path, &session.session_id))
-        {
+        let reopened = open_restored_tab(adapter.as_ref(), &session);
+        if matches!(reopened, Ok(Reopened::TabClosed)) {
+            retire_closed_tab(path, &session)?;
+            log_line(&format!(
+                "retired a session whose tab was closed in {kind}: {} {}",
+                session.tool, session.session_id
+            ))?;
+            summary.retired += 1;
+            continue;
+        }
+        match reopened.and_then(|_| wait_for_restore_owner(path, &session.session_id)) {
             Ok(()) => {
                 log_line(&format!(
                     "confirmed restored owner: {} {}",
@@ -783,23 +791,48 @@ fn terminal_executable(
 
 // A terminal that brings its own tabs back after a crash has the session's
 // waiting, and a new tab would sit beside it.
-fn open_restored_tab(adapter: &dyn TerminalAdapter, session: &SessionRecord) -> Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum Reopened {
+    InATab,
+    TabClosed,
+}
+
+fn open_restored_tab(adapter: &dyn TerminalAdapter, session: &SessionRecord) -> Result<Reopened> {
     let command = launch_command(&session.session_id)?;
-    if run_in_session_tab(adapter, session, &command)? {
-        return Ok(());
+    match run_in_session_tab(adapter, session, &command)? {
+        NamedTab::Ran => Ok(Reopened::InATab),
+        NamedTab::Closed => Ok(Reopened::TabClosed),
+        NamedTab::Unavailable => adapter
+            .open_tab(&session.directory, &command, Selection::Take)
+            .map(|()| Reopened::InATab),
     }
-    adapter.open_tab(&session.directory, &command, Selection::Take)
+}
+
+// The record still waits in the registry while its restore runs.
+fn retire_closed_tab(path: &std::path::Path, session: &SessionRecord) -> Result<()> {
+    let last_sessions_path = paths::last_sessions_file()?;
+    sessions::with_sessions_mut(path, |sessions| {
+        if let Some(index) = sessions
+            .iter()
+            .position(|record| record.session_id == session.session_id)
+        {
+            remember(&last_sessions_path, &sessions.remove(index))?;
+        }
+        Ok(())
+    })
 }
 
 fn run_in_session_tab(
     adapter: &dyn TerminalAdapter,
     session: &SessionRecord,
     command: &str,
-) -> Result<bool> {
+) -> Result<NamedTab> {
     session
         .terminal_tab
         .as_ref()
-        .map_or(Ok(false), |tab| adapter.run_in_named_tab(&tab.id, command))
+        .map_or(Ok(NamedTab::Unavailable), |tab| {
+            adapter.run_in_named_tab(&tab.id, command)
+        })
 }
 
 // A terminal launched together with its first tab gives Screen Time no moment
@@ -1330,7 +1363,7 @@ fn reopen_in_living_tabs(processes: &ProcessSnapshot) -> Result<Vec<SessionRecor
             .map(|tty| {
                 let command = launch_command(&session.session_id)?;
                 Ok::<_, anyhow::Error>(
-                    run_in_session_tab(adapter.as_ref(), &session, &command)?
+                    run_in_session_tab(adapter.as_ref(), &session, &command)? == NamedTab::Ran
                         || adapter.run_in_tab(tty, &command)?,
                 )
             })
@@ -1803,10 +1836,18 @@ mod tests {
         assert_eq!(launch_directory(&session), None);
     }
 
-    #[derive(Default)]
     struct TabsStandIn {
-        has_named_tab: bool,
+        named_tab: NamedTab,
         asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Default for TabsStandIn {
+        fn default() -> Self {
+            Self {
+                named_tab: NamedTab::Unavailable,
+                asked: std::cell::RefCell::default(),
+            }
+        }
     }
 
     impl TerminalAdapter for TabsStandIn {
@@ -1820,9 +1861,9 @@ mod tests {
         fn launch(&self) -> Result<()> {
             Ok(())
         }
-        fn run_in_named_tab(&self, tab: &str, _: &str) -> Result<bool> {
+        fn run_in_named_tab(&self, tab: &str, _: &str) -> Result<NamedTab> {
             self.asked.borrow_mut().push(tab.to_string());
-            Ok(self.has_named_tab)
+            Ok(self.named_tab)
         }
     }
 
@@ -1900,15 +1941,33 @@ mod tests {
         let mut session = sample(crate::tool("claude"), "abc");
         session.terminal_tab = Some(rex_tab());
         let terminal = TabsStandIn {
-            has_named_tab: true,
+            named_tab: NamedTab::Ran,
             ..TabsStandIn::default()
         };
-        open_restored_tab(&terminal, &session).unwrap();
+        assert_eq!(
+            open_restored_tab(&terminal, &session).unwrap(),
+            Reopened::InATab
+        );
         assert_eq!(*terminal.asked.borrow(), ["block:1"]);
     }
 
     #[test]
-    fn a_restore_opens_a_new_tab_when_its_own_is_gone_or_never_named() {
+    fn a_restore_whose_tab_was_closed_opens_nothing() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.terminal_tab = Some(rex_tab());
+        let terminal = TabsStandIn {
+            named_tab: NamedTab::Closed,
+            ..TabsStandIn::default()
+        };
+        assert_eq!(
+            open_restored_tab(&terminal, &session).unwrap(),
+            Reopened::TabClosed
+        );
+        assert_eq!(*terminal.asked.borrow(), ["block:1"]);
+    }
+
+    #[test]
+    fn a_restore_opens_a_new_tab_when_its_own_is_busy_or_never_named() {
         let mut session = sample(crate::tool("claude"), "abc");
         session.terminal_tab = Some(rex_tab());
         let terminal = TabsStandIn::default();

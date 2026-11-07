@@ -44,11 +44,21 @@ pub trait TerminalAdapter {
         Ok(false)
     }
     /// Runs `command` at the prompt of the tab a `TerminalTab` names, replacing
-    /// anything typed there. False when the terminal has no such tab, the tab
-    /// is busy, or the terminal does not name its tabs.
-    fn run_in_named_tab(&self, _tab: &str, _command: &str) -> Result<bool> {
-        Ok(false)
+    /// anything typed there.
+    fn run_in_named_tab(&self, _tab: &str, _command: &str) -> Result<NamedTab> {
+        Ok(NamedTab::Unavailable)
     }
+}
+
+/// What came of running a command in a tab its terminal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedTab {
+    Ran,
+    /// The tab is busy, or the terminal does not name its tabs.
+    Unavailable,
+    /// The running terminal has no such tab. A terminal that names its tabs
+    /// brings each one back after a crash, so this tab was closed.
+    Closed,
 }
 
 /// The tab holding `pid`, named by the terminal it runs in, for a terminal that

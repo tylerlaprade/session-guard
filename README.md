@@ -510,9 +510,20 @@ When the server starts again it brings back its saved sessions, with the same
 block ids and a fresh shell in each. Registration therefore records `REX_BLOCK`
 from the tool's environment. A restore types into that block once its login
 shell is in the foreground, so the session returns to its own pane and no empty
-copy is left beside it. A block that is gone, or still busy after five seconds,
-gets a new session instead. So does a tool whose environment the kernel hides,
-as it does for programs Apple ships.
+copy is left beside it. A block still busy after five seconds gets a new
+session instead. So does a tool whose environment the kernel hides, as it does
+for programs Apple ships.
+
+A block the running server no longer has was closed, because the server brings
+every block back after a crash, so its session retires instead of reopening.
+This settles the one end the server's exit leaves in doubt. The server exits
+about ten seconds after its last session and its last client connection close,
+just when the daemon settles that session's end, so closing the last session
+with no app connected looks like the server going down with it. The daemon
+waits for Rex to start again, and Rex's own list then shows whether the block
+came back. A server stopped with `--discard` drops its saved blocks too, so its
+sessions retire the same way. Only the listing an answering server gives counts
+as a block being gone, never a `rex` command that failed.
 
 A session in Rex belongs to Rex whichever terminal is configured, because its
 record names the block, so Rex can run beside another terminal. Its end is
@@ -526,13 +537,6 @@ Any `rex` command starts a missing server, including the daemon's first one
 after a reboot. After a server crash that did not reboot the Mac, the daemon
 waits for the terminal to return like any other: restores run once the app or
 any `rex` command has started the server again.
-
-Closing the last session while no client is connected reads as a crash. The
-server exits about ten seconds after its last session and connection close,
-which is just when the daemon settles the session's end, so it finds the terminal
-gone and reopens the session the next time Rex starts. A missing block cannot
-settle this, because a server stopped with `--discard` loses its saved sessions
-too, and a session reopened by mistake is cheaper than one lost.
 
 ### Tab order
 
