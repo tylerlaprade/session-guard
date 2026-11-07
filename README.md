@@ -514,6 +514,14 @@ copy is left beside it. A block that is gone, or still busy after five seconds,
 gets a new session instead. So does a tool whose environment the kernel hides,
 as it does for programs Apple ships.
 
+A session in Rex belongs to Rex whichever terminal is configured, because its
+record names the block, so Rex can run beside another terminal. Its end is
+judged by Rex's server, a killed tool is typed back into its block, Rex's return
+restores it, and so does a reboot, while sessions that name no tab keep the
+configured terminal. The daemon also records the block of a session registered
+before blocks were recorded, from its tool's environment, at its once-a-minute
+check.
+
 Any `rex` command starts a missing server, including the daemon's first one
 after a reboot. After a server crash that did not reboot the Mac, the daemon
 waits for the terminal to return like any other: restores run once the app or

@@ -123,7 +123,8 @@ pub fn tool(id: &str) -> Tool {
     Tool::from_id(id).expect("known harness")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TerminalKind {
     Ghostty,
     Iterm2,
@@ -175,6 +176,21 @@ impl TerminalKind {
             Self::Wezterm => "wezterm-gui",
             Self::Alacritty => "alacritty",
             Self::Rex => "/rex server.",
+        }
+    }
+
+    /// The variable a terminal sets in the environment of everything started
+    /// in a tab to name that tab, for a terminal that names its tabs.
+    #[must_use]
+    pub fn tab_variable(self) -> Option<&'static str> {
+        match self {
+            Self::Rex => Some(adapters::rex::BLOCK_VARIABLE),
+            Self::Ghostty
+            | Self::Iterm2
+            | Self::Terminal
+            | Self::Kitty
+            | Self::Wezterm
+            | Self::Alacritty => None,
         }
     }
 

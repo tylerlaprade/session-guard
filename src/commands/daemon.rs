@@ -195,7 +195,7 @@ pub fn run() -> Result<()> {
 
     let mut seconds_until_monitor = 60;
     let mut seconds_until_settle = SESSION_END_SETTLE_INTERVAL_SECS;
-    let mut terminal_watch = TerminalWatch::default();
+    let mut terminal_watches = HashMap::new();
     let mut monitor_cycles_until_cleanup = CARGO_TARGET_CLEANUP_MONITOR_CYCLES;
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
@@ -280,7 +280,7 @@ pub fn run() -> Result<()> {
                     ))?;
                 }
             }
-            if terminal_returned_with_victims(&mut terminal_watch, &processes, tab_offered)? {
+            if terminal_returned_with_victims(&mut terminal_watches, &processes, tab_offered)? {
                 let summary = restore_once(RestoreMode::Manual)?;
                 log_line(&format!("terminal returned: {}", summary.message()))?;
                 for error in &summary.errors {
@@ -541,7 +541,7 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 && ending_verdict(
                     &session,
                     &processes,
-                    terminal.map(TerminalKind::process_name),
+                    terminal_executable(&session, terminal),
                 ) == EndingVerdict::Retire
             {
                 remember(&last_sessions_path, &session)?;
@@ -630,11 +630,40 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
 // terminal when the lockout lifts, so each tab waits on that answer.
 fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> Result<()> {
     let path = paths::sessions_file()?;
-    let mut adapter = None;
     let mut attempted = Vec::new();
+    for (kind, sessions) in by_terminal(to_open, session_terminal)? {
+        open_restores_in(kind, sessions, summary, &mut attempted, &path)?;
+    }
+    record_holds(&path, &attempted, &summary.held)
+}
+
+/// The sessions in their order, grouped by the terminal each ran in, so a
+/// terminal that cannot take a tab yet holds only its own sessions.
+fn by_terminal(
+    sessions: Vec<SessionRecord>,
+    terminal: impl Fn(&SessionRecord) -> Result<TerminalKind>,
+) -> Result<Vec<(TerminalKind, Vec<SessionRecord>)>> {
+    let mut groups: Vec<(TerminalKind, Vec<SessionRecord>)> = Vec::new();
+    for session in sessions {
+        let kind = terminal(&session)?;
+        match groups.iter_mut().find(|(terminal, _)| *terminal == kind) {
+            Some((_, group)) => group.push(session),
+            None => groups.push((kind, vec![session])),
+        }
+    }
+    Ok(groups)
+}
+
+fn open_restores_in(
+    kind: TerminalKind,
+    to_open: Vec<SessionRecord>,
+    summary: &mut RestoreSummary,
+    attempted: &mut Vec<String>,
+    path: &std::path::Path,
+) -> Result<()> {
+    let mut adapter = None;
     let mut to_open = to_open.into_iter();
     while let Some(session) = to_open.next() {
-        let kind = configured_terminal()?;
         let adapter = adapter.get_or_insert_with(|| adapter_for(kind));
         let lockout = match lockout::lockout(kind) {
             Lockout::NotRunning => match launch_terminal(kind) {
@@ -682,7 +711,7 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
                     summary.held.push(session);
                     continue;
                 };
-                match start_in_background(&path, &session, background) {
+                match start_in_background(path, &session, background) {
                     Ok(()) => {
                         log_line(&format!(
                             "resumed in the background until the terminal can take a tab: {} {}",
@@ -706,7 +735,7 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
         attempted.push(session.session_id.clone());
 
         match open_restored_tab(adapter.as_ref(), &session)
-            .and_then(|()| wait_for_restore_owner(&path, &session.session_id))
+            .and_then(|()| wait_for_restore_owner(path, &session.session_id))
         {
             Ok(()) => {
                 log_line(&format!(
@@ -725,8 +754,31 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
             }
         }
     }
+    Ok(())
+}
 
-    record_holds(&path, &attempted, &summary.held)
+/// The terminal a session ran in: the one that named its tab, or else the
+/// configured one.
+pub(crate) fn session_terminal(session: &SessionRecord) -> Result<TerminalKind> {
+    session
+        .terminal_tab
+        .as_ref()
+        .map_or_else(configured_terminal, |tab| Ok(tab.terminal))
+}
+
+fn terminal_of(session: &SessionRecord, configured: Option<TerminalKind>) -> Option<TerminalKind> {
+    session
+        .terminal_tab
+        .as_ref()
+        .map(|tab| tab.terminal)
+        .or(configured)
+}
+
+fn terminal_executable(
+    session: &SessionRecord,
+    configured: Option<TerminalKind>,
+) -> Option<&'static str> {
+    terminal_of(session, configured).map(TerminalKind::process_name)
 }
 
 // A terminal that brings its own tabs back after a crash has the session's
@@ -746,8 +798,8 @@ fn run_in_session_tab(
 ) -> Result<bool> {
     session
         .terminal_tab
-        .as_deref()
-        .map_or(Ok(false), |tab| adapter.run_in_named_tab(tab, command))
+        .as_ref()
+        .map_or(Ok(false), |tab| adapter.run_in_named_tab(&tab.id, command))
 }
 
 // A terminal launched together with its first tab gives Screen Time no moment
@@ -1114,33 +1166,52 @@ impl TerminalWatch {
 // Restore on relaunch only when tabs died with the previous instance; a stale
 // pile alone must not reopen just because the terminal was reopened.
 // A tab offered by the new instance's shell proves it can already be scripted.
+// Each terminal a session ran in is watched for its own return, and its own
+// sessions are its victims.
 fn terminal_returned_with_victims(
-    watch: &mut TerminalWatch,
+    watches: &mut HashMap<TerminalKind, TerminalWatch>,
     processes: &ProcessSnapshot,
     tab_offered: bool,
 ) -> Result<bool> {
-    let Ok(terminal) = configured_terminal() else {
-        return Ok(false);
-    };
-    let now = chrono::Utc::now();
-    if let Some(started_at) = watch.relaunched(
-        &processes.instance_starts(terminal.process_name()),
-        now.naive_utc(),
-        tab_offered,
-    ) {
-        log_line(&format!(
-            "terminal relaunch detected: {terminal}, started at {started_at} UTC"
-        ))?;
-        watch.returned = Some(ReturnedTerminal {
-            started_at,
-            attempted: HashSet::new(),
-        });
-    }
-    if watch.returned.is_none() {
-        return Ok(false);
-    }
+    let configured = configured_terminal().ok();
     let sessions = sessions::read_sessions(&paths::sessions_file()?)?;
-    Ok(watch.unattempted_victims(&sessions, processes))
+    let mut terminals: Vec<TerminalKind> = configured.into_iter().collect();
+    for terminal in sessions
+        .iter()
+        .filter_map(|session| session.terminal_tab.as_ref().map(|tab| tab.terminal))
+    {
+        if !terminals.contains(&terminal) {
+            terminals.push(terminal);
+        }
+    }
+    let now = chrono::Utc::now();
+    let mut found = false;
+    for terminal in terminals {
+        let watch = watches.entry(terminal).or_default();
+        if let Some(started_at) = watch.relaunched(
+            &processes.instance_starts(terminal.process_name()),
+            now.naive_utc(),
+            tab_offered && configured == Some(terminal),
+        ) {
+            log_line(&format!(
+                "terminal relaunch detected: {terminal}, started at {started_at} UTC"
+            ))?;
+            watch.returned = Some(ReturnedTerminal {
+                started_at,
+                attempted: HashSet::new(),
+            });
+        }
+        if watch.returned.is_none() {
+            continue;
+        }
+        let its_sessions: Vec<SessionRecord> = sessions
+            .iter()
+            .filter(|session| terminal_of(session, configured) == Some(terminal))
+            .cloned()
+            .collect();
+        found |= watch.unattempted_victims(&its_sessions, processes);
+    }
+    Ok(found)
 }
 
 pub(crate) fn needs_terminal_restore(session: &SessionRecord, processes: &ProcessSnapshot) -> bool {
@@ -1170,11 +1241,7 @@ pub fn settle_endings(processes: &ProcessSnapshot) -> Result<SettleSummary> {
                 kept.push(session);
                 continue;
             }
-            match ending_verdict(
-                &session,
-                processes,
-                terminal.map(TerminalKind::process_name),
-            ) {
+            match ending_verdict(&session, processes, terminal_executable(&session, terminal)) {
                 EndingVerdict::Retire => {
                     remember(&last_sessions_path, &session)?;
                     summary.retired += 1;
@@ -1198,9 +1265,15 @@ pub fn settle_endings(processes: &ProcessSnapshot) -> Result<SettleSummary> {
 fn release_closed_tabs(processes: &ProcessSnapshot) -> Result<usize> {
     let path = paths::sessions_file()?;
     let now = chrono::Utc::now();
-    let terminal = configured_terminal().ok().map(TerminalKind::process_name);
-    let releasable =
-        |session: &SessionRecord| closed_under_running_terminal(session, processes, terminal, now);
+    let terminal = configured_terminal().ok();
+    let releasable = |session: &SessionRecord| {
+        closed_under_running_terminal(
+            session,
+            processes,
+            terminal_executable(session, terminal),
+            now,
+        )
+    };
     if !sessions::read_sessions(&path)?.iter().any(releasable) {
         return Ok(0);
     }
@@ -1231,16 +1304,25 @@ fn reopen_in_living_tabs(processes: &ProcessSnapshot) -> Result<Vec<SessionRecor
         .into_iter()
         .filter(crashed_in_living_tab)
         .collect();
-    let Some(kind) = crashed.first().and_then(|_| configured_terminal().ok()) else {
-        return Ok(Vec::new());
-    };
-    if lockout::lockout(kind) != Lockout::Clear {
+    if crashed.is_empty() {
         return Ok(Vec::new());
     }
-    let adapter = adapter_for(kind);
+    let configured = configured_terminal().ok();
+    let mut adapters: HashMap<TerminalKind, Box<dyn TerminalAdapter>> = HashMap::new();
+    let mut takes_tabs: HashMap<TerminalKind, bool> = HashMap::new();
     let mut reopened = Vec::new();
     let mut released = Vec::new();
     for session in crashed {
+        let Some(kind) = terminal_of(&session, configured) else {
+            continue;
+        };
+        if !*takes_tabs
+            .entry(kind)
+            .or_insert_with(|| lockout::lockout(kind) == Lockout::Clear)
+        {
+            continue;
+        }
+        let adapter = adapters.entry(kind).or_insert_with(|| adapter_for(kind));
         let in_tab = session
             .shell_pid
             .filter(|shell| processes.in_foreground(*shell))
@@ -1409,6 +1491,9 @@ pub fn monitor_once() -> Result<MonitorSummary> {
             }
             if session_is_alive(session, &processes) {
                 session.mark_active();
+                if session.terminal_tab.is_none() {
+                    session.terminal_tab = session.pid.and_then(crate::adapters::terminal_tab);
+                }
                 continue;
             }
 
@@ -1741,10 +1826,79 @@ mod tests {
         }
     }
 
+    fn rex_tab() -> crate::adapters::TerminalTab {
+        crate::adapters::TerminalTab {
+            terminal: TerminalKind::Rex,
+            id: "block:1".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_session_belongs_to_the_terminal_that_named_its_tab() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        assert_eq!(
+            terminal_of(&session, Some(TerminalKind::Ghostty)),
+            Some(TerminalKind::Ghostty)
+        );
+        assert_eq!(terminal_of(&session, None), None);
+        session.terminal_tab = Some(rex_tab());
+        assert_eq!(
+            terminal_of(&session, Some(TerminalKind::Ghostty)),
+            Some(TerminalKind::Rex)
+        );
+        assert_eq!(
+            terminal_executable(&session, Some(TerminalKind::Ghostty)),
+            Some(TerminalKind::Rex.process_name())
+        );
+    }
+
+    #[test]
+    fn restores_group_by_terminal_and_keep_their_order() {
+        let session = |id: &str, tab: bool| {
+            let mut session = sample(crate::tool("claude"), id);
+            session.terminal_tab = tab.then(rex_tab);
+            session
+        };
+        let groups = by_terminal(
+            vec![
+                session("a", false),
+                session("b", true),
+                session("c", false),
+                session("d", true),
+            ],
+            |session| Ok(terminal_of(session, Some(TerminalKind::Ghostty)).unwrap()),
+        )
+        .unwrap();
+        let ids: Vec<(TerminalKind, Vec<&str>)> = groups
+            .iter()
+            .map(|(kind, group)| (*kind, group.iter().map(|s| s.session_id.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                (TerminalKind::Ghostty, vec!["a", "c"]),
+                (TerminalKind::Rex, vec!["b", "d"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_recorded_tab_names_its_terminal() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.terminal_tab = Some(rex_tab());
+        let stored = serde_json::to_value(&session).unwrap();
+        assert_eq!(
+            stored["terminal_tab"],
+            serde_json::json!({"terminal": "rex", "id": "block:1"})
+        );
+        let read: SessionRecord = serde_json::from_value(stored).unwrap();
+        assert_eq!(read.terminal_tab, Some(rex_tab()));
+    }
+
     #[test]
     fn a_restore_goes_into_the_tab_the_terminal_brought_back() {
         let mut session = sample(crate::tool("claude"), "abc");
-        session.terminal_tab = Some("block:1".to_string());
+        session.terminal_tab = Some(rex_tab());
         let terminal = TabsStandIn {
             has_named_tab: true,
             ..TabsStandIn::default()
@@ -1756,7 +1910,7 @@ mod tests {
     #[test]
     fn a_restore_opens_a_new_tab_when_its_own_is_gone_or_never_named() {
         let mut session = sample(crate::tool("claude"), "abc");
-        session.terminal_tab = Some("block:1".to_string());
+        session.terminal_tab = Some(rex_tab());
         let terminal = TabsStandIn::default();
         open_restored_tab(&terminal, &session).unwrap();
         assert_eq!(*terminal.asked.borrow(), ["block:1", "new tab"]);

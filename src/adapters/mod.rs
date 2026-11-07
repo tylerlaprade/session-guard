@@ -8,6 +8,8 @@ mod wezterm;
 
 use crate::TerminalKind;
 use anyhow::{Context, Result};
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Whether a tab the daemon opens takes the selection in its window. A
@@ -41,7 +43,7 @@ pub trait TerminalAdapter {
     fn run_in_tab(&self, _tty: &str, _command: &str) -> Result<bool> {
         Ok(false)
     }
-    /// Runs `command` at the prompt of the tab `terminal_tab` named, replacing
+    /// Runs `command` at the prompt of the tab a `TerminalTab` names, replacing
     /// anything typed there. False when the terminal has no such tab, the tab
     /// is busy, or the terminal does not name its tabs.
     fn run_in_named_tab(&self, _tab: &str, _command: &str) -> Result<bool> {
@@ -49,10 +51,22 @@ pub trait TerminalAdapter {
     }
 }
 
-/// The name a terminal gives the tab holding `pid`, for a terminal that names
-/// its tabs in their environment.
-pub fn terminal_tab(pid: i32) -> Option<String> {
-    crate::process::process_environment_variable(pid, rex::BLOCK_VARIABLE)
+/// The tab holding `pid`, named by the terminal it runs in, for a terminal that
+/// names its tabs in their environment.
+pub fn terminal_tab(pid: i32) -> Option<TerminalTab> {
+    TerminalKind::value_variants().iter().find_map(|&terminal| {
+        let variable = terminal.tab_variable()?;
+        let id = crate::process::process_environment_variable(pid, variable)?;
+        Some(TerminalTab { terminal, id })
+    })
+}
+
+/// A tab as the terminal holding it names it. A session in such a tab belongs
+/// to that terminal, whichever one is configured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalTab {
+    pub terminal: TerminalKind,
+    pub id: String,
 }
 
 pub fn adapter_for(kind: TerminalKind) -> Box<dyn TerminalAdapter> {

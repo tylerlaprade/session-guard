@@ -110,10 +110,12 @@ pub struct SessionRecord {
     // reopen in the order they had.
     #[serde(default)]
     pub tab_position: Option<(u32, u32)>,
-    // The terminal's own name for the tab, when it names them, so a restore
-    // can find the tab if the terminal brought it back.
+    // The tab as the terminal holding it names it, when that terminal names
+    // its tabs. The session belongs to that terminal rather than the
+    // configured one, and a restore can find the tab if the terminal brought it
+    // back.
     #[serde(default)]
-    pub terminal_tab: Option<String>,
+    pub terminal_tab: Option<crate::adapters::TerminalTab>,
     #[serde(flatten)]
     pub unknown_fields: UnknownFields,
 }
