@@ -535,8 +535,17 @@ check.
 
 Any `rex` command starts a missing server, including the daemon's first one
 after a reboot. After a server crash that did not reboot the Mac, the daemon
-waits for the terminal to return like any other: restores run once the app or
-any `rex` command has started the server again.
+starts the server again itself when sessions wait to return to it, and its
+return restores them. The server's own exit, which the daemon reads from the
+kernel, says which ends count: the Go runtime exits 2 when the server crashes,
+while `rex server stop`, a plain `kill` and a server left empty all exit 0. A
+`kill -9` is never restarted, because the system reclaiming memory ends a
+process the same way, and bringing back the sessions that filled it would
+repeat it. The daemon waits until memory pressure is no longer critical, and
+starts the server at most once in a row: a server it started that crashes too
+is left for you to start. A terminal with windows is never restarted, since a
+relaunch puts its windows on screen and takes the focus; the daemon waits for
+it to return.
 
 ### Tab order
 

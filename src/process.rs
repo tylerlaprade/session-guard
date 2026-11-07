@@ -481,6 +481,15 @@ impl ProcessSnapshot {
 }
 
 impl ProcessSnapshot {
+    /// The terminal instance of `executable`: its oldest running process.
+    pub fn instance_pid(&self, executable: &str) -> Option<i32> {
+        self.processes
+            .iter()
+            .filter(|(_, (_, comm))| runs_executable(comm, executable))
+            .min_by_key(|(_, (start, _))| parse_identity(start))
+            .map(|(pid, _)| *pid)
+    }
+
     /// Start times of the running processes of `executable`. The oldest is the
     /// terminal instance itself, with its per-surface helpers being younger.
     pub fn instance_starts(

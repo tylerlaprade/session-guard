@@ -1,4 +1,4 @@
-use super::{NamedTab, Selection, TerminalAdapter, run_capture_timeout, run_checked};
+use super::{NamedTab, Selection, TerminalAdapter, run_capture_timeout};
 use crate::{TerminalKind, process};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -196,10 +196,12 @@ impl TerminalAdapter for Rex {
         })
     }
 
+    // Any `rex` command starts a missing server the way the app's does, which
+    // brings back its saved sessions and still exits once they are all closed.
     fn launch(&self) -> Result<()> {
-        let mut start = rex_command(&executable()?);
-        start.args(["server", "start"]);
-        run_checked(start, "starting the Rex server")
+        let mut list = rex_command(&executable()?);
+        list.args(["ls", "--json"]);
+        run_capture_timeout(&mut list, "starting the Rex server", COMMAND_TIMEOUT).map(drop)
     }
 
     // A shell Rex just brought back may still be starting, and what it runs from

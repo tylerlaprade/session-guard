@@ -196,6 +196,12 @@ pub fn run() -> Result<()> {
     let mut seconds_until_monitor = 60;
     let mut seconds_until_settle = SESSION_END_SETTLE_INTERVAL_SECS;
     let mut terminal_watches = HashMap::new();
+    let terminal_exits = process::ExitWatch::new()
+        .map_err(|error| {
+            let _ = log_line(&format!("terminal exit watch failed to start: {error:#}"));
+        })
+        .ok();
+    let mut crash_restarts = crate::crash_restart::CrashRestarts::default();
     let mut monitor_cycles_until_cleanup = CARGO_TARGET_CLEANUP_MONITOR_CYCLES;
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
@@ -279,6 +285,9 @@ pub fn run() -> Result<()> {
                         summary.marked_recoverable
                     ))?;
                 }
+            }
+            if settle_tick && let Some(exits) = &terminal_exits {
+                restart_crashed_terminals(&mut crash_restarts, exits, &processes)?;
             }
             if terminal_returned_with_victims(&mut terminal_watches, &processes, tab_offered)? {
                 let summary = restore_once(RestoreMode::Manual)?;
@@ -1199,15 +1208,10 @@ impl TerminalWatch {
 // Restore on relaunch only when tabs died with the previous instance; a stale
 // pile alone must not reopen just because the terminal was reopened.
 // A tab offered by the new instance's shell proves it can already be scripted.
-// Each terminal a session ran in is watched for its own return, and its own
-// sessions are its victims.
-fn terminal_returned_with_victims(
-    watches: &mut HashMap<TerminalKind, TerminalWatch>,
-    processes: &ProcessSnapshot,
-    tab_offered: bool,
-) -> Result<bool> {
-    let configured = configured_terminal().ok();
-    let sessions = sessions::read_sessions(&paths::sessions_file()?)?;
+fn terminals_in_use(
+    configured: Option<TerminalKind>,
+    sessions: &[SessionRecord],
+) -> Vec<TerminalKind> {
     let mut terminals: Vec<TerminalKind> = configured.into_iter().collect();
     for terminal in sessions
         .iter()
@@ -1217,6 +1221,76 @@ fn terminal_returned_with_victims(
             terminals.push(terminal);
         }
     }
+    terminals
+}
+
+/// Starts a crashed terminal again once, when sessions wait to return to it and
+/// memory pressure is not critical; its return then restores them as any
+/// relaunch would.
+fn restart_crashed_terminals(
+    restarts: &mut crate::crash_restart::CrashRestarts,
+    exits: &process::ExitWatch,
+    processes: &ProcessSnapshot,
+) -> Result<()> {
+    use crate::crash_restart::Exit;
+    use std::os::unix::process::ExitStatusExt;
+    let configured = configured_terminal().ok();
+    let sessions = sessions::read_sessions(&paths::sessions_file()?)?;
+    for terminal in terminals_in_use(configured, &sessions) {
+        if let Some(pid) = processes.instance_pid(terminal.process_name())
+            && restarts.running(terminal, pid)
+            && !exits.watch(pid)
+        {
+            restarts.unwatch(pid);
+        }
+    }
+    for (pid, status) in exits.exits(Duration::ZERO) {
+        let status = std::process::ExitStatus::from_raw(status);
+        match restarts.exited(pid, status) {
+            Some((terminal, Exit::Crashed)) => log_line(&format!(
+                "{terminal} crashed ({status}); starting it again for its sessions"
+            ))?,
+            Some((terminal, Exit::CrashedAfterRestart)) => log_line(&format!(
+                "{terminal} crashed again ({status}) after session-guard started it; leaving it for you to start"
+            ))?,
+            Some((terminal, Exit::Ended)) => {
+                log_line(&format!("{terminal} exited ({status})"))?;
+            }
+            None => {}
+        }
+    }
+    for terminal in restarts.crashed() {
+        let waiting = sessions.iter().any(|session| {
+            terminal_of(session, configured) == Some(terminal)
+                && needs_terminal_restore(session, processes)
+        });
+        if !waiting {
+            restarts.nothing_to_restore(terminal);
+            log_line(&format!("{terminal} has no session waiting to return"))?;
+            continue;
+        }
+        if process::memory_pressure_is_critical() {
+            continue;
+        }
+        restarts.restarting(terminal);
+        match adapter_for(terminal).launch() {
+            Ok(()) => log_line(&format!("started {terminal} again after its crash"))?,
+            Err(error) => log_line(&format!("could not start {terminal} again: {error:#}"))?,
+        }
+    }
+    Ok(())
+}
+
+// Each terminal a session ran in is watched for its own return, and its own
+// sessions are its victims.
+fn terminal_returned_with_victims(
+    watches: &mut HashMap<TerminalKind, TerminalWatch>,
+    processes: &ProcessSnapshot,
+    tab_offered: bool,
+) -> Result<bool> {
+    let configured = configured_terminal().ok();
+    let sessions = sessions::read_sessions(&paths::sessions_file()?)?;
+    let terminals = terminals_in_use(configured, &sessions);
     let now = chrono::Utc::now();
     let mut found = false;
     for terminal in terminals {

@@ -3,6 +3,7 @@ mod cargo_targets;
 mod codex_server;
 mod commands;
 mod continuation;
+mod crash_restart;
 mod exit_watch;
 mod fresh_tab;
 mod harness;
@@ -191,6 +192,26 @@ impl TerminalKind {
             | Self::Kitty
             | Self::Wezterm
             | Self::Alacritty => None,
+        }
+    }
+
+    /// Whether the daemon starts the terminal again itself after `exit` ended
+    /// it. A terminal with windows never: relaunched, it puts them on screen
+    /// and takes the focus.
+    #[must_use]
+    pub fn restarts_after(self, exit: std::process::ExitStatus) -> bool {
+        match self {
+            // Rex's server exits 0 when stopped or left empty, and the Go
+            // runtime exits 2 when it crashes. SIGKILL is as often the system
+            // reclaiming memory as anyone's kill -9, and a restart would bring
+            // back what filled it.
+            Self::Rex => exit.code() == Some(2),
+            Self::Ghostty
+            | Self::Iterm2
+            | Self::Terminal
+            | Self::Kitty
+            | Self::Wezterm
+            | Self::Alacritty => false,
         }
     }
 
