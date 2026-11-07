@@ -1,4 +1,4 @@
-use crate::adapters::{Selection, adapter_for, shell_quote};
+use crate::adapters::{Selection, TerminalAdapter, adapter_for, shell_quote};
 use crate::cargo_targets;
 use crate::harness::{Discovery, Integration};
 use crate::last_sessions::{self, LastSessionRecord};
@@ -396,7 +396,9 @@ fn held_lockout(summary: &RestoreSummary) -> Option<Lockout> {
 }
 
 fn start_lockout_watcher() -> Option<lockout::Watcher> {
-    let terminal = configured_terminal().ok()?;
+    let terminal = configured_terminal()
+        .ok()
+        .filter(|terminal| terminal.adds_tabs_to_windows())?;
     lockout::Watcher::start(terminal)
         .map_err(|error| {
             let _ = log_line(&format!("lockout watcher failed to start: {error:#}"));
@@ -703,12 +705,7 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
         }
         attempted.push(session.session_id.clone());
 
-        match adapter
-            .open_tab(
-                &session.directory,
-                &launch_command(&session.session_id)?,
-                Selection::Take,
-            )
+        match open_restored_tab(adapter.as_ref(), &session)
             .and_then(|()| wait_for_restore_owner(&path, &session.session_id))
         {
             Ok(()) => {
@@ -730,6 +727,27 @@ fn open_restores(to_open: Vec<SessionRecord>, summary: &mut RestoreSummary) -> R
     }
 
     record_holds(&path, &attempted, &summary.held)
+}
+
+// A terminal that brings its own tabs back after a crash has the session's
+// waiting, and a new tab would sit beside it.
+fn open_restored_tab(adapter: &dyn TerminalAdapter, session: &SessionRecord) -> Result<()> {
+    let command = launch_command(&session.session_id)?;
+    if run_in_session_tab(adapter, session, &command)? {
+        return Ok(());
+    }
+    adapter.open_tab(&session.directory, &command, Selection::Take)
+}
+
+fn run_in_session_tab(
+    adapter: &dyn TerminalAdapter,
+    session: &SessionRecord,
+    command: &str,
+) -> Result<bool> {
+    session
+        .terminal_tab
+        .as_deref()
+        .map_or(Ok(false), |tab| adapter.run_in_named_tab(tab, command))
 }
 
 // A terminal launched together with its first tab gives Screen Time no moment
@@ -1227,7 +1245,13 @@ fn reopen_in_living_tabs(processes: &ProcessSnapshot) -> Result<Vec<SessionRecor
             .shell_pid
             .filter(|shell| processes.in_foreground(*shell))
             .and_then(|shell| processes.tty(shell))
-            .map(|tty| adapter.run_in_tab(tty, &launch_command(&session.session_id)?))
+            .map(|tty| {
+                let command = launch_command(&session.session_id)?;
+                Ok::<_, anyhow::Error>(
+                    run_in_session_tab(adapter.as_ref(), &session, &command)?
+                        || adapter.run_in_tab(tty, &command)?,
+                )
+            })
             .transpose()?
             .unwrap_or(false);
         if in_tab && wait_for_restore_owner(&path, &session.session_id).is_ok() {
@@ -1692,6 +1716,55 @@ mod tests {
         );
         session.transcript_path = None;
         assert_eq!(launch_directory(&session), None);
+    }
+
+    #[derive(Default)]
+    struct TabsStandIn {
+        has_named_tab: bool,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl TerminalAdapter for TabsStandIn {
+        fn open_tab(&self, _: &std::path::Path, _: &str, _: Selection) -> Result<()> {
+            self.asked.borrow_mut().push("new tab".to_string());
+            Ok(())
+        }
+        fn is_running(&self) -> bool {
+            true
+        }
+        fn launch(&self) -> Result<()> {
+            Ok(())
+        }
+        fn run_in_named_tab(&self, tab: &str, _: &str) -> Result<bool> {
+            self.asked.borrow_mut().push(tab.to_string());
+            Ok(self.has_named_tab)
+        }
+    }
+
+    #[test]
+    fn a_restore_goes_into_the_tab_the_terminal_brought_back() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.terminal_tab = Some("block:1".to_string());
+        let terminal = TabsStandIn {
+            has_named_tab: true,
+            ..TabsStandIn::default()
+        };
+        open_restored_tab(&terminal, &session).unwrap();
+        assert_eq!(*terminal.asked.borrow(), ["block:1"]);
+    }
+
+    #[test]
+    fn a_restore_opens_a_new_tab_when_its_own_is_gone_or_never_named() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.terminal_tab = Some("block:1".to_string());
+        let terminal = TabsStandIn::default();
+        open_restored_tab(&terminal, &session).unwrap();
+        assert_eq!(*terminal.asked.borrow(), ["block:1", "new tab"]);
+
+        session.terminal_tab = None;
+        let terminal = TabsStandIn::default();
+        open_restored_tab(&terminal, &session).unwrap();
+        assert_eq!(*terminal.asked.borrow(), ["new tab"]);
     }
 
     #[test]

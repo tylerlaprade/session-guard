@@ -471,7 +471,7 @@ impl ProcessSnapshot {
     pub fn instance_running_since(&self, executable: &str, started_by: Option<&str>) -> bool {
         let deadline = started_by.and_then(parse_identity);
         self.processes.values().any(|(start, comm)| {
-            comm.rsplit('/').next() == Some(executable)
+            runs_executable(comm, executable)
                 && match (deadline, parse_identity(start)) {
                     (Some(deadline), Some(start)) => start <= deadline,
                     _ => true,
@@ -489,9 +489,17 @@ impl ProcessSnapshot {
     ) -> std::collections::BTreeSet<chrono::NaiveDateTime> {
         self.processes
             .values()
-            .filter(|(_, comm)| comm.rsplit('/').next() == Some(executable))
+            .filter(|(_, comm)| runs_executable(comm, executable))
             .filter_map(|(start, _)| parse_identity(start))
             .collect()
+    }
+}
+
+fn runs_executable(comm: &str, executable: &str) -> bool {
+    if executable.contains('/') {
+        comm.contains(executable)
+    } else {
+        comm.rsplit('/').next() == Some(executable)
     }
 }
 
@@ -957,6 +965,26 @@ mod tests {
         let kernel_name: String = name.chars().take(2 * libc::MAXCOMLEN).collect();
         assert!(pids_named(&kernel_name).contains(&own));
         assert_eq!(pids_named("no-such-process-xyz"), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn the_rex_server_counts_as_the_terminal_and_its_app_does_not() {
+        let server = crate::TerminalKind::Rex.process_name();
+        for bundled in [
+            "/applications/rex beta.app/contents/helpers/rex server.rex/contents/macos/rex",
+            "/users/me/library/application support/com.superlogical.rex/rexserver/versions/1853/rex server.app/contents/macos/rex",
+        ] {
+            assert!(runs_executable(bundled, server));
+        }
+        assert!(!runs_executable(
+            "/applications/rex beta.app/contents/macos/rex",
+            server
+        ));
+        assert!(runs_executable(
+            "/applications/ghostty.app/contents/macos/ghostty",
+            "ghostty"
+        ));
+        assert!(!runs_executable("/usr/bin/not-ghostty", "ghostty"));
     }
 
     #[test]

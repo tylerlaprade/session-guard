@@ -23,6 +23,7 @@ Supported terminal values:
 | `kitty` | Uses `kitty @ launch --type=tab`. |
 | `wezterm` | Uses `wezterm cli spawn`. |
 | `alacritty` | Alacritty has no tab control API, so restores open new windows. |
+| `rex` | Types the restore into the tab Rex brought back after the crash, or else opens a Rex session labeled after the folder with `rex new`. Needs no window, so a Screen Time lockout or a locked screen does not hold it. `rex` comes from PATH, or else from the app LaunchServices knows by its bundle id. |
 
 ## Commands
 
@@ -218,7 +219,8 @@ editor, which has no hooks. Once the grace has passed,
 the daemon types the session's `session-guard launch` into that shell's own tab,
 found by its tty, when the shell sits idle at its prompt; a shell the user has
 already put to other work is released like a closed tab. Typing into a tab
-needs Ghostty's scripting. Other terminals release the record as before.
+needs Ghostty's scripting or Rex's `send`. Other terminals release the record as
+before.
 
 A restored tab's launcher handles the same death itself. When the tool is
 killed by a signal that only memory pressure, a crash, or `kill -9` sends
@@ -280,6 +282,10 @@ When session-guard itself launches Ghostty, it disables the default empty window
 for that launch only. The first restored session creates the first window.
 
 ### Screen Time lockouts
+
+This section covers terminals that add tabs to windows of their own. Rex adds
+sessions to its server instead, so it is never held, `session-guard lockout`
+answers 0 for it, and the daemon runs no lockout watcher.
 
 When Screen Time locks the terminal out, for Downtime or an app limit, AppKit
 covers its native fullscreen windows. A tab opened under that cover crashes the
@@ -490,6 +496,35 @@ previous instance can take several seconds to die after it does, so the
 returned terminal keeps restoring them as they die, trying each once. Tabs it
 opened itself are never treated as victims. The short startup delay is only
 for terminal readiness.
+
+### Rex
+
+Rex's server holds its sessions with no window of its own, and the app is only
+a client of it, so the server is the terminal: a session's owner is judged by
+the server's process, and an app left open after its server dies does not count.
+The server keeps running with the app closed, until a reboot or crash takes it
+down. A restored session runs at a normal shell, as in Ghostty, so its Rex
+session stays open when the tool exits.
+
+When the server starts again it brings back its saved sessions, with the same
+block ids and a fresh shell in each. Registration therefore records `REX_BLOCK`
+from the tool's environment. A restore types into that block once its login
+shell is in the foreground, so the session returns to its own pane and no empty
+copy is left beside it. A block that is gone, or still busy after five seconds,
+gets a new session instead. So does a tool whose environment the kernel hides,
+as it does for programs Apple ships.
+
+Any `rex` command starts a missing server, including the daemon's first one
+after a reboot. After a server crash that did not reboot the Mac, the daemon
+waits for the terminal to return like any other: restores run once the app or
+any `rex` command has started the server again.
+
+Closing the last session while no client is connected reads as a crash. The
+server exits about ten seconds after its last session and connection close,
+which is just when the daemon settles the session's end, so it finds the terminal
+gone and reopens the session the next time Rex starts. A missing block cannot
+settle this, because a server stopped with `--discard` loses its saved sessions
+too, and a session reopened by mistake is cheaper than one lost.
 
 ### Tab order
 

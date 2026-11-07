@@ -110,6 +110,10 @@ pub struct SessionRecord {
     // reopen in the order they had.
     #[serde(default)]
     pub tab_position: Option<(u32, u32)>,
+    // The terminal's own name for the tab, when it names them, so a restore
+    // can find the tab if the terminal brought it back.
+    #[serde(default)]
+    pub terminal_tab: Option<String>,
     #[serde(flatten)]
     pub unknown_fields: UnknownFields,
 }
@@ -161,6 +165,7 @@ impl SessionRecord {
             background_tasks: None,
             command: None,
             tab_position: None,
+            terminal_tab: pid.and_then(crate::adapters::terminal_tab),
             unknown_fields: UnknownFields::new(),
         }
     }
@@ -202,6 +207,7 @@ impl SessionRecord {
             background_tasks: None,
             command: None,
             tab_position: None,
+            terminal_tab: None,
             unknown_fields: UnknownFields::new(),
         }
     }

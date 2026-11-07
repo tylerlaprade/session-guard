@@ -297,6 +297,9 @@ impl Launch {
 }
 
 pub fn lockout(terminal: TerminalKind) -> Lockout {
+    if !terminal.adds_tabs_to_windows() {
+        return Lockout::Clear;
+    }
     match screen::is_locked() {
         Ok(true) => return Lockout::ScreenLocked,
         Ok(false) => {}
@@ -1392,6 +1395,11 @@ mod tests {
             outcome,
             stream: None,
         }
+    }
+
+    #[test]
+    fn a_terminal_without_windows_of_its_own_is_never_locked_out() {
+        assert_eq!(lockout(TerminalKind::Rex), Lockout::Clear);
     }
 
     const EARLIER: &str = "Sun Oct 18 10:00:00 2026";

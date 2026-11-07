@@ -103,6 +103,7 @@ fn claim(session: &mut SessionRecord, owner: i32, started: &str) -> LaunchReques
     session.shell_pid = Some(owner);
     session.pid_started_at = Some(started.to_string());
     session.shell_pid_started_at = Some(started.to_string());
+    session.terminal_tab = crate::adapters::terminal_tab(owner);
     session.server_pid = None;
     session.server_pid_started_at = None;
     session.source = Some("restore-launch".to_string());

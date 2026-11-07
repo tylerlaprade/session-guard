@@ -2,6 +2,7 @@ mod alacritty;
 pub(crate) mod ghostty;
 mod iterm2;
 mod kitty;
+pub(crate) mod rex;
 mod terminal_app;
 mod wezterm;
 
@@ -40,6 +41,18 @@ pub trait TerminalAdapter {
     fn run_in_tab(&self, _tty: &str, _command: &str) -> Result<bool> {
         Ok(false)
     }
+    /// Runs `command` at the prompt of the tab `terminal_tab` named, replacing
+    /// anything typed there. False when the terminal has no such tab, the tab
+    /// is busy, or the terminal does not name its tabs.
+    fn run_in_named_tab(&self, _tab: &str, _command: &str) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+/// The name a terminal gives the tab holding `pid`, for a terminal that names
+/// its tabs in their environment.
+pub fn terminal_tab(pid: i32) -> Option<String> {
+    crate::process::process_environment_variable(pid, rex::BLOCK_VARIABLE)
 }
 
 pub fn adapter_for(kind: TerminalKind) -> Box<dyn TerminalAdapter> {
@@ -50,6 +63,7 @@ pub fn adapter_for(kind: TerminalKind) -> Box<dyn TerminalAdapter> {
         TerminalKind::Kitty => Box::new(kitty::Kitty),
         TerminalKind::Wezterm => Box::new(wezterm::Wezterm),
         TerminalKind::Alacritty => Box::new(alacritty::Alacritty),
+        TerminalKind::Rex => Box::new(rex::Rex),
     }
 }
 

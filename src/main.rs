@@ -131,6 +131,7 @@ pub enum TerminalKind {
     Kitty,
     Wezterm,
     Alacritty,
+    Rex,
 }
 
 impl TerminalKind {
@@ -143,6 +144,7 @@ impl TerminalKind {
             Self::Kitty => "kitty",
             Self::Wezterm => "wezterm",
             Self::Alacritty => "alacritty",
+            Self::Rex => "rex",
         }
     }
 
@@ -156,10 +158,13 @@ impl TerminalKind {
             Self::Kitty => "net.kovidgoyal.kitty",
             Self::Wezterm => "com.github.wez.wezterm",
             Self::Alacritty => "org.alacritty",
+            Self::Rex => "com.superlogical.rex",
         }
     }
 
-    /// Executable name as `ps -o comm=` reports it, lowercased.
+    /// Executable name as `ps -o comm=` reports it, lowercased. A name holding
+    /// a slash is instead a fragment of the path: the Rex app's executable and
+    /// the Rex server's share a file name, and only the server holds the tabs.
     #[must_use]
     pub fn process_name(self) -> &'static str {
         match self {
@@ -169,6 +174,23 @@ impl TerminalKind {
             Self::Kitty => "kitty",
             Self::Wezterm => "wezterm-gui",
             Self::Alacritty => "alacritty",
+            Self::Rex => "/rex server.",
+        }
+    }
+
+    /// Whether a new tab goes into a window of the terminal's own, which Screen
+    /// Time and a locked screen make unsafe (see `lockout`). A Rex session lives
+    /// in its server, which has no windows.
+    #[must_use]
+    pub fn adds_tabs_to_windows(self) -> bool {
+        match self {
+            Self::Ghostty
+            | Self::Iterm2
+            | Self::Terminal
+            | Self::Kitty
+            | Self::Wezterm
+            | Self::Alacritty => true,
+            Self::Rex => false,
         }
     }
 }
@@ -184,6 +206,7 @@ impl std::str::FromStr for TerminalKind {
             "kitty" => Ok(Self::Kitty),
             "wezterm" => Ok(Self::Wezterm),
             "alacritty" => Ok(Self::Alacritty),
+            "rex" => Ok(Self::Rex),
             other => anyhow::bail!("unsupported terminal '{other}'"),
         }
     }

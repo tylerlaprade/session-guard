@@ -284,6 +284,7 @@ fn served_record(
 fn set_owner(record: &mut SessionRecord, pid: i32, shell_pid: Option<i32>) {
     record.pid = Some(pid);
     record.pid_started_at = process::process_start_identity(pid).ok();
+    record.terminal_tab = crate::adapters::terminal_tab(pid);
     record.shell_pid = shell_pid;
     record.shell_pid_started_at =
         shell_pid.and_then(|pid| process::process_start_identity(pid).ok());

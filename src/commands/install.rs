@@ -48,6 +48,7 @@ fn ensure_terminal_available(terminal: TerminalKind) -> Result<()> {
         TerminalKind::Kitty => process::command_exists("kitty"),
         TerminalKind::Wezterm => process::command_exists("wezterm"),
         TerminalKind::Alacritty => process::command_exists("alacritty"),
+        TerminalKind::Rex => crate::adapters::rex::executable().is_ok(),
     };
 
     if !available {
