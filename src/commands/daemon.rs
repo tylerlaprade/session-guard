@@ -848,6 +848,9 @@ fn run_in_session_tab(
 // to lock it out before the tab, so it is launched alone, and tabs wait until
 // Screen Time has answered for the launch.
 fn launch_terminal(kind: TerminalKind) -> Result<()> {
+    if !kind.adds_tabs_to_windows() {
+        return adapter_for(kind).launch();
+    }
     lockout::launch(kind, move |failure| {
         let _ = log_line(&format!("launching {kind} failed: {failure}"));
     })
@@ -1224,9 +1227,22 @@ fn terminals_in_use(
     terminals
 }
 
-/// Starts a crashed terminal again once, when sessions wait to return to it and
-/// memory pressure is not critical; its return then restores them as any
-/// relaunch would.
+fn can_launch_now(lockout: &Lockout) -> bool {
+    match lockout {
+        Lockout::Clear | Lockout::NotRunning => true,
+        Lockout::Engaged
+        | Lockout::ScreenLocked
+        | Lockout::Deciding
+        | Lockout::Reading
+        | Lockout::Unknown(_) => false,
+    }
+}
+
+/// Starts a crashed terminal again once, when sessions wait to return to it,
+/// memory pressure is not critical, and nothing stops a launch: a locked
+/// screen, Screen Time, or a launch already waiting on Screen Time's answer.
+/// It launches alone, and its return then restores its sessions as any
+/// relaunch would, once Screen Time has answered for it.
 fn restart_crashed_terminals(
     restarts: &mut crate::crash_restart::CrashRestarts,
     exits: &process::ExitWatch,
@@ -1269,12 +1285,12 @@ fn restart_crashed_terminals(
             log_line(&format!("{terminal} has no session waiting to return"))?;
             continue;
         }
-        if process::memory_pressure_is_critical() {
+        if !can_launch_now(&lockout::lockout(terminal)) || process::memory_pressure_is_critical() {
             continue;
         }
         restarts.restarting(terminal);
-        match adapter_for(terminal).launch() {
-            Ok(()) => log_line(&format!("started {terminal} again after its crash"))?,
+        match launch_terminal(terminal) {
+            Ok(()) => log_line(&format!("starting {terminal} again after its crash"))?,
             Err(error) => log_line(&format!("could not start {terminal} again: {error:#}"))?,
         }
     }
@@ -1945,6 +1961,21 @@ mod tests {
         crate::adapters::TerminalTab {
             terminal: TerminalKind::Rex,
             id: "block:1".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_crashed_terminal_launches_only_when_nothing_holds_a_launch() {
+        assert!(can_launch_now(&Lockout::NotRunning));
+        assert!(can_launch_now(&Lockout::Clear));
+        for held in [
+            Lockout::Engaged,
+            Lockout::ScreenLocked,
+            Lockout::Deciding,
+            Lockout::Reading,
+            Lockout::Unknown("no watcher".to_string()),
+        ] {
+            assert!(!can_launch_now(&held), "{held:?}");
         }
     }
 

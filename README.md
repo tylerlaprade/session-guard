@@ -278,8 +278,9 @@ handed it. Existing prompts, re-sourced configuration, subshells, and multiple
 tabs or splits never make an offer. There is no polling of the prompt and no
 injected command or keystroke.
 
-When session-guard itself launches Ghostty, it disables the default empty window
-for that launch only. The first restored session creates the first window.
+When session-guard itself launches Ghostty, it launches it in the background
+and disables the default empty window for that launch only. The first restored
+session creates the first window.
 
 ### Screen Time lockouts
 
@@ -535,17 +536,32 @@ check.
 
 Any `rex` command starts a missing server, including the daemon's first one
 after a reboot. After a server crash that did not reboot the Mac, the daemon
-starts the server again itself when sessions wait to return to it, and its
-return restores them. The server's own exit, which the daemon reads from the
-kernel, says which ends count: the Go runtime exits 2 when the server crashes,
-while `rex server stop`, a plain `kill` and a server left empty all exit 0. A
-`kill -9` is never restarted, because the system reclaiming memory ends a
-process the same way, and bringing back the sessions that filled it would
-repeat it. The daemon waits until memory pressure is no longer critical, and
-starts the server at most once in a row: a server it started that crashes too
-is left for you to start. A terminal with windows is never restarted, since a
-relaunch puts its windows on screen and takes the focus; the daemon waits for
-it to return.
+starts the server again itself (see Restarting a crashed terminal).
+
+### Restarting a crashed terminal
+
+When Ghostty or Rex's server crashes and sessions wait to return to it, the
+daemon starts it again once, and its return restores them as any relaunch
+would. The terminal's own exit, which the daemon reads from the kernel, says
+whether it crashed:
+
+| Terminal | Crashed | Ended on purpose |
+| --- | --- | --- |
+| Ghostty | exit 5 (an abort), or SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE or SIGSYS | exit 0 (Quit), SIGTERM, SIGHUP, SIGINT, SIGQUIT |
+| Rex's server | exit 2 (the Go runtime's crash) | exit 0 (`rex server stop`, a plain `kill`, or the last session closed) |
+
+A `kill -9` is never restarted: the system reclaiming memory ends a process the
+same way, and bringing back the sessions that filled it would repeat it. The
+daemon waits until memory pressure is no longer critical, the screen is
+unlocked, and no launch is still waiting on Screen Time's answer. Ghostty
+launches alone, as for any restore, so its tabs wait for Screen Time to answer
+for it and hold while it is locked out. A terminal starts again at most once in
+a row: one the daemon started that crashes too is left for you to start. The
+other terminals' exits have not been measured, so they are never restarted.
+
+session-guard launches Ghostty in the background (`open -g`), so the launch
+takes no focus. Ghostty's scripting activates it whenever it adds a tab, so
+restored tabs do bring it to the front.
 
 ### Tab order
 

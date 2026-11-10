@@ -102,7 +102,7 @@ impl TerminalAdapter for Ghostty {
 
     fn launch(&self) -> Result<()> {
         let mut command = Command::new("open");
-        command.args(["-a", "Ghostty", "--args", "--initial-window=false"]);
+        command.args(["-g", "-a", "Ghostty", "--args", "--initial-window=false"]);
         run_checked(command, "launching Ghostty")
     }
 

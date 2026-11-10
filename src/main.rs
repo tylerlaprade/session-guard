@@ -195,23 +195,35 @@ impl TerminalKind {
         }
     }
 
-    /// Whether the daemon starts the terminal again itself after `exit` ended
-    /// it. A terminal with windows never: relaunched, it puts them on screen
-    /// and takes the focus.
+    /// Whether `exit` was the terminal crashing, which the daemon answers by
+    /// starting it again. SIGKILL never counts: it is as often the system
+    /// reclaiming memory as anyone's kill -9, and a restart would bring back
+    /// what filled it. A terminal whose exits have not been measured never
+    /// restarts.
     #[must_use]
     pub fn restarts_after(self, exit: std::process::ExitStatus) -> bool {
+        use std::os::unix::process::ExitStatusExt;
         match self {
             // Rex's server exits 0 when stopped or left empty, and the Go
-            // runtime exits 2 when it crashes. SIGKILL is as often the system
-            // reclaiming memory as anyone's kill -9, and a restart would bring
-            // back what filled it.
+            // runtime exits 2 when it crashes.
             Self::Rex => exit.code() == Some(2),
-            Self::Ghostty
-            | Self::Iterm2
-            | Self::Terminal
-            | Self::Kitty
-            | Self::Wezterm
-            | Self::Alacritty => false,
+            // Ghostty exits 0 when it quits and 5 when it aborts. SIGTERM,
+            // SIGHUP, SIGINT and SIGQUIT are someone ending it.
+            Self::Ghostty => {
+                exit.code() == Some(5)
+                    || matches!(
+                        exit.signal(),
+                        Some(
+                            libc::SIGSEGV
+                                | libc::SIGBUS
+                                | libc::SIGILL
+                                | libc::SIGTRAP
+                                | libc::SIGFPE
+                                | libc::SIGSYS
+                        )
+                    )
+            }
+            Self::Iterm2 | Self::Terminal | Self::Kitty | Self::Wezterm | Self::Alacritty => false,
         }
     }
 
@@ -375,5 +387,47 @@ fn main() -> Result<()> {
         Command::Restore { all } => commands::restore::run(all),
         Command::Lockout { wait } => lockout::run(wait),
         Command::AttachAfterLockout { id } => commands::attach_after_lockout::run(&id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    fn exited_with(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn a_crash_is_read_from_each_terminals_measured_exits() {
+        let crashes = [
+            (TerminalKind::Rex, exited_with(2)),
+            (TerminalKind::Ghostty, exited_with(5)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGSEGV)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGBUS)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGILL)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGTRAP)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGFPE)),
+        ];
+        for (terminal, exit) in crashes {
+            assert!(terminal.restarts_after(exit), "{terminal} {exit}");
+        }
+        let ends = [
+            (TerminalKind::Rex, exited_with(0)),
+            (TerminalKind::Rex, ExitStatus::from_raw(libc::SIGKILL)),
+            (TerminalKind::Ghostty, exited_with(0)),
+            (TerminalKind::Ghostty, exited_with(2)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGKILL)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGTERM)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGHUP)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGINT)),
+            (TerminalKind::Ghostty, ExitStatus::from_raw(libc::SIGQUIT)),
+            (TerminalKind::Iterm2, ExitStatus::from_raw(libc::SIGSEGV)),
+        ];
+        for (terminal, exit) in ends {
+            assert!(!terminal.restarts_after(exit), "{terminal} {exit}");
+        }
     }
 }
