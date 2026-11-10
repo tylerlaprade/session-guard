@@ -40,11 +40,32 @@ pub fn daemon_heartbeat() -> Result<PathBuf> {
 
 /// Names this boot's processes, so it lives in machine-local storage.
 pub fn lockout_state() -> Result<PathBuf> {
-    Ok(user_temp_dir()?.join("session-guard-lockout.json"))
+    Ok(machine_state_dir()?.join("lockout.json"))
 }
 
 pub fn lockout_launch() -> Result<PathBuf> {
-    Ok(user_temp_dir()?.join("session-guard-lockout-launch.json"))
+    Ok(machine_state_dir()?.join("lockout-launch.json"))
+}
+
+/// Machine-local state belongs to one configuration folder, so a daemon run
+/// with another HOME, as a test's is, never shares the live daemon's.
+fn machine_state_dir() -> Result<PathBuf> {
+    Ok(state_dir_for(&user_temp_dir()?, &config_dir()?))
+}
+
+fn state_dir_for(temp_dir: &std::path::Path, config_dir: &std::path::Path) -> PathBuf {
+    let owner: String = config_dir
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    temp_dir.join(format!("session-guard{owner}"))
 }
 
 // launchd gives the LaunchAgent no TMPDIR, so the daemon asks for the
@@ -100,4 +121,23 @@ pub fn launch_agent_plist() -> Result<PathBuf> {
         .join("Library")
         .join("LaunchAgents")
         .join("com.tylerlaprade.session-guard.plist"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn each_configuration_folder_keeps_its_own_machine_state() {
+        let temp = Path::new("/var/folders/xy/T");
+        let live = state_dir_for(temp, Path::new("/Users/tyler/.config/session-guard"));
+        let test = state_dir_for(temp, Path::new("/tmp/fixture/.config/session-guard"));
+        assert_ne!(live, test);
+        assert_eq!(
+            live,
+            temp.join("session-guard-Users-tyler--config-session-guard")
+        );
+        assert_eq!(live.parent(), Some(temp));
+    }
 }

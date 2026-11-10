@@ -280,7 +280,8 @@ injected command or keystroke.
 
 When session-guard itself launches Ghostty, it launches it in the background
 and disables the default empty window for that launch only. The first restored
-session creates the first window.
+session creates the first window, and once the last one has opened, the focus
+goes back to the app that had it (see Restarting a crashed terminal).
 
 ### Screen Time lockouts
 
@@ -299,8 +300,10 @@ opens them.
 Reading the policy behind a lockout takes a private entitlement, so the daemon
 follows the line AppKit logs in the terminal at each change (`LockoutUI changed
 state: engaged` or `disengaged`). It runs one `log stream` for that line while
-it runs and keeps the state in `$TMPDIR/session-guard-lockout.json`, keyed by
-the terminal's PID and start time. A daemon that starts while the terminal is
+it runs and keeps the state in `lockout.json`, keyed by the terminal's PID and
+start time. The file sits in a folder of `$TMPDIR` named after the daemon's
+configuration folder, such as `session-guard-Users-you--config-session-guard`,
+so a daemon run with another HOME, as a test's is, keeps state of its own. A daemon that starts while the terminal is
 already running reads that terminal's state back from the stored log. After a
 clean stop it reads only from where the previous daemon stopped following,
 which takes seconds; after a crash, or for a terminal it never saw, it reads
@@ -560,8 +563,10 @@ a row: one the daemon started that crashes too is left for you to start. The
 other terminals' exits have not been measured, so they are never restarted.
 
 session-guard launches Ghostty in the background (`open -g`), so the launch
-takes no focus. Ghostty's scripting activates it whenever it adds a tab, so
-restored tabs do bring it to the front.
+takes no focus. Ghostty's scripting activates it whenever it adds a tab, so a
+restore pass notes the app and Ghostty window in front before its first tab and
+gives the focus back to them after its last, as dotfiles' `ghostty-tab` does.
+Someone who switched to another app while the tabs opened stays there.
 
 ### Tab order
 

@@ -463,8 +463,25 @@ impl Fixture {
         assert!(String::from_utf8_lossy(&unknown.stderr).contains("watcher is not running"));
     }
 
+    /// The daemon keeps it in the machine's temp folder, here the fixture's
+    /// root, under a name made from its configuration folder.
     fn state_file(&self) -> PathBuf {
-        self.root().join("session-guard-lockout.json")
+        let owner: String = self
+            .root()
+            .join(".config/session-guard")
+            .to_string_lossy()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        self.root()
+            .join(format!("session-guard{owner}"))
+            .join("lockout.json")
     }
 }
 

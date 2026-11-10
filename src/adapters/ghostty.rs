@@ -1,5 +1,5 @@
-use super::{Selection, TerminalAdapter, run_checked};
-use crate::process;
+use super::{Focus, Selection, TerminalAdapter, run_checked};
+use crate::{TerminalKind, process};
 use anyhow::{Context, Result};
 use std::cell::RefCell;
 use std::path::Path;
@@ -9,6 +9,7 @@ use std::time::Duration;
 
 // A wedged Ghostty can take the whole window this long.
 const OPEN_TAB_TIMEOUT: Duration = Duration::from_secs(15);
+const FOCUS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One restore pass's tabs stay together. The first goes into the front
 /// window, or a new one when none is open, and the rest follow it by the
@@ -106,6 +107,34 @@ impl TerminalAdapter for Ghostty {
         run_checked(command, "launching Ghostty")
     }
 
+    // Ghostty's scripting activates it whenever it adds a tab, with no option
+    // to skip that.
+    fn focus(&self) -> Option<Focus> {
+        let mut osa = Command::new("osascript");
+        osa.args(["-e", include_str!("ghostty_front_window.applescript")]);
+        let window =
+            super::run_capture_timeout(&mut osa, "reading Ghostty's front window", FOCUS_TIMEOUT)
+                .ok()
+                .filter(|window| !window.is_empty());
+        Some(Focus {
+            app: foreground_app(),
+            window,
+        })
+    }
+
+    // Someone who moved to another app while the tabs opened stays there.
+    fn return_focus(&self, focus: &Focus) -> Result<()> {
+        if foreground_app().as_deref() != Some(TerminalKind::Ghostty.bundle_id()) {
+            return Ok(());
+        }
+        super::run_capture_timeout(
+            &mut return_focus_command(focus),
+            "giving the focus back after a restore",
+            FOCUS_TIMEOUT,
+        )
+        .map(drop)
+    }
+
     fn tab_positions(&self) -> Result<Vec<((u32, u32), String)>> {
         let mut osa = Command::new("osascript");
         osa.args(["-e", include_str!("ghostty_tab_order.applescript")]);
@@ -137,6 +166,43 @@ impl TerminalAdapter for Ghostty {
     }
 }
 
+/// The app in front, when it is an ordinary one. A system alert can hold the
+/// front as a `UIElement` app, and asking to activate one stalled a script for
+/// 119 seconds (dotfiles' ghostty-tab).
+fn foreground_app() -> Option<String> {
+    let front = lsappinfo(&["front"])?;
+    if lsappinfo_value(&lsappinfo(&["info", "-only", "ApplicationType", &front])?).as_deref()
+        != Some("Foreground")
+    {
+        return None;
+    }
+    lsappinfo_value(&lsappinfo(&["info", "-only", "bundleID", &front])?)
+}
+
+fn lsappinfo(arguments: &[&str]) -> Option<String> {
+    let mut command = Command::new("lsappinfo");
+    command.args(arguments);
+    super::run_capture_timeout(&mut command, "asking which app is in front", FOCUS_TIMEOUT).ok()
+}
+
+/// The value of a `"key"="value"` line from `lsappinfo info -only key`.
+fn lsappinfo_value(reply: &str) -> Option<String> {
+    let (_, value) = reply.trim().split_once('=')?;
+    let value = value.trim_matches('"');
+    (!value.is_empty() && value != "[ NULL ]").then(|| value.to_string())
+}
+
+fn return_focus_command(focus: &Focus) -> Command {
+    let mut osa = Command::new("osascript");
+    osa.args([
+        "-e",
+        include_str!("ghostty_return_focus.applescript"),
+        focus.window.as_deref().unwrap_or_default(),
+        focus.app.as_deref().unwrap_or_default(),
+    ]);
+    osa
+}
+
 fn parse_tab_positions(reply: &str) -> Vec<((u32, u32), String)> {
     reply
         .lines()
@@ -152,6 +218,54 @@ fn parse_tab_positions(reply: &str) -> Vec<((u32, u32), String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsappinfo_replies_are_read_for_their_value() {
+        assert_eq!(
+            lsappinfo_value("\"ApplicationType\"=\"Foreground\"\n").as_deref(),
+            Some("Foreground")
+        );
+        assert_eq!(
+            lsappinfo_value("\"CFBundleIdentifier\"=\"com.example.train\"").as_deref(),
+            Some("com.example.train")
+        );
+        assert_eq!(lsappinfo_value("\"bundleID\"=[ NULL ]"), None);
+        assert_eq!(lsappinfo_value(""), None);
+    }
+
+    /// The window comes back before the app, as in dotfiles' ghostty-tab:
+    /// activating the app last leaves it, not Ghostty, in front.
+    #[test]
+    fn focus_returns_to_the_window_and_then_the_app() {
+        let arguments = |focus: &Focus| -> Vec<String> {
+            return_focus_command(focus)
+                .get_args()
+                .skip(2)
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            arguments(&Focus {
+                app: Some("com.example.train".to_string()),
+                window: Some("tab-group-1".to_string()),
+            }),
+            ["tab-group-1", "com.example.train"]
+        );
+        assert_eq!(
+            arguments(&Focus {
+                app: None,
+                window: None,
+            }),
+            ["", ""]
+        );
+        let script = include_str!("ghostty_return_focus.applescript");
+        assert!(
+            script.find("activate window").unwrap()
+                < script
+                    .find("tell application id frontAppId to activate")
+                    .unwrap()
+        );
+    }
 
     #[test]
     fn tab_positions_pair_each_tty_with_its_window_and_tab() {

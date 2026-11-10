@@ -48,6 +48,22 @@ pub trait TerminalAdapter {
     fn run_in_named_tab(&self, _tab: &str, _command: &str) -> Result<NamedTab> {
         Ok(NamedTab::Unavailable)
     }
+    /// What has the focus before a restore pass opens its tabs, for a terminal
+    /// whose new tabs take it.
+    fn focus(&self) -> Option<Focus> {
+        None
+    }
+    /// Gives the focus back once a restore pass has opened its last tab.
+    fn return_focus(&self, _focus: &Focus) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The app in front, and the terminal's own window in front of its others.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Focus {
+    pub app: Option<String>,
+    pub window: Option<String>,
 }
 
 /// What came of running a command in a tab its terminal names.

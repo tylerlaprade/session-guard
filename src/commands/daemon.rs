@@ -670,10 +670,10 @@ fn open_restores_in(
     attempted: &mut Vec<String>,
     path: &std::path::Path,
 ) -> Result<()> {
-    let mut adapter = None;
+    let adapter = adapter_for(kind);
+    let mut focus = FocusReturn::default();
     let mut to_open = to_open.into_iter();
     while let Some(session) = to_open.next() {
-        let adapter = adapter.get_or_insert_with(|| adapter_for(kind));
         let lockout = match lockout::lockout(kind) {
             Lockout::NotRunning => match launch_terminal(kind) {
                 Ok(()) => {
@@ -743,6 +743,7 @@ fn open_restores_in(
         }
         attempted.push(session.session_id.clone());
 
+        focus.note(adapter.as_ref());
         let reopened = open_restored_tab(adapter.as_ref(), &session);
         if matches!(reopened, Ok(Reopened::TabClosed)) {
             retire_closed_tab(path, &session)?;
@@ -771,7 +772,35 @@ fn open_restores_in(
             }
         }
     }
+    if let Err(error) = focus.give_back(adapter.as_ref()) {
+        log_line(&format!(
+            "could not give the focus back after a restore: {error:#}"
+        ))?;
+    }
     Ok(())
+}
+
+/// The focus before a restore pass's first tab, given back after its last.
+#[derive(Default)]
+enum FocusReturn {
+    #[default]
+    BeforeFirstTab,
+    Noted(Option<crate::adapters::Focus>),
+}
+
+impl FocusReturn {
+    fn note(&mut self, adapter: &dyn TerminalAdapter) {
+        if matches!(self, Self::BeforeFirstTab) {
+            *self = Self::Noted(adapter.focus());
+        }
+    }
+
+    fn give_back(self, adapter: &dyn TerminalAdapter) -> Result<()> {
+        match self {
+            Self::Noted(Some(focus)) => adapter.return_focus(&focus),
+            Self::Noted(None) | Self::BeforeFirstTab => Ok(()),
+        }
+    }
 }
 
 /// The terminal a session ran in: the one that named its tab, or else the
@@ -1955,6 +1984,19 @@ mod tests {
             self.asked.borrow_mut().push(tab.to_string());
             Ok(self.named_tab)
         }
+        fn focus(&self) -> Option<crate::adapters::Focus> {
+            self.asked.borrow_mut().push("note focus".to_string());
+            Some(crate::adapters::Focus {
+                app: Some("com.example.train".to_string()),
+                window: None,
+            })
+        }
+        fn return_focus(&self, focus: &crate::adapters::Focus) -> Result<()> {
+            self.asked
+                .borrow_mut()
+                .push(format!("return focus to {}", focus.app.as_deref().unwrap()));
+            Ok(())
+        }
     }
 
     fn rex_tab() -> crate::adapters::TerminalTab {
@@ -2054,6 +2096,34 @@ mod tests {
             Reopened::InATab
         );
         assert_eq!(*terminal.asked.borrow(), ["block:1"]);
+    }
+
+    #[test]
+    fn a_restore_pass_returns_the_focus_it_found_once_after_its_last_tab() {
+        let terminal = TabsStandIn::default();
+        let session = sample(crate::tool("claude"), "abc");
+        let mut focus = FocusReturn::default();
+        for _ in 0..2 {
+            focus.note(&terminal);
+            open_restored_tab(&terminal, &session).unwrap();
+        }
+        focus.give_back(&terminal).unwrap();
+        assert_eq!(
+            *terminal.asked.borrow(),
+            [
+                "note focus",
+                "new tab",
+                "new tab",
+                "return focus to com.example.train"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_restore_pass_that_opened_nothing_leaves_the_focus_alone() {
+        let terminal = TabsStandIn::default();
+        FocusReturn::default().give_back(&terminal).unwrap();
+        assert!(terminal.asked.borrow().is_empty());
     }
 
     #[test]

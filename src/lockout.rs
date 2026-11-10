@@ -360,6 +360,10 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+    }
     let staged = path.with_extension("json.new");
     fs::write(&staged, serde_json::to_vec(value)?)
         .with_context(|| format!("failed to write {}", staged.display()))?;
