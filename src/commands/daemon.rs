@@ -841,7 +841,12 @@ fn open_restored_tab(adapter: &dyn TerminalAdapter, session: &SessionRecord) -> 
         NamedTab::Ran => Ok(Reopened::InATab),
         NamedTab::Closed => Ok(Reopened::TabClosed),
         NamedTab::Unavailable => adapter
-            .open_tab(&session.directory, &command, Selection::Take)
+            .open_tab(
+                &session.directory,
+                &command,
+                Selection::Take,
+                session.terminal_tab.as_ref().map(|tab| tab.id.as_str()),
+            )
             .map(|()| Reopened::InATab),
     }
 }
@@ -1019,6 +1024,7 @@ fn attach_backgrounded(processes: &ProcessSnapshot) -> Result<()> {
             } else {
                 Selection::Take
             },
+            None,
         ) {
             Ok(()) => {
                 log_line(&format!(
@@ -1970,8 +1976,17 @@ mod tests {
     }
 
     impl TerminalAdapter for TabsStandIn {
-        fn open_tab(&self, _: &std::path::Path, _: &str, _: Selection) -> Result<()> {
-            self.asked.borrow_mut().push("new tab".to_string());
+        fn open_tab(
+            &self,
+            _: &std::path::Path,
+            _: &str,
+            _: Selection,
+            beside: Option<&str>,
+        ) -> Result<()> {
+            self.asked.borrow_mut().push(beside.map_or_else(
+                || "new tab".to_string(),
+                |tab| format!("new tab beside {tab}"),
+            ));
             Ok(())
         }
         fn is_running(&self) -> bool {
@@ -2142,12 +2157,15 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_opens_a_new_tab_when_its_own_is_busy_or_never_named() {
+    fn a_restore_opens_a_new_tab_beside_its_own_when_busy_or_alone_when_never_named() {
         let mut session = sample(crate::tool("claude"), "abc");
         session.terminal_tab = Some(rex_tab());
         let terminal = TabsStandIn::default();
         open_restored_tab(&terminal, &session).unwrap();
-        assert_eq!(*terminal.asked.borrow(), ["block:1", "new tab"]);
+        assert_eq!(
+            *terminal.asked.borrow(),
+            ["block:1", "new tab beside block:1"]
+        );
 
         session.terminal_tab = None;
         let terminal = TabsStandIn::default();

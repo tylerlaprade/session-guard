@@ -7,7 +7,13 @@ use std::process::Command;
 pub struct Wezterm;
 
 impl TerminalAdapter for Wezterm {
-    fn open_tab(&self, directory: &Path, command: &str, _selection: Selection) -> Result<()> {
+    fn open_tab(
+        &self,
+        directory: &Path,
+        command: &str,
+        _selection: Selection,
+        _beside: Option<&str>,
+    ) -> Result<()> {
         let mut process = Command::new("wezterm");
         process.args(["cli", "spawn", "--cwd"]);
         process.arg(directory);

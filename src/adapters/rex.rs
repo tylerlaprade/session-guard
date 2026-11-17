@@ -54,13 +54,26 @@ fn rex_command(rex: &Path) -> Command {
 fn new_session_command(rex: &Path, directory: &Path) -> Command {
     let mut new = rex_command(rex);
     new.arg("new");
-    new.args(session_label(directory));
+    new.args(folder_label(directory));
     new.arg("-c").arg(directory).arg("--json");
     new
 }
 
-// Rex takes a leading dash for a flag, and names a session itself given no label.
-fn session_label(directory: &Path) -> Option<String> {
+// The tab beside it is busy, so someone may be using it: the new tab leaves
+// the selection where it is.
+fn new_tab_command(rex: &Path, session: &str, directory: &Path) -> Command {
+    let mut new = rex_command(rex);
+    new.args(["window", "new", "-s", session]);
+    new.args(folder_label(directory));
+    new.arg("-c")
+        .arg(directory)
+        .args(["--focus=false", "--json"]);
+    new
+}
+
+// Rex takes a leading dash for a flag, and names a session or tab itself given
+// no label.
+fn folder_label(directory: &Path) -> Option<String> {
     let name = directory.file_name()?.to_string_lossy();
     let label = name.trim_start_matches('-');
     (!label.is_empty()).then(|| label.to_string())
@@ -76,7 +89,7 @@ struct CreatedWindow {
     block_ids: Vec<String>,
 }
 
-fn first_block(reply: &str) -> Result<String> {
+fn new_session_block(reply: &str) -> Result<String> {
     let created: CreatedSession =
         serde_json::from_str(reply).context("Rex's new session reply is not readable")?;
     created
@@ -85,6 +98,38 @@ fn first_block(reply: &str) -> Result<String> {
         .flat_map(|window| window.block_ids)
         .next()
         .context("Rex's new session has no terminal")
+}
+
+fn new_tab_block(reply: &str) -> Result<String> {
+    let created: CreatedWindow =
+        serde_json::from_str(reply).context("Rex's new tab reply is not readable")?;
+    created
+        .block_ids
+        .into_iter()
+        .next()
+        .context("Rex's new tab has no terminal")
+}
+
+/// Opens a tab running `command` beside the block `beside` names, in the Rex
+/// session holding that block, or else in a Rex session of its own.
+fn open_in(rex: &Path, directory: &Path, command: &str, beside: Option<&str>) -> Result<()> {
+    let block = match beside
+        .map(|block| session_holding(rex, block))
+        .transpose()?
+        .flatten()
+    {
+        Some(session) => new_tab_block(&run_capture_timeout(
+            &mut new_tab_command(rex, &session, directory),
+            "opening a Rex tab",
+            COMMAND_TIMEOUT,
+        )?)?,
+        None => new_session_block(&run_capture_timeout(
+            &mut new_session_command(rex, directory),
+            "opening a Rex session",
+            COMMAND_TIMEOUT,
+        )?)?,
+    };
+    send(rex, &block, &format!("{command}\n"))
 }
 
 fn send(rex: &Path, block: &str, text: &str) -> Result<()> {
@@ -135,10 +180,10 @@ struct ListedBlock {
     block_id: String,
 }
 
-/// Whether the server holds `block`, read from its listings so that only an
-/// answer, never a failure to get one, says a block is gone. A server this
-/// starts brings back its saved sessions before it answers.
-fn has_block(rex: &Path, block: &str) -> Result<bool> {
+/// The Rex session holding `block`, read from the server's listings so that
+/// only an answer, never a failure to get one, says a block is gone. A server
+/// this starts brings back its saved sessions before it answers.
+fn session_holding(rex: &Path, block: &str) -> Result<Option<String>> {
     let mut list = rex_command(rex);
     list.args(["ls", "--json"]);
     let sessions: SessionList = serde_json::from_str(&run_capture_timeout(
@@ -157,10 +202,10 @@ fn has_block(rex: &Path, block: &str) -> Result<bool> {
         )?)
         .context("Rex's terminal list is not readable")?;
         if listed.blocks.iter().any(|listed| listed.block_id == block) {
-            return Ok(true);
+            return Ok(Some(session.session_id));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn block_at_prompt(rex: &Path, block: &str) -> Option<Result<bool>> {
@@ -175,14 +220,14 @@ fn block_at_prompt(rex: &Path, block: &str) -> Option<Result<bool>> {
 impl TerminalAdapter for Rex {
     // A session's shell outlives the tool, as Ghostty's does: the session stays
     // open once the tool exits, and a tool killed in it can be typed back in.
-    fn open_tab(&self, directory: &Path, command: &str, _selection: Selection) -> Result<()> {
-        let rex = executable()?;
-        let reply = run_capture_timeout(
-            &mut new_session_command(&rex, directory),
-            "opening a Rex session",
-            COMMAND_TIMEOUT,
-        )?;
-        send(&rex, &first_block(&reply)?, &format!("{command}\n"))
+    fn open_tab(
+        &self,
+        directory: &Path,
+        command: &str,
+        _selection: Selection,
+        beside: Option<&str>,
+    ) -> Result<()> {
+        open_in(&executable()?, directory, command, beside)
     }
 
     fn is_running(&self) -> bool {
@@ -208,7 +253,7 @@ impl TerminalAdapter for Rex {
     // its startup files looks like work at the prompt, so a busy one gets a moment.
     fn run_in_named_tab(&self, tab: &str, command: &str) -> Result<NamedTab> {
         let rex = executable()?;
-        if !has_block(&rex, tab)? {
+        if session_holding(&rex, tab)?.is_none() {
             return Ok(NamedTab::Closed);
         }
         let deadline = Instant::now() + PROMPT_WAIT;
@@ -274,13 +319,52 @@ mod tests {
     }
 
     #[test]
-    fn rex_names_a_session_whose_folder_gives_no_usable_label() {
-        assert_eq!(session_label(Path::new("/tmp/--flag")).unwrap(), "flag");
-        assert_eq!(session_label(Path::new("/tmp/--")), None);
-        assert_eq!(session_label(Path::new("/")), None);
+    fn a_tab_beside_another_is_labeled_after_its_folder_and_leaves_the_selection() {
+        assert_eq!(
+            arguments(&new_tab_command(
+                Path::new("rex"),
+                "session:1",
+                Path::new("/Users/me/My Project")
+            )),
+            [
+                "window",
+                "new",
+                "-s",
+                "session:1",
+                "My Project",
+                "-c",
+                "/Users/me/My Project",
+                "--focus=false",
+                "--json"
+            ]
+        );
+    }
+
+    #[test]
+    fn rex_names_a_session_or_tab_whose_folder_gives_no_usable_label() {
+        assert_eq!(folder_label(Path::new("/tmp/--flag")).unwrap(), "flag");
+        assert_eq!(folder_label(Path::new("/tmp/--")), None);
+        assert_eq!(folder_label(Path::new("/")), None);
         assert_eq!(
             arguments(&new_session_command(Path::new("rex"), Path::new("/"))),
             ["new", "-c", "/", "--json"]
+        );
+        assert_eq!(
+            arguments(&new_tab_command(
+                Path::new("rex"),
+                "session:1",
+                Path::new("/")
+            )),
+            [
+                "window",
+                "new",
+                "-s",
+                "session:1",
+                "-c",
+                "/",
+                "--focus=false",
+                "--json"
+            ]
         );
     }
 
@@ -300,9 +384,83 @@ mod tests {
     fn a_new_sessions_first_terminal_is_read_from_its_reply() {
         let reply = r#"{"session_id":"session:1","initial_windows":[
             {"window_id":"window:1","block_ids":["block:1","block:2"],"revision":1}]}"#;
-        assert_eq!(first_block(reply).unwrap(), "block:1");
-        assert!(first_block(r#"{"initial_windows":[]}"#).is_err());
-        assert!(first_block("not json").is_err());
+        assert_eq!(new_session_block(reply).unwrap(), "block:1");
+        assert!(new_session_block(r#"{"initial_windows":[]}"#).is_err());
+        assert!(new_session_block("not json").is_err());
+    }
+
+    #[test]
+    fn a_new_tabs_first_terminal_is_read_from_its_reply() {
+        let reply = r#"{"window_id":"window:1","block_ids":["block:1","block:2"],"revision":3}"#;
+        assert_eq!(new_tab_block(reply).unwrap(), "block:1");
+        assert!(new_tab_block(r#"{"window_id":"window:1","block_ids":[],"revision":3}"#).is_err());
+        assert!(new_tab_block(r#"{"window_id":null,"block_ids":null,"revision":3}"#).is_err());
+        assert!(new_tab_block("not json").is_err());
+    }
+
+    // Session N holds block N.
+    const REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$0.log"
+case $1 in
+  ls) echo '{"sessions":[{"session_id":"session:1"},{"session_id":"session:2"}]}' ;;
+  block) echo "{\"blocks\":[{\"block_id\":\"block:${4#session:}\"}]}" ;;
+  window) echo '{"window_id":"window:3","block_ids":["block:3"],"revision":4}' ;;
+  new) echo '{"session_id":"session:3","initial_windows":[{"window_id":"window:4","block_ids":["block:4"]}]}' ;;
+esac
+"#;
+
+    fn rex_calls(open: impl FnOnce(&Path)) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let rex = folder.path().join("rex");
+        std::fs::write(&rex, REX).unwrap();
+        std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        open(&rex);
+        std::fs::read_to_string(folder.path().join("rex.log"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_tab_reopens_beside_its_old_one_in_the_rex_session_holding_it() {
+        let calls = rex_calls(|rex| {
+            open_in(rex, Path::new("/me/app"), "resume", Some("block:2")).unwrap();
+        });
+        assert_eq!(
+            calls,
+            [
+                "ls --json",
+                "block ls -s session:1 --json",
+                "block ls -s session:2 --json",
+                "window new -s session:2 app -c /me/app --focus=false --json",
+                "send -b block:3 resume",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tab_gets_a_rex_session_of_its_own_when_none_holds_its_old_one() {
+        let calls = rex_calls(|rex| {
+            open_in(rex, Path::new("/me/app"), "resume", Some("block:9")).unwrap();
+        });
+        assert_eq!(
+            calls,
+            [
+                "ls --json",
+                "block ls -s session:1 --json",
+                "block ls -s session:2 --json",
+                "new app -c /me/app --json",
+                "send -b block:4 resume",
+            ]
+        );
+        let calls = rex_calls(|rex| open_in(rex, Path::new("/me/app"), "resume", None).unwrap());
+        assert_eq!(
+            calls,
+            ["new app -c /me/app --json", "send -b block:4 resume"]
+        );
     }
 
     #[test]

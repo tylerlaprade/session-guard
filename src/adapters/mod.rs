@@ -15,8 +15,9 @@ use std::path::Path;
 /// Whether a tab the daemon opens takes the selection in its window. A
 /// restored tab does, so it can be watched opening; a spawned session's tab
 /// opened after a lockout keeps the tab in front, as it would have opened at
-/// once. Only Ghostty can keep it; in the other terminals the new tab or
-/// window always takes it.
+/// once. Only Ghostty can keep it, and Rex always keeps it for a tab opened
+/// beside another; in the other terminals the new tab or window always takes
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selection {
     Take,
@@ -24,7 +25,15 @@ pub enum Selection {
 }
 
 pub trait TerminalAdapter {
-    fn open_tab(&self, directory: &Path, command: &str, selection: Selection) -> Result<()>;
+    /// `beside` is the tab the session last ran in, as a terminal that names
+    /// its tabs names it, so the new tab can open among that tab's neighbors.
+    fn open_tab(
+        &self,
+        directory: &Path,
+        command: &str,
+        selection: Selection,
+        beside: Option<&str>,
+    ) -> Result<()>;
     fn is_running(&self) -> bool;
     fn launch(&self) -> Result<()>;
     /// Whether every tab asked for so far has been added or never will be:

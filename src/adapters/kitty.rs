@@ -7,7 +7,13 @@ use std::process::Command;
 pub struct Kitty;
 
 impl TerminalAdapter for Kitty {
-    fn open_tab(&self, directory: &Path, command: &str, _selection: Selection) -> Result<()> {
+    fn open_tab(
+        &self,
+        directory: &Path,
+        command: &str,
+        _selection: Selection,
+        _beside: Option<&str>,
+    ) -> Result<()> {
         let mut process = Command::new("kitty");
         process.args(["@", "launch", "--type=tab", "--cwd"]);
         process.arg(directory);

@@ -7,7 +7,13 @@ use std::process::Command;
 pub struct Alacritty;
 
 impl TerminalAdapter for Alacritty {
-    fn open_tab(&self, directory: &Path, command: &str, _selection: Selection) -> Result<()> {
+    fn open_tab(
+        &self,
+        directory: &Path,
+        command: &str,
+        _selection: Selection,
+        _beside: Option<&str>,
+    ) -> Result<()> {
         let mut process = Command::new("alacritty");
         process.arg("--working-directory");
         process.arg(directory);

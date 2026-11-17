@@ -23,7 +23,7 @@ Supported terminal values:
 | `kitty` | Uses `kitty @ launch --type=tab`. |
 | `wezterm` | Uses `wezterm cli spawn`. |
 | `alacritty` | Alacritty has no tab control API, so restores open new windows. |
-| `rex` | Types the restore into the tab Rex brought back after the crash, or else opens a Rex session labeled after the folder with `rex new`. Needs no window, so a Screen Time lockout or a locked screen does not hold it. `rex` comes from PATH, or else from the app LaunchServices knows by its bundle id. |
+| `rex` | Types the restore into the tab Rex brought back after the crash. When that tab is busy, opens a new tab beside it in the Rex session that holds it, with `rex window new`; a session never seen in a Rex tab gets a Rex session of its own, labeled after the folder, with `rex new`. Needs no window, so a Screen Time lockout or a locked screen does not hold it. `rex` comes from PATH, or else from the app LaunchServices knows by its bundle id. |
 
 ## Commands
 
@@ -381,7 +381,8 @@ itself, so a late tab and its retry never show one session twice.
 A restored session's tab takes the selection when it opens, so restores can be
 watched. A handed-off session's tab keeps the tab in front selected, as the
 spawn would have if it had opened its tab at once. Only Ghostty can keep the
-selection; in the other terminals the new tab or window takes it.
+selection, and Rex always keeps it for a tab opened beside a busy one; in the
+other terminals the new tab or window takes it.
 
 ### Locked screen
 
@@ -514,9 +515,11 @@ When the server starts again it brings back its saved sessions, with the same
 block ids and a fresh shell in each. Registration therefore records `REX_BLOCK`
 from the tool's environment. A restore types into that block once its login
 shell is in the foreground, so the session returns to its own pane and no empty
-copy is left beside it. A block still busy after five seconds gets a new
-session instead. So does a tool whose environment the kernel hides, as it does
-for programs Apple ships.
+copy is left beside it. A block still busy after five seconds gets a new tab
+(a Rex window) beside it instead, in the Rex session that holds the block, and
+that tab leaves the selection alone, since someone may be using the busy one.
+A tool whose environment the kernel hides, as it does for programs Apple
+ships, names no block, so it gets a Rex session of its own.
 
 A block the running server no longer has was closed, because the server brings
 every block back after a crash, so its session retires instead of reopening.
