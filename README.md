@@ -23,7 +23,7 @@ Supported terminal values:
 | `kitty` | Uses `kitty @ launch --type=tab`. |
 | `wezterm` | Uses `wezterm cli spawn`. |
 | `alacritty` | Alacritty has no tab control API, so restores open new windows. |
-| `rex` | Types the restore into the tab Rex brought back after the crash. When that tab is busy, opens a new tab beside it in the Rex session that holds it, with `rex window new`; a session never seen in a Rex tab gets a Rex session of its own, labeled after the folder, with `rex new`. Needs no window, so a Screen Time lockout or a locked screen does not hold it. `rex` comes from PATH, or else from the app LaunchServices knows by its bundle id. |
+| `rex` | Types the restore into the tab Rex brought back after the crash. When that tab is busy, opens a new tab beside it in the Rex session that holds it, with `rex window new`; a session never seen in a Rex tab gets a Rex session of its own, labeled after the folder, with `rex new`. Needs no window, so a Screen Time lockout or a locked screen does not hold it. `rex` comes from PATH, or else from the app LaunchServices knows by its bundle id, which each session-guard process asks once and again only if that file goes away. |
 
 ## Commands
 
@@ -220,7 +220,8 @@ the daemon types the session's `session-guard launch` into that shell's own tab,
 found by its tty, when the shell sits idle at its prompt; a shell the user has
 already put to other work is released like a closed tab. Typing into a tab
 needs Ghostty's scripting or Rex's `send`. Other terminals release the record as
-before.
+before. A terminal that fails to answer, as a command that times out does,
+leaves the session waiting for the next pass, five seconds later.
 
 A restored tab's launcher handles the same death itself. When the tool is
 killed by a signal that only memory pressure, a crash, or `kill -9` sends

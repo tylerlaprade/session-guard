@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,12 +22,34 @@ const ERASE_LINE: char = '\u{15}';
 
 pub struct Rex;
 
+static FOUND_IN_APP: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 /// The `rex` command: on PATH inside Rex's own terminals, and otherwise only
 /// inside the app, which `LaunchServices` finds under whatever name it has.
 pub fn executable() -> Result<PathBuf> {
     if process::command_exists("rex") {
         return Ok(PathBuf::from("rex"));
     }
+    remembered(&FOUND_IN_APP, find_in_app)
+}
+
+/// Asking `LaunchServices` takes an `AppleScript` call, which a swapping Mac can
+/// take seconds to answer, so a process asks once and asks again only after
+/// the file it was told about is gone. A failed answer is never kept.
+fn remembered(
+    found: &Mutex<Option<PathBuf>>,
+    find: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(rex) = found.as_ref().filter(|rex| rex.is_file()) {
+        return Ok(rex.clone());
+    }
+    let rex = find()?;
+    *found = Some(rex.clone());
+    Ok(rex)
+}
+
+fn find_in_app() -> Result<PathBuf> {
     let bundle_id = TerminalKind::Rex.bundle_id();
     let mut osa = Command::new("osascript");
     osa.args(["-e", include_str!("rex_app_path.applescript"), bundle_id]);
@@ -378,6 +401,36 @@ mod tests {
         std::fs::write(macos.join("rex"), "").unwrap();
         assert_eq!(bundled_executable(app.path()), Some(macos.join("rex")));
         assert_eq!(bundled_executable(Path::new("")), None);
+    }
+
+    #[test]
+    fn the_app_is_asked_for_rex_once_until_the_file_it_named_is_gone() {
+        let folder = tempfile::tempdir().unwrap();
+        let rex = folder.path().join("rex");
+        std::fs::write(&rex, "").unwrap();
+        let asked = std::cell::Cell::new(0);
+        let find = || {
+            asked.set(asked.get() + 1);
+            Ok(rex.clone())
+        };
+        let found = Mutex::new(None);
+        assert_eq!(remembered(&found, find).unwrap(), rex);
+        assert_eq!(remembered(&found, find).unwrap(), rex);
+        assert_eq!(asked.get(), 1);
+
+        std::fs::remove_file(&rex).unwrap();
+        assert_eq!(remembered(&found, find).unwrap(), rex);
+        assert_eq!(asked.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_search_for_rex_is_asked_again_next_time() {
+        let folder = tempfile::tempdir().unwrap();
+        let rex = folder.path().join("rex");
+        std::fs::write(&rex, "").unwrap();
+        let found = Mutex::new(None);
+        assert!(remembered(&found, || anyhow::bail!("finding the Rex app timed out")).is_err());
+        assert_eq!(remembered(&found, || Ok(rex.clone())).unwrap(), rex);
     }
 
     #[test]

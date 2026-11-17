@@ -1481,23 +1481,23 @@ fn reopen_in_living_tabs(processes: &ProcessSnapshot) -> Result<Vec<SessionRecor
             continue;
         }
         let adapter = adapters.entry(kind).or_insert_with(|| adapter_for(kind));
-        let in_tab = session
+        let Some(tty) = session
             .shell_pid
             .filter(|shell| processes.in_foreground(*shell))
             .and_then(|shell| processes.tty(shell))
-            .map(|tty| {
-                let command = launch_command(&session.session_id)?;
-                Ok::<_, anyhow::Error>(
-                    run_in_session_tab(adapter.as_ref(), &session, &command)? == NamedTab::Ran
-                        || adapter.run_in_tab(tty, &command)?,
-                )
-            })
-            .transpose()?
-            .unwrap_or(false);
-        if in_tab && wait_for_restore_owner(&path, &session.session_id).is_ok() {
-            reopened.push(session);
-        } else {
+        else {
             released.push(session.session_id);
+            continue;
+        };
+        match retype_in_tab(adapter.as_ref(), &session, tty, || {
+            wait_for_restore_owner(&path, &session.session_id).is_ok()
+        }) {
+            Retype::Reopened => reopened.push(session),
+            Retype::Released => released.push(session.session_id),
+            Retype::Retry(error) => log_line(&format!(
+                "could not type the restore into the tab it crashed in, trying again: {} {}: {error}",
+                session.tool, session.session_id
+            ))?,
         }
     }
     if !released.is_empty() {
@@ -1511,6 +1511,35 @@ fn reopen_in_living_tabs(processes: &ProcessSnapshot) -> Result<Vec<SessionRecor
         })?;
     }
     Ok(reopened)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Retype {
+    Reopened,
+    /// The tab is busy or gone, or its terminal cannot type into it.
+    Released,
+    /// The terminal failed to answer, as a command that timed out does, so the
+    /// session stays pending for the next pass.
+    Retry(String),
+}
+
+fn retype_in_tab(
+    adapter: &dyn TerminalAdapter,
+    session: &SessionRecord,
+    tty: &str,
+    came_up: impl FnOnce() -> bool,
+) -> Retype {
+    let typed = launch_command(&session.session_id).and_then(|command| {
+        Ok(
+            run_in_session_tab(adapter, session, &command)? == NamedTab::Ran
+                || adapter.run_in_tab(tty, &command)?,
+        )
+    });
+    match typed {
+        Ok(true) if came_up() => Retype::Reopened,
+        Ok(_) => Retype::Released,
+        Err(error) => Retype::Retry(format!("{error:#}")),
+    }
 }
 
 fn crashed_in_living_tab(
@@ -2011,6 +2040,67 @@ mod tests {
                 .borrow_mut()
                 .push(format!("return focus to {}", focus.app.as_deref().unwrap()));
             Ok(())
+        }
+    }
+
+    struct UnansweringTerminal;
+
+    impl TerminalAdapter for UnansweringTerminal {
+        fn open_tab(
+            &self,
+            _: &std::path::Path,
+            _: &str,
+            _: Selection,
+            _: Option<&str>,
+        ) -> Result<()> {
+            anyhow::bail!("opening a tab timed out")
+        }
+        fn is_running(&self) -> bool {
+            true
+        }
+        fn launch(&self) -> Result<()> {
+            Ok(())
+        }
+        fn run_in_named_tab(&self, _: &str, _: &str) -> Result<NamedTab> {
+            anyhow::bail!("finding the Rex app timed out after 5s")
+        }
+    }
+
+    #[test]
+    fn a_retype_the_terminal_failed_to_answer_waits_for_the_next_pass() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.terminal_tab = Some(rex_tab());
+        assert_eq!(
+            retype_in_tab(&UnansweringTerminal, &session, "ttys001", || true),
+            Retype::Retry("finding the Rex app timed out after 5s".to_string())
+        );
+    }
+
+    #[test]
+    fn a_retype_is_released_unless_its_tab_ran_it_and_the_session_came_up() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.terminal_tab = Some(rex_tab());
+        let ran = TabsStandIn {
+            named_tab: NamedTab::Ran,
+            ..TabsStandIn::default()
+        };
+        assert_eq!(
+            retype_in_tab(&ran, &session, "ttys001", || true),
+            Retype::Reopened
+        );
+        assert_eq!(
+            retype_in_tab(&ran, &session, "ttys001", || false),
+            Retype::Released
+        );
+        for named_tab in [NamedTab::Unavailable, NamedTab::Closed] {
+            let terminal = TabsStandIn {
+                named_tab,
+                ..TabsStandIn::default()
+            };
+            assert_eq!(
+                retype_in_tab(&terminal, &session, "ttys001", || true),
+                Retype::Released
+            );
         }
     }
 
