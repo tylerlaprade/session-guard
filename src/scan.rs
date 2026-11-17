@@ -208,13 +208,9 @@ pub(crate) fn is_claude_session_process(process: &ProcInfo) -> bool {
     let _binary = parts.next();
     let first = parts.next();
     let second = parts.next();
-    if matches!(first, Some("--bg-pty-host" | "--bg-spare"))
-        || (first == Some("daemon") && second == Some("run"))
-    {
-        return false;
-    }
-
-    true
+    let is_background_helper = matches!(first, Some("--bg-pty-host" | "--bg-spare"));
+    let is_daemon = first == Some("daemon") && second == Some("run");
+    !is_background_helper && !is_daemon
 }
 
 /// Conservative Claude CLI/process recognition for destructive cleanup.

@@ -1,3 +1,5 @@
+mod common;
+
 use chrono::{Duration as Age, Utc};
 use serde_json::{Value, json};
 use std::ffi::{CString, c_char, c_int};
@@ -170,13 +172,7 @@ impl Drop for Screen {
 }
 
 fn stand_in_terminal_path() -> PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/alacritty")
+    common::example("alacritty")
 }
 
 // The terminal is the oldest process with its name, so two stand-ins running at

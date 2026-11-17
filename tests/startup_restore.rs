@@ -1,3 +1,5 @@
+mod common;
+
 use chrono::{Duration as Age, Utc};
 use serde_json::{Value, json};
 use std::fs;
@@ -167,13 +169,7 @@ else:
             .spawn()
             .unwrap()
     };
-    let stand_in = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/alacritty");
+    let stand_in = common::example("alacritty");
     let _one_terminal = ONE_TERMINAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -14,13 +16,7 @@ const STARTUP: &str = r"if [[ $ZSH_EVAL_CONTEXT == file && -o login && -o intera
 fi";
 
 fn stand_in_ghostty_path() -> std::path::PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/ghostty")
+    common::example("ghostty")
 }
 
 struct Terminal {
