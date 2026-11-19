@@ -37,6 +37,8 @@ pub struct RestoreSummary {
     pub retired: usize,
     pub failed: usize,
     pub errors: Vec<String>,
+    /// The sessions that failed, as a person would name them.
+    pub failed_names: Vec<String>,
     /// Sessions left unopened because the terminal could not take a tab yet.
     pub held: Vec<SessionRecord>,
     pub held_reason: Option<String>,
@@ -178,6 +180,8 @@ pub fn run() -> Result<()> {
     flag::register(SIGUSR2, Arc::clone(&restore_all_requested))?;
 
     let summary = restore_once(RestoreMode::Startup)?;
+
+    announce_failures(&summary);
     log_line(&summary.message())?;
     for error in &summary.errors {
         log_line(error)?;
@@ -208,6 +212,7 @@ pub fn run() -> Result<()> {
 
         if restore_requested.swap(false, Ordering::Relaxed) {
             let summary = restore_once(RestoreMode::Manual)?;
+            announce_failures(&summary);
             log_line(&format!("manual restore: {}", summary.message()))?;
             for error in &summary.errors {
                 log_line(error)?;
@@ -216,6 +221,7 @@ pub fn run() -> Result<()> {
         }
         if restore_all_requested.swap(false, Ordering::Relaxed) {
             let summary = restore_once(RestoreMode::All)?;
+            announce_failures(&summary);
             log_line(&format!("manual restore --all: {}", summary.message()))?;
             for error in &summary.errors {
                 log_line(error)?;
@@ -234,6 +240,7 @@ pub fn run() -> Result<()> {
                 || (resumes_in_background(&now) && *seen != now)
             {
                 let summary = restore_once(RestoreMode::Held)?;
+                announce_failures(&summary);
                 log_line(&format!("held restore: {}", summary.message()))?;
                 for error in &summary.errors {
                     log_line(error)?;
@@ -291,6 +298,7 @@ pub fn run() -> Result<()> {
             }
             if terminal_returned_with_victims(&mut terminal_watches, &processes, tab_offered)? {
                 let summary = restore_once(RestoreMode::Manual)?;
+                announce_failures(&summary);
                 log_line(&format!("terminal returned: {}", summary.message()))?;
                 for error in &summary.errors {
                     log_line(error)?;
@@ -679,6 +687,9 @@ fn open_restores_in(
     attempted: &mut Vec<String>,
     path: &std::path::Path,
 ) -> Result<()> {
+    if !kind.adds_tabs_to_windows() {
+        return open_restores_at_once(kind, to_open, summary, attempted);
+    }
     let adapter = adapter_for(kind);
     let mut focus = FocusReturn::default();
     let mut to_open = to_open.into_iter();
@@ -692,6 +703,7 @@ fn open_restores_in(
                 Err(error) => {
                     for session in std::iter::once(session).chain(to_open) {
                         summary.failed += 1;
+                        summary.failed_names.push(display_name(&session));
                         summary.errors.push(format!(
                             "failed to restore {}: could not launch {kind}: {error:#}",
                             session.session_id
@@ -763,28 +775,136 @@ fn open_restores_in(
             summary.retired += 1;
             continue;
         }
-        match reopened.and_then(|_| wait_for_restore_owner(path, &session.session_id)) {
-            Ok(()) => {
-                log_line(&format!(
-                    "confirmed restored owner: {} {}",
-                    session.tool, session.session_id
-                ))?;
-                summary.record_restore(session.tool);
-            }
-            Err(error) => {
-                summary.failed += 1;
-                summary.errors.push(format!(
-                    "failed to restore {} in {}: {error:#}",
-                    session.session_id,
-                    session.directory.display()
-                ));
-            }
-        }
+        let owned = reopened.and_then(|_| wait_for_restore_owner(path, &session.session_id));
+        record_owner(summary, &session, owned)?;
     }
     if let Err(error) = focus.give_back(adapter.as_ref()) {
         log_line(&format!(
             "could not give the focus back after a restore: {error:#}"
         ))?;
+    }
+    Ok(())
+}
+
+/// A terminal without windows types each restore into a tab of its own, with no
+/// focus to share and no Screen Time lockout, so every restore is typed at once
+/// and their owners are awaited together. A terminal that is not up yet is
+/// started, and its sessions wait for its return if it does not come up.
+fn open_restores_at_once(
+    kind: TerminalKind,
+    to_open: Vec<SessionRecord>,
+    summary: &mut RestoreSummary,
+    attempted: &mut Vec<String>,
+) -> Result<()> {
+    let path = paths::sessions_file()?;
+    let adapter = adapter_for(kind);
+    if !adapter.is_running()
+        && let Err(error) = launch_terminal(kind)
+    {
+        log_line(&format!("could not start {kind} for a restore: {error:#}"))?;
+        summary.held.extend(to_open);
+        summary.held_reason = Some(format!("{kind} is not running"));
+        return Ok(());
+    }
+    attempted.extend(to_open.iter().map(|session| session.session_id.clone()));
+    let reopened: Vec<(SessionRecord, Result<Reopened>)> = thread::scope(|scope| {
+        let typing: Vec<_> = to_open
+            .into_iter()
+            .map(|session| {
+                scope.spawn(move || {
+                    let reopened = open_restored_tab(adapter_for(kind).as_ref(), &session);
+                    (session, reopened)
+                })
+            })
+            .collect();
+        typing
+            .into_iter()
+            .filter_map(|typed| typed.join().ok())
+            .collect()
+    });
+    let mut awaiting = Vec::new();
+    for (session, reopened) in reopened {
+        match reopened {
+            Ok(Reopened::TabClosed) => {
+                retire_closed_tab(&path, &session)?;
+                log_line(&format!(
+                    "retired a session whose tab was closed in {kind}: {} {}",
+                    session.tool, session.session_id
+                ))?;
+                summary.retired += 1;
+            }
+            Ok(Reopened::InATab) => awaiting.push(session),
+            Err(error) => record_owner(summary, &session, Err(error))?,
+        }
+    }
+    for session in awaiting {
+        let owned = wait_for_restore_owner(&path, &session.session_id);
+        record_owner(summary, &session, owned)?;
+    }
+    Ok(())
+}
+
+fn display_name(session: &SessionRecord) -> String {
+    session.session_name.clone().unwrap_or_else(|| {
+        session.directory.file_name().map_or_else(
+            || session.directory.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    })
+}
+
+/// A restore that worked shows itself in the tabs it fills, but one that failed
+/// leaves a tab that looks lost, so only failures are announced.
+fn announce_failures(summary: &RestoreSummary) {
+    if summary.failed_names.is_empty() {
+        return;
+    }
+    let message = format!(
+        "Could not resume {}: {}",
+        if summary.failed_names.len() == 1 {
+            "a session"
+        } else {
+            "sessions"
+        },
+        summary.failed_names.join(", ")
+    );
+    let _ = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "display notification (item 1 of argv) with title \"session-guard\"",
+            "-e",
+            "end run",
+            &message,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+fn record_owner(
+    summary: &mut RestoreSummary,
+    session: &SessionRecord,
+    owned: Result<()>,
+) -> Result<()> {
+    match owned {
+        Ok(()) => {
+            log_line(&format!(
+                "confirmed restored owner: {} {}",
+                session.tool, session.session_id
+            ))?;
+            summary.record_restore(session.tool);
+        }
+        Err(error) => {
+            summary.failed += 1;
+            summary.failed_names.push(display_name(session));
+            summary.errors.push(format!(
+                "failed to restore {} in {}: {error:#}",
+                session.session_id,
+                session.directory.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -1361,7 +1481,7 @@ fn terminal_returned_with_victims(
         if let Some(started_at) = watch.relaunched(
             &processes.instance_starts(terminal.process_name()),
             now.naive_utc(),
-            tab_offered && configured == Some(terminal),
+            terminal.ready_when_it_answers() || (tab_offered && configured == Some(terminal)),
         ) {
             log_line(&format!(
                 "terminal relaunch detected: {terminal}, started at {started_at} UTC"
@@ -2786,6 +2906,7 @@ mod tests {
             retired: 2,
             failed: 0,
             errors: vec![],
+            failed_names: vec![],
             held: vec![],
             held_reason: None,
             backgrounded: 0,

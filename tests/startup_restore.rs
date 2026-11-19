@@ -118,7 +118,9 @@ fn run_startup(
     fs::write(&script, r#"#!/usr/bin/env python3
 import os, pathlib, subprocess, sys
 script = sys.argv[sys.argv.index("-e") + 1]
-if "is running" in script:
+if "display notification" in " ".join(sys.argv):
+    pass
+elif "is running" in script:
     print("true")
 elif "working directory of focused terminal" in script:
     print("/tmp")
@@ -150,6 +152,9 @@ else:
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CODEX_HOME", home.join(".codex"))
             .env("SHELL", "/bin/sh")
+            .env_remove("REX_SERVER")
+            .env_remove("REX_SESSION")
+            .env_remove("REX_BLOCK")
             .env("TEST_BINARY", env!("CARGO_BIN_EXE_session-guard"))
             .env("TEST_SESSION", session)
             .env(

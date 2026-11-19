@@ -259,6 +259,24 @@ impl TerminalKind {
     }
 }
 
+impl TerminalKind {
+    /// Whether the terminal answers only once it has brought its tabs back, so
+    /// a restore can start the moment it returns instead of letting it settle.
+    /// Rex's server restores its saved sessions before it answers.
+    #[must_use]
+    pub fn ready_when_it_answers(self) -> bool {
+        match self {
+            Self::Rex => true,
+            Self::Ghostty
+            | Self::Iterm2
+            | Self::Terminal
+            | Self::Kitty
+            | Self::Wezterm
+            | Self::Alacritty => false,
+        }
+    }
+}
+
 impl std::str::FromStr for TerminalKind {
     type Err = anyhow::Error;
 

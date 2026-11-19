@@ -555,10 +555,19 @@ A `rex` command can start a missing server, but session-guard never lets one:
 the server would take session-guard as the app responsible for it, and macOS
 would then ask for privacy permissions in session-guard's name for everything
 run in any Rex tab. Every `rex` command session-guard runs passes
-`--autostart=false`, and when the server is down, the daemon opens the Rex app
-in the background, which starts the server as its own. It does this after a
-reboot and after a server crash that did not reboot the Mac (see Restarting a
-crashed terminal).
+`--autostart=false`. When the server is down, the daemon starts the launchd job
+the Rex app runs its server as, which brings it back in seconds under Rex's own
+name. Before the app has run since login there is no such job, so the daemon
+opens the app in the background instead, which starts the server once the app
+is up. It does this after a reboot and after a server crash that did not reboot
+the Mac (see Restarting a crashed terminal).
+
+Rex's server answers only once it has brought back its saved sessions, so a
+restore starts the moment the server answers, with no settling time. Each Rex
+tab gets its own restore with no window focus to share, so every tab's resume
+is typed at once and their sessions start together. If any session fails to
+resume, a macOS notification names it; a restore that works shows itself in the
+tabs it fills.
 
 ### Restarting a crashed terminal
 

@@ -167,6 +167,52 @@ fn open_in(
     send(rex, &block, &format!("{command}\n"))
 }
 
+/// A server that has just started answers only once it has brought back its
+/// saved sessions, so a restore that begins the moment the server process
+/// appears waits for that answer rather than for a fixed settling time.
+fn wait_for_server(rex: &Path) -> Result<()> {
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    while !server_answers(rex) {
+        if Instant::now() >= deadline {
+            anyhow::bail!("Rex's server did not answer");
+        }
+        thread::sleep(PROMPT_POLL);
+    }
+    Ok(())
+}
+
+fn server_answers(rex: &Path) -> bool {
+    rex_command(rex)
+        .args(["server", "status"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+const SERVER_JOB_PREFIX: &str = "com.superlogical.rex.server.";
+
+/// The launchd job the Rex app runs its local server as, when there is exactly
+/// one, as `gui/<uid>/<label>`.
+fn server_job() -> Result<Option<String>> {
+    let mut list = Command::new("launchctl");
+    list.arg("list");
+    let listed = run_capture_timeout(&mut list, "listing launchd jobs", COMMAND_TIMEOUT)?;
+    Ok(only_server_job(&listed).map(|label| {
+        let uid = unsafe { libc::getuid() };
+        format!("gui/{uid}/{label}")
+    }))
+}
+
+fn only_server_job(listed: &str) -> Option<&str> {
+    let mut jobs = listed
+        .lines()
+        .filter_map(|line| line.split('\t').nth(2))
+        .filter(|label| label.starts_with(SERVER_JOB_PREFIX));
+    let job = jobs.next()?;
+    jobs.next().is_none().then_some(job)
+}
+
 fn send(rex: &Path, block: &str, text: &str) -> Result<()> {
     let mut command = rex_command(rex);
     command.args(["send", "-b", block, text]);
@@ -289,26 +335,30 @@ impl TerminalAdapter for Rex {
         _selection: Selection,
         beside: Option<&TerminalTab>,
     ) -> Result<()> {
-        open_in(&executable()?, directory, command, beside)
+        let rex = executable()?;
+        wait_for_server(&rex)?;
+        open_in(&rex, directory, command, beside)
     }
 
     fn is_running(&self) -> bool {
-        executable().is_ok_and(|rex| {
-            rex_command(&rex)
-                .args(["server", "status"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        })
+        executable().is_ok_and(|rex| server_answers(&rex))
     }
 
-    // The app starts a missing server, which brings back its saved sessions
-    // before it answers and still exits once they are all closed.
+    // The app runs its server as a launchd job of its own, which launchd can
+    // start again at once. Without that job, as before the app's first start
+    // since login, the app starts the server, but only once it is up, which
+    // can take minutes on a busy Mac. Either way the server brings back its
+    // saved sessions before it answers.
     fn launch(&self) -> Result<()> {
-        let mut open = Command::new("open");
-        open.args(["-g", "-b", TerminalKind::Rex.bundle_id()]);
-        run_capture_timeout(&mut open, "opening the Rex app", COMMAND_TIMEOUT)?;
+        if let Some(job) = server_job()? {
+            let mut kickstart = Command::new("launchctl");
+            kickstart.arg("kickstart").arg(&job);
+            run_capture_timeout(&mut kickstart, "starting Rex's server job", COMMAND_TIMEOUT)?;
+        } else {
+            let mut open = Command::new("open");
+            open.args(["-g", "-b", TerminalKind::Rex.bundle_id()]);
+            run_capture_timeout(&mut open, "opening the Rex app", COMMAND_TIMEOUT)?;
+        }
         let deadline = Instant::now() + COMMAND_TIMEOUT;
         while !self.is_running() {
             if Instant::now() >= deadline {
@@ -323,6 +373,7 @@ impl TerminalAdapter for Rex {
     // its startup files looks like work at the prompt, so a busy one gets a moment.
     fn run_in_named_tab(&self, tab: &str, command: &str) -> Result<NamedTab> {
         let rex = executable()?;
+        wait_for_server(&rex)?;
         if session_holding(&rex, tab)?.is_none() {
             return Ok(NamedTab::Closed);
         }
@@ -512,6 +563,7 @@ mod tests {
 if [ "$1" = --autostart=false ]; then shift; else echo "could start a server" >> "$0.log"; fi
 printf '%s\n' "$*" >> "$0.log"
 case $1 in
+  server) ;;
   ls) echo '{"sessions":[{"session_id":"session:1"},{"session_id":"session:2"}]}' ;;
   block) echo "{\"blocks\":[{\"block_id\":\"block:${4#session:}\"}]}" ;;
   window) echo '{"window_id":"window:3","block_ids":["block:3"],"revision":4}' ;;
@@ -540,6 +592,21 @@ esac
             id: id.to_string(),
             holder: holder.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn the_server_job_is_found_only_when_it_is_the_one() {
+        let one = "PID\tStatus\tLabel\n-\t0\tcom.apple.thing\n25354\t0\tcom.superlogical.rex.server.996d\n";
+        assert_eq!(
+            only_server_job(one),
+            Some("com.superlogical.rex.server.996d")
+        );
+        let two = format!("{one}-\t0\tcom.superlogical.rex.server.aaaa\n");
+        assert_eq!(only_server_job(&two), None);
+        assert_eq!(
+            only_server_job("PID\tStatus\tLabel\n-\t0\tcom.apple.thing\n"),
+            None
+        );
     }
 
     #[test]
