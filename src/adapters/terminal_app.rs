@@ -12,7 +12,7 @@ impl TerminalAdapter for TerminalApp {
         directory: &Path,
         command: &str,
         _selection: Selection,
-        _beside: Option<&str>,
+        _beside: Option<&super::TerminalTab>,
     ) -> Result<()> {
         let line = shell_line(directory, command);
         let mut command = Command::new("osascript");

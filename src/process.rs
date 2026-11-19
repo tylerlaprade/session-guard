@@ -178,17 +178,38 @@ pub fn process_arguments(pid: i32) -> Option<Vec<String>> {
     parse_process_arguments(&process_arguments_buffer(pid)?)
 }
 
-#[cfg(target_os = "macos")]
 pub fn process_environment_variable(pid: i32, name: &str) -> Option<String> {
-    parse_process_environment_variable(&process_arguments_buffer(pid)?, name)
+    let [value] = process_environment_variables(pid, [name]);
+    value
+}
+
+/// Several variables from one read of a process's environment.
+#[cfg(target_os = "macos")]
+pub fn process_environment_variables<const N: usize>(
+    pid: i32,
+    names: [&str; N],
+) -> [Option<String>; N] {
+    let buffer = process_arguments_buffer(pid);
+    names.map(|name| {
+        buffer
+            .as_deref()
+            .and_then(|buffer| parse_process_environment_variable(buffer, name))
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn process_environment_variable(pid: i32, name: &str) -> Option<String> {
-    std::fs::read(format!("/proc/{pid}/environ"))
-        .ok()?
-        .split(|byte| *byte == 0)
-        .find_map(|entry| environment_value(entry, name))
+pub fn process_environment_variables<const N: usize>(
+    pid: i32,
+    names: [&str; N],
+) -> [Option<String>; N] {
+    let environment = std::fs::read(format!("/proc/{pid}/environ")).ok();
+    names.map(|name| {
+        environment.as_deref().and_then(|environment| {
+            environment
+                .split(|byte| *byte == 0)
+                .find_map(|entry| environment_value(entry, name))
+        })
+    })
 }
 
 #[cfg(target_os = "macos")]

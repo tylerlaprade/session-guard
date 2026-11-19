@@ -12,7 +12,7 @@ impl TerminalAdapter for Kitty {
         directory: &Path,
         command: &str,
         _selection: Selection,
-        _beside: Option<&str>,
+        _beside: Option<&super::TerminalTab>,
     ) -> Result<()> {
         let mut process = Command::new("kitty");
         process.args(["@", "launch", "--type=tab", "--cwd"]);

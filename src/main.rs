@@ -195,6 +195,21 @@ impl TerminalKind {
         }
     }
 
+    /// The variable naming the group that holds a tab, for a terminal that
+    /// groups its tabs, so a tab it does not bring back can reopen in that group.
+    #[must_use]
+    pub fn holder_variable(self) -> Option<&'static str> {
+        match self {
+            Self::Rex => Some(adapters::rex::SESSION_VARIABLE),
+            Self::Ghostty
+            | Self::Iterm2
+            | Self::Terminal
+            | Self::Kitty
+            | Self::Wezterm
+            | Self::Alacritty => None,
+        }
+    }
+
     /// Whether `exit` was the terminal crashing, which the daemon answers by
     /// starting it again. SIGKILL never counts: it is as often the system
     /// reclaiming memory as anyone's kill -9, and a restart would bring back

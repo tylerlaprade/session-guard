@@ -12,7 +12,7 @@ impl TerminalAdapter for Alacritty {
         directory: &Path,
         command: &str,
         _selection: Selection,
-        _beside: Option<&str>,
+        _beside: Option<&super::TerminalTab>,
     ) -> Result<()> {
         let mut process = Command::new("alacritty");
         process.arg("--working-directory");

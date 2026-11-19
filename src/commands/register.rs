@@ -231,10 +231,14 @@ fn run_with_input(
             source,
         ),
     };
+    let launched_in = (hook_event.as_deref() == Some("SessionStart")
+        && !matches!(record.source.as_deref(), Some("clear" | "compact")))
+    .then(|| record.directory.clone());
     sessions::register(
         &paths::sessions_file()?,
         SessionRecord {
             background_tasks,
+            launched_in,
             ..record
         },
     )

@@ -116,6 +116,15 @@ pub struct SessionRecord {
     // back.
     #[serde(default)]
     pub terminal_tab: Option<crate::adapters::TerminalTab>,
+    // The folder the tool was last started or resumed in. Later hooks report
+    // the folder it has changed into since, and a session resumed somewhere
+    // new no longer matches where its transcript began.
+    #[serde(default)]
+    pub launched_in: Option<PathBuf>,
+    // A reboot took the session's tab down, so a tab the terminal did not bring
+    // back was not closed by anyone.
+    #[serde(default)]
+    pub tab_ended_by_reboot: bool,
     #[serde(flatten)]
     pub unknown_fields: UnknownFields,
 }
@@ -168,6 +177,8 @@ impl SessionRecord {
             command: None,
             tab_position: None,
             terminal_tab: pid.and_then(crate::adapters::terminal_tab),
+            launched_in: None,
+            tab_ended_by_reboot: false,
             unknown_fields: UnknownFields::new(),
         }
     }
@@ -210,6 +221,8 @@ impl SessionRecord {
             command: None,
             tab_position: None,
             terminal_tab: None,
+            launched_in: None,
+            tab_ended_by_reboot: false,
             unknown_fields: UnknownFields::new(),
         }
     }
@@ -390,6 +403,9 @@ pub fn register(path: &Path, mut record: SessionRecord) -> Result<()> {
             .find(|previous| previous.session_id == record.session_id)
         {
             record.tab_position = record.tab_position.or(previous.tab_position);
+            if record.launched_in.is_none() {
+                record.launched_in.clone_from(&previous.launched_in);
+            }
             record.attach_after_lockout = previous.attach_after_lockout;
             record.attach_keeps_selection = previous.attach_keeps_selection;
             record.attach_tab_pending = previous.attach_tab_pending;
@@ -558,6 +574,36 @@ mod tests {
         assert_eq!(stored[0]["future_field"], serde_json::json!({"kept": true}));
         assert_eq!(stored[0]["activity"]["future_activity_field"], 1);
         assert_eq!(stored[0]["background_tasks"][0]["future_task_field"], "x");
+    }
+
+    #[test]
+    fn a_later_registration_keeps_the_folder_the_session_was_started_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active-sessions.json");
+        let at = |directory: &str| {
+            SessionRecord::new(
+                crate::tool("claude"),
+                "abc".to_string(),
+                None,
+                None,
+                PathBuf::from(directory),
+                None,
+                None,
+                None,
+            )
+        };
+        register(
+            &path,
+            SessionRecord {
+                launched_in: Some(PathBuf::from("/code/app")),
+                ..at("/code/app")
+            },
+        )
+        .unwrap();
+        register(&path, at("/code/app/deeper")).unwrap();
+        let stored = read_sessions(&path).unwrap();
+        assert_eq!(stored[0].directory, PathBuf::from("/code/app/deeper"));
+        assert_eq!(stored[0].launched_in, Some(PathBuf::from("/code/app")));
     }
 
     #[test]

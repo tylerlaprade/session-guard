@@ -23,7 +23,7 @@ Supported terminal values:
 | `kitty` | Uses `kitty @ launch --type=tab`. |
 | `wezterm` | Uses `wezterm cli spawn`. |
 | `alacritty` | Alacritty has no tab control API, so restores open new windows. |
-| `rex` | Types the restore into the tab Rex brought back after the crash. When that tab is busy, opens a new tab beside it in the Rex session that holds it, with `rex window new`; a session never seen in a Rex tab gets a Rex session of its own, labeled after the folder, with `rex new`. Needs no window, so a Screen Time lockout or a locked screen does not hold it. `rex` comes from PATH, or else from the app LaunchServices knows by its bundle id, which each session-guard process asks once and again only if that file goes away. |
+| `rex` | Types the restore into the tab Rex brought back after the crash. When that tab is busy, opens a new tab beside it in the Rex session that holds it, with `rex window new`, and after a reboot that left the tab out, opens one in the Rex session that held it; a session never seen in a Rex tab gets a Rex session of its own, labeled after the folder, with `rex new`. Needs no window, so a Screen Time lockout or a locked screen does not hold it. `rex` comes from PATH, or else from the app LaunchServices knows by its bundle id, which each session-guard process asks once and again only if that file goes away. |
 
 ## Commands
 
@@ -75,11 +75,14 @@ programs the hooks run, `ps` and `tr`, live in `/bin` and `/usr/bin`, which
 even that minimal PATH includes. An update rewrites only session-guard's hook
 entries and keeps every other key in its place.
 
-A session reopens in the folder its transcript began in, which is the folder it
-was started in. Hooks report the folder a session has since changed into, but
-the start folder decides which project instructions the session loads. A
-session without a readable transcript reopens in the last folder its hooks
-reported.
+A session reopens in the folder it was last started or resumed in, which its
+`SessionStart` hook reports. Hooks report the folder a session has since changed
+into, but the start folder decides which project instructions the session loads.
+A record made before start folders were kept reopens where its transcript
+began. A start folder that has since been moved or deleted gives way to the
+next of these that still exists, and a session without either reopens in the
+last folder its hooks reported. A session whose folder is gone altogether is
+dropped, and the daemon log names it.
 
 OpenCode has no shell-command hooks. OpenCode 2 runs sessions on a shared
 background server, which cannot tell which tab shows a session, so
@@ -512,9 +515,11 @@ The server keeps running with the app closed, until a reboot or crash takes it
 down. A restored session runs at a normal shell, as in Ghostty, so its Rex
 session stays open when the tool exits.
 
-When the server starts again it brings back its saved sessions, with the same
-block ids and a fresh shell in each. Registration therefore records `REX_BLOCK`
-from the tool's environment. A restore types into that block once its login
+When the server starts again after a crash it brings back its saved sessions,
+with the same block ids and a fresh shell in each. After a reboot it can bring
+back the sessions with no blocks in them. Registration therefore records
+`REX_BLOCK` from the tool's environment, and `REX_SESSION`, the Rex session
+holding that block. A restore types into that block once its login
 shell is in the foreground, so the session returns to its own pane and no empty
 copy is left beside it. A block still busy after five seconds gets a new tab
 (a Rex window) beside it instead, in the Rex session that holds the block, and
@@ -524,6 +529,9 @@ ships, names no block, so it gets a Rex session of its own.
 
 A block the running server no longer has was closed, because the server brings
 every block back after a crash, so its session retires instead of reopening.
+A reboot is the exception: it took every tab down, so a session whose block did
+not come back reopens in a new tab in the Rex session that held the block, or
+in a Rex session of its own when Rex no longer has that one.
 This settles the one end the server's exit leaves in doubt. The server exits
 about ten seconds after its last session and its last client connection close,
 just when the daemon settles that session's end, so closing the last session

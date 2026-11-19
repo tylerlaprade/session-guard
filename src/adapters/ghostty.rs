@@ -65,7 +65,7 @@ impl TerminalAdapter for Ghostty {
         directory: &Path,
         command: &str,
         selection: Selection,
-        _beside: Option<&str>,
+        _beside: Option<&super::TerminalTab>,
     ) -> Result<()> {
         if crate::fresh_tab::fill(directory, command)? {
             return Ok(());

@@ -1,4 +1,4 @@
-use super::{NamedTab, Selection, TerminalAdapter, run_capture_timeout};
+use super::{NamedTab, Selection, TerminalAdapter, TerminalTab, run_capture_timeout};
 use crate::{TerminalKind, process};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -11,6 +11,11 @@ use std::time::{Duration, Instant};
 /// Names the block, Rex's terminal pane, in the environment of everything
 /// started in it. A block keeps its id when Rex brings it back after a crash.
 pub const BLOCK_VARIABLE: &str = "REX_BLOCK";
+
+/// Names the Rex session holding a block, in the environment of everything
+/// started in it. A session keeps its id when Rex brings it back after a
+/// reboot, though not its blocks.
+pub const SESSION_VARIABLE: &str = "REX_SESSION";
 
 // The first command after a reboot starts the server, which brings back every
 // saved session before it answers.
@@ -70,7 +75,7 @@ fn bundled_executable(app: &Path) -> Option<PathBuf> {
 fn rex_command(rex: &Path) -> Command {
     let mut command = Command::new(rex);
     // Inside a Rex terminal, a block in any other session counts as not found.
-    command.env_remove("REX_SESSION");
+    command.env_remove(SESSION_VARIABLE);
     command
 }
 
@@ -134,13 +139,16 @@ fn new_tab_block(reply: &str) -> Result<String> {
 }
 
 /// Opens a tab running `command` beside the block `beside` names, in the Rex
-/// session holding that block, or else in a Rex session of its own.
-fn open_in(rex: &Path, directory: &Path, command: &str, beside: Option<&str>) -> Result<()> {
-    let block = match beside
-        .map(|block| session_holding(rex, block))
-        .transpose()?
-        .flatten()
-    {
+/// session holding that block. A block Rex did not bring back reopens in the
+/// Rex session that held it if Rex still has that session, and otherwise the
+/// tab gets a Rex session of its own.
+fn open_in(
+    rex: &Path,
+    directory: &Path,
+    command: &str,
+    beside: Option<&TerminalTab>,
+) -> Result<()> {
+    let block = match beside.map(|tab| home_for(rex, tab)).transpose()?.flatten() {
         Some(session) => new_tab_block(&run_capture_timeout(
             &mut new_tab_command(rex, &session, directory),
             "opening a Rex tab",
@@ -203,10 +211,9 @@ struct ListedBlock {
     block_id: String,
 }
 
-/// The Rex session holding `block`, read from the server's listings so that
-/// only an answer, never a failure to get one, says a block is gone. A server
-/// this starts brings back its saved sessions before it answers.
-fn session_holding(rex: &Path, block: &str) -> Result<Option<String>> {
+/// The Rex sessions the server lists. A server this starts brings back its
+/// saved sessions before it answers.
+fn listed_sessions(rex: &Path) -> Result<Vec<String>> {
     let mut list = rex_command(rex);
     list.args(["ls", "--json"]);
     let sessions: SessionList = serde_json::from_str(&run_capture_timeout(
@@ -215,9 +222,20 @@ fn session_holding(rex: &Path, block: &str) -> Result<Option<String>> {
         COMMAND_TIMEOUT,
     )?)
     .context("Rex's session list is not readable")?;
-    for session in sessions.sessions {
+    Ok(sessions
+        .sessions
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect())
+}
+
+/// The Rex session among `sessions` holding `block`, read from the server's
+/// listings so that only an answer, never a failure to get one, says a block
+/// is gone.
+fn holding(rex: &Path, sessions: &[String], block: &str) -> Result<Option<String>> {
+    for session in sessions {
         let mut blocks = rex_command(rex);
-        blocks.args(["block", "ls", "-s", &session.session_id, "--json"]);
+        blocks.args(["block", "ls", "-s", session, "--json"]);
         let listed: BlockList = serde_json::from_str(&run_capture_timeout(
             &mut blocks,
             "listing a Rex session's terminals",
@@ -225,10 +243,27 @@ fn session_holding(rex: &Path, block: &str) -> Result<Option<String>> {
         )?)
         .context("Rex's terminal list is not readable")?;
         if listed.blocks.iter().any(|listed| listed.block_id == block) {
-            return Ok(Some(session.session_id));
+            return Ok(Some(session.clone()));
         }
     }
     Ok(None)
+}
+
+fn session_holding(rex: &Path, block: &str) -> Result<Option<String>> {
+    holding(rex, &listed_sessions(rex)?, block)
+}
+
+/// Where a tab reopens: the Rex session holding its block now, or else the one
+/// that held it when it was named, while Rex still has that session.
+fn home_for(rex: &Path, tab: &TerminalTab) -> Result<Option<String>> {
+    let sessions = listed_sessions(rex)?;
+    if let Some(session) = holding(rex, &sessions, &tab.id)? {
+        return Ok(Some(session));
+    }
+    Ok(tab
+        .holder
+        .clone()
+        .filter(|holder| sessions.contains(holder)))
 }
 
 fn block_at_prompt(rex: &Path, block: &str) -> Option<Result<bool>> {
@@ -248,7 +283,7 @@ impl TerminalAdapter for Rex {
         directory: &Path,
         command: &str,
         _selection: Selection,
-        beside: Option<&str>,
+        beside: Option<&TerminalTab>,
     ) -> Result<()> {
         open_in(&executable()?, directory, command, beside)
     }
@@ -477,10 +512,47 @@ esac
             .collect()
     }
 
+    fn block(id: &str, holder: Option<&str>) -> TerminalTab {
+        TerminalTab {
+            terminal: TerminalKind::Rex,
+            id: id.to_string(),
+            holder: holder.map(str::to_string),
+        }
+    }
+
     #[test]
     fn a_tab_reopens_beside_its_old_one_in_the_rex_session_holding_it() {
         let calls = rex_calls(|rex| {
-            open_in(rex, Path::new("/me/app"), "resume", Some("block:2")).unwrap();
+            open_in(
+                rex,
+                Path::new("/me/app"),
+                "resume",
+                Some(&block("block:2", Some("session:1"))),
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            calls,
+            [
+                "ls --json",
+                "block ls -s session:1 --json",
+                "block ls -s session:2 --json",
+                "window new -s session:2 app -c /me/app --focus=false --json",
+                "send -b block:3 resume",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tab_rex_did_not_bring_back_reopens_in_the_rex_session_that_held_it() {
+        let calls = rex_calls(|rex| {
+            open_in(
+                rex,
+                Path::new("/me/app"),
+                "resume",
+                Some(&block("block:9", Some("session:2"))),
+            )
+            .unwrap();
         });
         assert_eq!(
             calls,
@@ -497,7 +569,13 @@ esac
     #[test]
     fn a_tab_gets_a_rex_session_of_its_own_when_none_holds_its_old_one() {
         let calls = rex_calls(|rex| {
-            open_in(rex, Path::new("/me/app"), "resume", Some("block:9")).unwrap();
+            open_in(
+                rex,
+                Path::new("/me/app"),
+                "resume",
+                Some(&block("block:9", Some("session:7"))),
+            )
+            .unwrap();
         });
         assert_eq!(
             calls,

@@ -14,7 +14,7 @@ impl TerminalAdapter for Iterm2 {
         directory: &Path,
         command: &str,
         _selection: Selection,
-        _beside: Option<&str>,
+        _beside: Option<&super::TerminalTab>,
     ) -> Result<()> {
         if !self.is_running() {
             self.launch()?;

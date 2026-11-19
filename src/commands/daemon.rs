@@ -578,6 +578,12 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
             }
 
             if !session.directory.is_dir() {
+                log_line(&format!(
+                    "pruned a session whose folder is gone: {} {} {}",
+                    session.tool,
+                    session.session_id,
+                    session.directory.display()
+                ))?;
                 summary.pruned_missing_dirs += 1;
                 continue;
             }
@@ -619,6 +625,9 @@ pub fn restore_once(mode: RestoreMode) -> Result<RestoreSummary> {
                 continue;
             }
 
+            if rebooted {
+                session.tab_ended_by_reboot = true;
+            }
             to_open.push(session);
         }
 
@@ -835,17 +844,20 @@ enum Reopened {
     TabClosed,
 }
 
+// A reboot takes every tab down, and a terminal that brings its sessions back
+// after one can bring them back empty, as Rex does, so a tab missing after a
+// reboot was not closed by anyone.
 fn open_restored_tab(adapter: &dyn TerminalAdapter, session: &SessionRecord) -> Result<Reopened> {
     let command = launch_command(&session.session_id)?;
     match run_in_session_tab(adapter, session, &command)? {
         NamedTab::Ran => Ok(Reopened::InATab),
-        NamedTab::Closed => Ok(Reopened::TabClosed),
-        NamedTab::Unavailable => adapter
+        NamedTab::Closed if !session.tab_ended_by_reboot => Ok(Reopened::TabClosed),
+        NamedTab::Closed | NamedTab::Unavailable => adapter
             .open_tab(
                 &session.directory,
                 &command,
                 Selection::Take,
-                session.terminal_tab.as_ref().map(|tab| tab.id.as_str()),
+                session.terminal_tab.as_ref(),
             )
             .map(|()| Reopened::InATab),
     }
@@ -1851,14 +1863,23 @@ fn should_replace(
 }
 
 /// Hooks report the folder a session has since changed into, but the folder
-/// it started in decides which instructions it loads, so a restore reopens
-/// it where its transcript began.
+/// it started in decides which instructions it loads, so a restore reopens it
+/// where it was last started or resumed, or for a record that never noted
+/// that, where its transcript began. A folder moved or deleted since gives way
+/// to the next one that still exists.
 fn launch_directory(session: &SessionRecord) -> Option<PathBuf> {
-    let transcript = session.transcript_path.as_ref()?;
-    transcripts::read_metadata(transcript, session.tool)
-        .ok()
-        .flatten()
-        .map(|(_, cwd, _)| cwd)
+    let transcript_start = session.transcript_path.as_ref().and_then(|transcript| {
+        transcripts::read_metadata(transcript, session.tool)
+            .ok()
+            .flatten()
+            .map(|(_, cwd, _)| cwd)
+    });
+    session
+        .launched_in
+        .clone()
+        .into_iter()
+        .chain(transcript_start)
+        .find(|directory| directory.is_dir())
 }
 
 /// A harness writes its transcript on the first message, and its resume
@@ -1971,21 +1992,27 @@ mod tests {
     #[test]
     fn a_restore_reopens_a_session_where_its_transcript_began() {
         let directory = tempfile::tempdir().unwrap();
+        let code = directory.path().join("Code");
+        let dotfiles = code.join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
         let transcript = directory.path().join("session.jsonl");
+        let line = |value: serde_json::Value| format!("{value}\n");
         fs::write(
             &transcript,
-            "{\"type\":\"summary\"}\n\
-             {\"cwd\":\"/Users/tester/Code\",\"timestamp\":\"2026-10-18T11:00:00Z\"}\n\
-             {\"cwd\":\"/Users/tester/Code/dotfiles\"}\n",
+            [
+                line(serde_json::json!({"type": "summary"})),
+                line(serde_json::json!({"cwd": code, "timestamp": "2026-10-18T11:00:00Z"})),
+                line(serde_json::json!({"cwd": dotfiles})),
+            ]
+            .concat(),
         )
         .unwrap();
         let mut session = sample(crate::tool("claude"), "abc");
-        session.directory = PathBuf::from("/Users/tester/Code/dotfiles");
+        session.directory.clone_from(&dotfiles);
         session.transcript_path = Some(transcript);
-        assert_eq!(
-            launch_directory(&session),
-            Some(PathBuf::from("/Users/tester/Code"))
-        );
+        assert_eq!(launch_directory(&session), Some(code.clone()));
+        fs::remove_dir_all(&code).unwrap();
+        assert_eq!(launch_directory(&session), None);
         session.transcript_path = None;
         assert_eq!(launch_directory(&session), None);
     }
@@ -2010,11 +2037,11 @@ mod tests {
             _: &std::path::Path,
             _: &str,
             _: Selection,
-            beside: Option<&str>,
+            beside: Option<&crate::adapters::TerminalTab>,
         ) -> Result<()> {
             self.asked.borrow_mut().push(beside.map_or_else(
                 || "new tab".to_string(),
-                |tab| format!("new tab beside {tab}"),
+                |tab| format!("new tab beside {}", tab.id),
             ));
             Ok(())
         }
@@ -2051,7 +2078,7 @@ mod tests {
             _: &std::path::Path,
             _: &str,
             _: Selection,
-            _: Option<&str>,
+            _: Option<&crate::adapters::TerminalTab>,
         ) -> Result<()> {
             anyhow::bail!("opening a tab timed out")
         }
@@ -2108,6 +2135,7 @@ mod tests {
         crate::adapters::TerminalTab {
             terminal: TerminalKind::Rex,
             id: "block:1".to_string(),
+            holder: None,
         }
     }
 
@@ -2244,6 +2272,38 @@ mod tests {
             Reopened::TabClosed
         );
         assert_eq!(*terminal.asked.borrow(), ["block:1"]);
+    }
+
+    #[test]
+    fn a_tab_missing_after_a_reboot_reopens_beside_where_it_was() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.terminal_tab = Some(rex_tab());
+        session.tab_ended_by_reboot = true;
+        let terminal = TabsStandIn {
+            named_tab: NamedTab::Closed,
+            ..TabsStandIn::default()
+        };
+        assert_eq!(
+            open_restored_tab(&terminal, &session).unwrap(),
+            Reopened::InATab
+        );
+        assert_eq!(
+            *terminal.asked.borrow(),
+            ["block:1", "new tab beside block:1"]
+        );
+    }
+
+    #[test]
+    fn a_restore_reopens_where_the_session_was_last_started_while_that_folder_exists() {
+        let folders = tempfile::tempdir().unwrap();
+        let resumed_in = folders.path().join("agents").join("app");
+        std::fs::create_dir_all(&resumed_in).unwrap();
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.launched_in = Some(resumed_in.clone());
+        assert_eq!(launch_directory(&session), Some(resumed_in));
+
+        session.launched_in = Some(folders.path().join("moved-away"));
+        assert_eq!(launch_directory(&session), None);
     }
 
     #[test]

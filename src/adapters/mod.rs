@@ -32,7 +32,7 @@ pub trait TerminalAdapter {
         directory: &Path,
         command: &str,
         selection: Selection,
-        beside: Option<&str>,
+        beside: Option<&TerminalTab>,
     ) -> Result<()>;
     fn is_running(&self) -> bool;
     fn launch(&self) -> Result<()>;
@@ -90,9 +90,18 @@ pub enum NamedTab {
 /// names its tabs in their environment.
 pub fn terminal_tab(pid: i32) -> Option<TerminalTab> {
     TerminalKind::value_variants().iter().find_map(|&terminal| {
-        let variable = terminal.tab_variable()?;
-        let id = crate::process::process_environment_variable(pid, variable)?;
-        Some(TerminalTab { terminal, id })
+        let tab_variable = terminal.tab_variable()?;
+        let [id, holder] = if let Some(holder_variable) = terminal.holder_variable() {
+            crate::process::process_environment_variables(pid, [tab_variable, holder_variable])
+        } else {
+            let [id] = crate::process::process_environment_variables(pid, [tab_variable]);
+            [id, None]
+        };
+        Some(TerminalTab {
+            terminal,
+            id: id?,
+            holder,
+        })
     })
 }
 
@@ -102,6 +111,10 @@ pub fn terminal_tab(pid: i32) -> Option<TerminalTab> {
 pub struct TerminalTab {
     pub terminal: TerminalKind,
     pub id: String,
+    /// The group holding the tab when it was named, for a terminal that
+    /// groups its tabs, such as the Rex session holding a block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
 }
 
 pub fn adapter_for(kind: TerminalKind) -> Box<dyn TerminalAdapter> {
