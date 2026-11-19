@@ -551,9 +551,14 @@ configured terminal. The daemon also records the block and Rex session of a
 session registered before those were recorded, from its tool's environment, at
 its once-a-minute check.
 
-Any `rex` command starts a missing server, including the daemon's first one
-after a reboot. After a server crash that did not reboot the Mac, the daemon
-starts the server again itself (see Restarting a crashed terminal).
+A `rex` command can start a missing server, but session-guard never lets one:
+the server would take session-guard as the app responsible for it, and macOS
+would then ask for privacy permissions in session-guard's name for everything
+run in any Rex tab. Every `rex` command session-guard runs passes
+`--autostart=false`, and when the server is down, the daemon opens the Rex app
+in the background, which starts the server as its own. It does this after a
+reboot and after a server crash that did not reboot the Mac (see Restarting a
+crashed terminal).
 
 ### Restarting a crashed terminal
 

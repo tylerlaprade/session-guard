@@ -72,8 +72,12 @@ fn bundled_executable(app: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+// A server a `rex` command starts takes session-guard as the app responsible
+// for it, and macOS then asks in session-guard's name for everything run in any
+// Rex tab, so no command here starts one; `launch` has the app start it.
 fn rex_command(rex: &Path) -> Command {
     let mut command = Command::new(rex);
+    command.arg("--autostart=false");
     // Inside a Rex terminal, a block in any other session counts as not found.
     command.env_remove(SESSION_VARIABLE);
     command
@@ -291,7 +295,7 @@ impl TerminalAdapter for Rex {
     fn is_running(&self) -> bool {
         executable().is_ok_and(|rex| {
             rex_command(&rex)
-                .args(["--autostart=false", "server", "status"])
+                .args(["server", "status"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -299,12 +303,20 @@ impl TerminalAdapter for Rex {
         })
     }
 
-    // Any `rex` command starts a missing server the way the app's does, which
-    // brings back its saved sessions and still exits once they are all closed.
+    // The app starts a missing server, which brings back its saved sessions
+    // before it answers and still exits once they are all closed.
     fn launch(&self) -> Result<()> {
-        let mut list = rex_command(&executable()?);
-        list.args(["ls", "--json"]);
-        run_capture_timeout(&mut list, "starting the Rex server", COMMAND_TIMEOUT).map(drop)
+        let mut open = Command::new("open");
+        open.args(["-g", "-b", TerminalKind::Rex.bundle_id()]);
+        run_capture_timeout(&mut open, "opening the Rex app", COMMAND_TIMEOUT)?;
+        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        while !self.is_running() {
+            if Instant::now() >= deadline {
+                anyhow::bail!("the Rex app did not start its server");
+            }
+            thread::sleep(PROMPT_POLL);
+        }
+        Ok(())
     }
 
     // A shell Rex just brought back may still be starting, and what it runs from
@@ -372,7 +384,14 @@ mod tests {
                 Path::new("rex"),
                 Path::new("/Users/me/My Project")
             )),
-            ["new", "My Project", "-c", "/Users/me/My Project", "--json"]
+            [
+                "--autostart=false",
+                "new",
+                "My Project",
+                "-c",
+                "/Users/me/My Project",
+                "--json"
+            ]
         );
     }
 
@@ -385,6 +404,7 @@ mod tests {
                 Path::new("/Users/me/My Project")
             )),
             [
+                "--autostart=false",
                 "window",
                 "new",
                 "-s",
@@ -405,7 +425,7 @@ mod tests {
         assert_eq!(folder_label(Path::new("/")), None);
         assert_eq!(
             arguments(&new_session_command(Path::new("rex"), Path::new("/"))),
-            ["new", "-c", "/", "--json"]
+            ["--autostart=false", "new", "-c", "/", "--json"]
         );
         assert_eq!(
             arguments(&new_tab_command(
@@ -414,6 +434,7 @@ mod tests {
                 Path::new("/")
             )),
             [
+                "--autostart=false",
                 "window",
                 "new",
                 "-s",
@@ -488,6 +509,7 @@ mod tests {
 
     // Session N holds block N.
     const REX: &str = r#"#!/bin/sh
+if [ "$1" = --autostart=false ]; then shift; else echo "could start a server" >> "$0.log"; fi
 printf '%s\n' "$*" >> "$0.log"
 case $1 in
   ls) echo '{"sessions":[{"session_id":"session:1"},{"session_id":"session:2"}]}' ;;
