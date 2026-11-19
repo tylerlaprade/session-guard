@@ -1690,9 +1690,7 @@ pub fn monitor_once() -> Result<MonitorSummary> {
             }
             if session_is_alive(session, &processes) {
                 session.mark_active();
-                if session.terminal_tab.is_none() {
-                    session.terminal_tab = session.pid.and_then(crate::adapters::terminal_tab);
-                }
+                backfill_registration(session);
                 continue;
             }
 
@@ -1860,6 +1858,23 @@ fn should_replace(
     }
 
     candidate.last_seen_at > existing.last_seen_at
+}
+
+/// Fills in what a session registered by an older build never recorded: its
+/// tab, the group holding that tab, and the folder it was started in, which a
+/// tool's own working folder still is.
+fn backfill_registration(session: &mut SessionRecord) {
+    if session
+        .terminal_tab
+        .as_ref()
+        .is_none_or(|tab| tab.holder.is_none())
+        && let Some(tab) = session.pid.and_then(crate::adapters::terminal_tab)
+    {
+        session.terminal_tab = Some(tab);
+    }
+    if session.launched_in.is_none() {
+        session.launched_in = session.pid.and_then(crate::process::process_directory);
+    }
 }
 
 /// Hooks report the folder a session has since changed into, but the folder
@@ -2272,6 +2287,18 @@ mod tests {
             Reopened::TabClosed
         );
         assert_eq!(*terminal.asked.borrow(), ["block:1"]);
+    }
+
+    #[test]
+    fn a_running_session_from_an_older_build_gains_its_start_folder() {
+        let mut session = sample(crate::tool("claude"), "abc");
+        session.pid = Some(i32::try_from(std::process::id()).unwrap());
+        backfill_registration(&mut session);
+        assert_eq!(session.launched_in, std::env::current_dir().ok());
+
+        session.launched_in = Some(PathBuf::from("/kept"));
+        backfill_registration(&mut session);
+        assert_eq!(session.launched_in, Some(PathBuf::from("/kept")));
     }
 
     #[test]

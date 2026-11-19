@@ -81,7 +81,9 @@ into, but the start folder decides which project instructions the session loads.
 A record made before start folders were kept reopens where its transcript
 began. A start folder that has since been moved or deleted gives way to the
 next of these that still exists, and a session without either reopens in the
-last folder its hooks reported. A session whose folder is gone altogether is
+last folder its hooks reported. A session already running when start folders
+began to be kept gets its start folder from the tool's working folder at the
+daemon's once-a-minute check. A session whose folder is gone altogether is
 dropped, and the daemon log names it.
 
 OpenCode has no shell-command hooks. OpenCode 2 runs sessions on a shared
@@ -545,9 +547,9 @@ A session in Rex belongs to Rex whichever terminal is configured, because its
 record names the block, so Rex can run beside another terminal. Its end is
 judged by Rex's server, a killed tool is typed back into its block, Rex's return
 restores it, and so does a reboot, while sessions that name no tab keep the
-configured terminal. The daemon also records the block of a session registered
-before blocks were recorded, from its tool's environment, at its once-a-minute
-check.
+configured terminal. The daemon also records the block and Rex session of a
+session registered before those were recorded, from its tool's environment, at
+its once-a-minute check.
 
 Any `rex` command starts a missing server, including the daemon's first one
 after a reboot. After a server crash that did not reboot the Mac, the daemon
